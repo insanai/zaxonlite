@@ -1,0 +1,19 @@
+.{
+    .name = .zaxonlite,
+    .version = "0.1.0",
+    .fingerprint = 0xdf9f861eecc5d6a3, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .paxos = .{ .path = ".." },
+        .sqlite = .{
+            .url = "https://sqlite.org/2025/sqlite-amalgamation-3500400.zip",
+            .hash = "N-V-__8AAHCbqABM_X5RTjbDBDBWErxZE8tJzmtEnLOLRHGx",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+    },
+}
