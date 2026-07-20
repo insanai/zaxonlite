@@ -96,8 +96,10 @@ fn mapError(handle: *Handle, err: anyerror) c_int {
             handle.setError("statement is not read-only");
             return misuse_code;
         },
-        error.TransactionFinished, error.EmptyTransaction,
-        error.TooManyStatements, error.TransactionInputTooLarge,
+        error.TransactionFinished,
+        error.EmptyTransaction,
+        error.TooManyStatements,
+        error.TransactionInputTooLarge,
         => {
             handle.setError(@errorName(err));
             return misuse_code;
@@ -162,9 +164,26 @@ export fn zaxonlite_cluster_open(
     out.* = null;
     const directory = options.directory orelse return misuse_code;
     const raw_members = options.members orelse return misuse_code;
-    if (options.member_count == 0) {
+    // Every declared count is reduced to the product limit before any
+    // slice is formed or allocation sized from it.
+    if (options.member_count == 0 or
+        options.member_count > zaxonlite.embedded.max_registry_members)
+    {
         return misuse_code;
     }
+    const secret: ?[]const u8 = if (options.auth_secret) |pointer| blk: {
+        if (options.auth_secret_length == 0 or
+            options.auth_secret_length >
+                zaxonlite.configuration.maximum_secret_file_bytes)
+        {
+            return misuse_code;
+        }
+        break :blk @as([*]const u8, @ptrCast(pointer))[0..options.auth_secret_length];
+    } else if (options.auth_secret_length == 0)
+        null
+    else
+        return misuse_code;
+
     const members = gpa.alloc(zaxonlite.EmbeddedMember, options.member_count) catch
         return unavailable_code;
     defer gpa.free(members);
@@ -178,12 +197,6 @@ export fn zaxonlite_cluster_open(
             .role = role,
         };
     }
-    const secret: ?[]const u8 = if (options.auth_secret) |pointer|
-        @as([*]const u8, @ptrCast(pointer))[0..options.auth_secret_length]
-    else if (options.auth_secret_length == 0)
-        null
-    else
-        return misuse_code;
 
     const handle = gpa.create(ClusterHandle) catch return unavailable_code;
     handle.* = .{
@@ -223,6 +236,7 @@ export fn zaxonlite_cluster_exec(
     sql: ?[*:0]const u8,
     changes_out: ?*i64,
 ) c_int {
+    if (changes_out) |out| out.* = 0;
     const handle: *ClusterHandle = @ptrCast(@alignCast(
         pointer orelse return misuse_code,
     ));
@@ -294,6 +308,7 @@ export fn zaxonlite_exec(
     sql: ?[*:0]const u8,
     changes_out: ?*i64,
 ) c_int {
+    if (changes_out) |out| out.* = 0;
     const handle = handleOf(pointer) orelse return misuse_code;
     const statement = sql orelse return misuse_code;
     const result = handle.node.exec(std.mem.span(statement)) catch |err|
@@ -309,6 +324,7 @@ export fn zaxonlite_exec_prepared(
     value_count: usize,
     changes_out: ?*i64,
 ) c_int {
+    if (changes_out) |out| out.* = 0;
     const handle = handleOf(pointer) orelse return misuse_code;
     const statement = sql orelse return misuse_code;
     const values = valuesFromC(raw_values, value_count) catch |err| {
@@ -366,6 +382,7 @@ export fn zaxonlite_transaction_commit(
     pointer: ?*anyopaque,
     changes_out: ?*i64,
 ) c_int {
+    if (changes_out) |out| out.* = 0;
     const transaction: *TransactionHandle = @ptrCast(@alignCast(
         pointer orelse return misuse_code,
     ));
@@ -389,8 +406,9 @@ export fn zaxonlite_session_open(
     pointer: ?*anyopaque,
     session_out: ?*u64,
 ) c_int {
-    const handle = handleOf(pointer) orelse return misuse_code;
     const out = session_out orelse return misuse_code;
+    out.* = 0;
+    const handle = handleOf(pointer) orelse return misuse_code;
     out.* = handle.node.openSession() catch |err| return mapError(handle, err);
     return ok_code;
 }
@@ -405,6 +423,8 @@ export fn zaxonlite_exec_idempotent(
     changes_out: ?*i64,
     replayed_out: ?*bool,
 ) c_int {
+    if (changes_out) |out| out.* = 0;
+    if (replayed_out) |out| out.* = false;
     const handle = handleOf(pointer) orelse return misuse_code;
     const statement = sql orelse return misuse_code;
     const result = handle.node.execIdempotent(
@@ -479,6 +499,7 @@ fn resultJson(result: *const zaxonlite.QueryResult, out: *?[*:0]u8) c_int {
 fn valuesFromC(raw_values: ?[*]const CValue, count: usize) ![]Value {
     if (count == 0) return gpa.alloc(Value, 0);
     const source = raw_values orelse return error.NullValues;
+    // Checked before the count sizes an allocation or slices caller memory.
     if (count > zaxonlite.prepared.maximum_statements * 64) {
         return error.TooManyValues;
     }
@@ -499,6 +520,11 @@ fn valuesFromC(raw_values: ?[*]const CValue, count: usize) ![]Value {
 
 fn cBytes(value: CValue) ![]const u8 {
     if (value.length == 0) return "";
+    // A declared length beyond the transaction input limit can never be
+    // valid, so it is rejected before the caller's memory is sliced.
+    if (value.length > zaxonlite.prepared.maximum_input_bytes) {
+        return error.ValueTooLarge;
+    }
     const pointer = value.bytes orelse return error.NullValueBytes;
     return @as([*]const u8, @ptrCast(pointer))[0..value.length];
 }
@@ -564,6 +590,7 @@ export fn zaxonlite_expire_sessions(
     retain: u64,
     expired_out: ?*i64,
 ) c_int {
+    if (expired_out) |out| out.* = 0;
     const handle = handleOf(pointer) orelse return misuse_code;
     const result = handle.node.expireSessions(retain) catch |err|
         return mapError(handle, err);

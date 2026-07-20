@@ -11,6 +11,22 @@
  *   2  misuse (null argument, write statement on the read path)
  *   3  integrity failure
  *   4  unavailable (directory locked, corrupt state, or I/O failure)
+ *
+ * Boundary contract (every function follows these rules):
+ *   - NULL is accepted only where a parameter is documented optional. A
+ *     non-zero length always requires a non-null pointer, and a null
+ *     pointer always requires a zero length.
+ *   - Declared counts and lengths are validated against product limits
+ *     before any memory is read, sliced, or allocated from them
+ *     (member lists, bound-value counts, value byte lengths, secrets).
+ *   - Input buffers are borrowed only for the duration of the call.
+ *     Output buffers name their release function (zaxonlite_free);
+ *     opaque handles name their close/destroy function.
+ *   - Every fallible function sets its output handles, pointers, and
+ *     scalar out-parameters to a safe empty value (NULL/0/false) before
+ *     doing any other work, on success and on every error path.
+ *   - Error strings from zaxonlite_last_error are bounded, owned by the
+ *     handle, and valid until the next call on that handle.
  */
 
 #ifndef ZAXONLITE_H
