@@ -996,6 +996,10 @@ pub const Server = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.failed or self.node.isVoter()) return error.InvalidFrame;
+        // Only a configured voter may certify a chosen slot to a learner; a
+        // standby or read replica replays state but never certifies it.
+        const source = self.addressOf(from) orelse return error.NotMember;
+        if (!source.role.capabilities().votes) return error.InvalidFrame;
         if (commit.configuration_id < self.node.identity.configuration_id) return;
         if (commit.configuration_id > self.node.identity.configuration_id) {
             self.requestSnapshot(from);

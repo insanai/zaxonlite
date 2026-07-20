@@ -119,6 +119,12 @@ zig build                 # produces zig-out/bin/zaxon and libzaxonlite.a
 From the repository root: `zig build test-zaxonlite`, `zig build zaxon`,
 `zig build book-zaxonlite`.
 
+API documentation: `zig build docs` (in this directory) writes the generated
+reference to `zig-out/docs/api`; because the output is a WASM application that
+browsers refuse to load from `file://`, use `zig build docs-serve` and open
+<http://localhost:8000>. CI publishes the same pages at
+`https://<owner>.github.io/paxos-zig/zaxonlite/`.
+
 The rqlite comparisons run with installed `rqlited` and `rqlite` binaries. The
 dqlite execution is deferred and remains Linux-only. See
 [`benchmarks/README.md`](benchmarks/README.md) for exact commands and limits.

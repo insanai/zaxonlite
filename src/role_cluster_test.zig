@@ -63,6 +63,7 @@ pub fn main(init: std.process.Init) !u8 {
     try expectReplica(io, gpa, members[4].address, "standby");
     try expectReplica(io, gpa, members[5].address, "read-replica");
     try expectCannotRead(gpa, io, members[3].address);
+    try expectRogueStandbyCommitRejected(gpa, io, &members);
     for (nodes[0..3]) |*node| {
         if (node.*) |value| {
             value.close();
@@ -139,6 +140,80 @@ fn expectCannotRead(gpa: std.mem.Allocator, io: Io, address: []const u8) !void {
     if (std.mem.indexOf(u8, response, "\"error\":\"forbidden\"") == null) {
         return error.WitnessServedRead;
     }
+}
+
+/// Only a configured voter may certify a chosen slot to a learner. This
+/// connects to the read replica while authenticated as the standby (a
+/// configured non-voter) and sends a well-formed `learner_commit`; the
+/// replica must reject the certification by closing the connection.
+fn expectRogueStandbyCommitRejected(
+    gpa: std.mem.Allocator,
+    io: Io,
+    members: []const zaxonlite.EmbeddedMember,
+) !void {
+    var peers: [member_count]zaxonlite.server.PeerAddress = undefined;
+    for (&peers, members[0..member_count]) |*peer, member| {
+        const peer_endpoint = try zaxonlite.client.Endpoint.parse(member.address);
+        peer.* = .{
+            .id = member.id,
+            .host = peer_endpoint.host,
+            .port = peer_endpoint.port,
+            .role = member.role,
+        };
+    }
+    const database_id = zaxonlite.server.deriveDatabaseId(&peers, "role-cluster");
+
+    const standby = members[4];
+    const replica = try zaxonlite.client.Endpoint.parse(members[5].address);
+    const address = try std.Io.net.IpAddress.parse(replica.host, replica.port);
+    var stream = try address.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var read_buffer: [16 * 1024]u8 = undefined;
+    var stream_reader = stream.reader(io, &read_buffer);
+    const reader = &stream_reader.interface;
+    var write_buffer: [16 * 1024]u8 = undefined;
+    var stream_writer = stream.writer(io, &write_buffer);
+    const writer = &stream_writer.interface;
+
+    const hello = zaxonlite.wire.Hello{
+        .version = zaxonlite.wire.protocol_version,
+        .kind = .peer,
+        .node_id = standby.id,
+        .database_id = database_id,
+        .configuration_id = 1,
+    };
+    var hello_buffer: [zaxonlite.wire.Hello.encoded_size]u8 = undefined;
+    const hello_encoded = hello.encode(&hello_buffer);
+    try zaxonlite.wire.writeFrame(writer, .hello, hello_encoded);
+    try writer.flush();
+    var session = try zaxonlite.transport_auth.connect(
+        gpa,
+        reader,
+        writer,
+        secret,
+        hello_encoded,
+    );
+
+    // A payload-free noop entry would pass every later check in
+    // `onLearnerCommit`, so the only rejection path is the voter guard.
+    const commit = zaxonlite.wire.LearnerCommit{
+        .configuration_id = 1,
+        .slot = 1,
+        .entry = .{ .command = .noop },
+    };
+    var commit_buffer: [zaxonlite.wire.LearnerCommit.encoded_max]u8 = undefined;
+    const commit_body = commit.encode(&commit_buffer);
+
+    // The replica sends no reply on this path; rejection is observed as a
+    // closed connection, which surfaces as a failed send within a bounded
+    // number of resend attempts.
+    var attempt: u32 = 0;
+    while (attempt < 50) : (attempt += 1) {
+        session.writeFrame(writer, .learner_commit, commit_body) catch return;
+        writer.flush() catch return;
+        io.sleep(.fromMilliseconds(100), .awake) catch {};
+    }
+    return error.RogueLearnerCommitAccepted;
 }
 
 fn expectStale(gpa: std.mem.Allocator, io: Io, address: []const u8) !void {

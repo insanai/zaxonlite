@@ -14,23 +14,54 @@ const roles = @import("roles.zig");
 const types = @import("types.zig");
 const gateway = @import("gateway.zig");
 
+/// One static cluster member. Every process must pass the identical member
+/// list to `Embedded.open`; membership cannot change while the cluster runs.
 pub const Member = struct {
+    /// Non-zero, unique across the list, and never reused for a different
+    /// logical member (a reused id could vote twice for one identity).
     id: u32,
+    /// `host:port` TCP endpoint this member listens on. Borrowed during
+    /// `open` and copied; the caller may free it once `open` returns.
     address: []const u8,
     role: roles.Role = .data_voter,
 };
 
+/// Options for `Embedded.open`. All slices are copied into the facade's own
+/// arena, so the caller keeps ownership and may free them after `open`.
 pub const OpenOptions = struct {
+    /// Node data directory (journal, payloads, snapshots, SQLite image);
+    /// created when missing. One directory belongs to exactly one node.
     directory: []const u8,
+    /// This process's member id; must appear in `members`.
     node_id: u32,
+    /// Full static membership including this node. Voter count must be
+    /// between one and the compiled maximum, and at least one member must
+    /// be able to campaign, or `open` fails before starting anything.
     members: []const Member,
+    /// Optional salt for the derived database identity, letting two
+    /// clusters with identical member lists refuse each other's peers.
     cluster_id: ?[]const u8 = null,
+    /// Shared transport secret. When set, peers and clients mutually
+    /// authenticate and every frame is HMAC-protected (integrity, not
+    /// confidentiality — use an encrypted tunnel for secret SQL).
     auth_secret: ?[]const u8 = null,
+    /// How long `open` waits for the spawned server to accept connections
+    /// before failing with `error.ServerStartupTimeout`.
     startup_timeout_ms: u64 = 10_000,
+    /// Test-only crash and delay injection; never enable in production.
     enable_test_faults: bool = false,
     test_faults: server.TestFaults = .{},
 };
 
+/// One in-process cluster member: the node (or gateway), its TCP listener,
+/// peer senders, and tick loop run on a background thread owned by this
+/// facade. Create with `open`, destroy with `close`; the struct is
+/// heap-allocated and must not be copied or accessed after `close`.
+///
+/// Safety comes from the node underneath: every acknowledged write is
+/// journaled and fsynced before its reply leaves the process. Liveness is
+/// not guaranteed: with no elected leader or no quorum, calls fail or time
+/// out rather than weakening durability.
 pub const Embedded = struct {
     gpa: std.mem.Allocator,
     io: Io,
@@ -46,6 +77,18 @@ pub const Embedded = struct {
     finished: std.atomic.Value(bool) = .init(false),
     exit_code: std.atomic.Value(u8) = .init(255),
 
+    /// Validates the member list, copies all option slices, spawns the server
+    /// thread, and blocks until this member answers on its own endpoint or
+    /// `options.startup_timeout_ms` elapses (`error.ServerStartupTimeout`);
+    /// a server thread that exits during startup is `error.ServerStartupFailed`.
+    /// Membership faults (`InvalidMemberCount`, `InvalidNodeId`,
+    /// `DuplicateNodeId`, `InvalidVoterCount`, `CampaignerRequired`,
+    /// `NotMember`) are reported before any thread or file is touched.
+    ///
+    /// The returned facade is allocated from `gpa` and owned by the caller;
+    /// release it with `close`, never with `gpa.destroy`. `gpa` and `io` must
+    /// outlive the facade. Startup replays the local journal, so a node with
+    /// existing state is durable-consistent before `open` returns.
     pub fn open(
         gpa: std.mem.Allocator,
         io: Io,
@@ -202,6 +245,13 @@ pub const Embedded = struct {
         self.finished.store(true, .release);
     }
 
+    /// Requests a server stop, joins the background thread, and frees the
+    /// facade and everything it copied; `self` is invalid afterwards. There
+    /// is nothing to flush here: every acknowledged write was already synced
+    /// before its reply, and a request still in flight when `close` runs may
+    /// or may not have committed — its caller must treat the outcome as
+    /// unknown. Never returns an error; a node that cannot be reached for a
+    /// clean stop is joined after its own exit.
     pub fn close(self: *Embedded) void {
         if (!self.finished.load(.acquire)) {
             if (self.gateway_mode) {
@@ -238,6 +288,14 @@ pub const Embedded = struct {
         gpa.destroy(self);
     }
 
+    /// Sends one raw JSON RPC request to the cluster: the first reachable
+    /// member answers, and when `leader` is true, `not_leader` redirects are
+    /// followed to the current leader first. Fails when no member is
+    /// reachable (a liveness failure; nothing durable is affected).
+    ///
+    /// Returns the JSON response body allocated from the `gpa` given to
+    /// `open`; the caller must free it with that same allocator. The body is
+    /// returned as-is — including `{"ok":false,...}` error responses.
     pub fn call(self: *Embedded, request: []const u8, leader: bool) ![]u8 {
         const result = try client.callClusterWithSecret(
             self.gpa,
@@ -250,6 +308,16 @@ pub const Embedded = struct {
         return result.body;
     }
 
+    /// Executes `sql` as one replicated write on the leader. Returns only
+    /// after the transaction's slot is decided and its journal record is
+    /// fsynced, per the write-before-send rule; the result is a plain value
+    /// that owns no memory. A server-side refusal is
+    /// `error.RemoteOperationFailed` and a malformed reply is
+    /// `error.InvalidResponse`.
+    ///
+    /// A transport failure does not mean the write did not commit: this path
+    /// has no session identity, so retrying may apply the statement twice.
+    /// Use the session RPCs (via `call`) when exactly-once retries matter.
     pub fn exec(self: *Embedded, sql: []const u8) !node_mod.ExecResult {
         var request: Io.Writer.Allocating = .init(self.gpa);
         defer request.deinit();
@@ -268,6 +336,16 @@ pub const Embedded = struct {
         };
     }
 
+    /// Runs `sql` at the `linearizable` read level: the leader fences the
+    /// read on a quorum, so the result reflects every write acknowledged
+    /// before the call began. No journal append or disk sync happens per
+    /// read. Reads at weaker levels are not offered here; issue them through
+    /// `call` so the staleness label is explicit.
+    ///
+    /// Columns and rows are copied into an arena inside the returned
+    /// `QueryResult`, allocated from the `gpa` argument (which may differ
+    /// from the open-time allocator); the caller owns the result and must
+    /// call `deinit` exactly once. Cell values arrive as text or null.
     pub fn query(
         self: *Embedded,
         gpa: std.mem.Allocator,

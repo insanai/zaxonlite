@@ -75,6 +75,8 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the zaxon CLI");
     run_step.dependOn(&run_cli.step);
 
+    addApiDocs(b, zaxonlite);
+
     const unit_tests = b.addTest(.{ .root_module = zaxonlite });
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run the zaxonlite test suite");
@@ -315,4 +317,31 @@ pub fn build(b: *std.Build) void {
     ));
     const capi_step = b.step("test-cabi", "Run the C ABI smoke test");
     capi_step.dependOn(&run_capi_smoke.step);
+}
+
+fn addApiDocs(b: *std.Build, zaxonlite: *std.Build.Module) void {
+    const docs_object = b.addObject(.{
+        .name = "zaxonlite-api-docs",
+        .root_module = zaxonlite,
+    });
+    const install_docs = b.addInstallDirectory(.{
+        .source_dir = docs_object.getEmittedDocs(),
+        .install_dir = .prefix,
+        .install_subdir = "docs/api",
+    });
+    const docs_step = b.step("docs", "Generate the Zig API documentation");
+    docs_step.dependOn(&install_docs.step);
+
+    // The autodoc output is a WASM application; browsers refuse to load it
+    // from file://, so serve the installed directory over local HTTP.
+    const serve_docs = b.addSystemCommand(&.{
+        "python3", "-m", "http.server", "8000", "-d",
+    });
+    serve_docs.addArg(b.getInstallPath(.prefix, "docs/api"));
+    serve_docs.step.dependOn(&install_docs.step);
+    const serve_step = b.step(
+        "docs-serve",
+        "Serve the API documentation at http://localhost:8000",
+    );
+    serve_step.dependOn(&serve_docs.step);
 }
