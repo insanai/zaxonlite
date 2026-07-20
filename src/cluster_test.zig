@@ -77,6 +77,9 @@ const Cluster = struct {
         }
         try argv.append(self.gpa, "--enable-failpoints");
         try argv.appendSlice(self.gpa, &.{ "--auth-file", self.auth_file });
+        // The scenario exercises process crashes, which lose nothing under
+        // either sync policy; skip the full-flush latency.
+        try argv.appendSlice(self.gpa, &.{ "--sync", "os" });
         _ = extra_env;
 
         // Each (re)start truncates the node's log; on failure we dump the

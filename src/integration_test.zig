@@ -691,3 +691,53 @@ test "idle sessions expire after the retention window" {
     );
     try testing.expect(replay.replayed);
 }
+
+test "application SQL cannot break the replication contract" {
+    const gpa = testing.allocator;
+    var test_dir = try TestDir.init(gpa);
+    defer test_dir.deinit(gpa);
+    const dir = try test_dir.nodeDir(gpa);
+    defer gpa.free(dir);
+
+    const node = try openNode(dir);
+    defer node.close();
+    _ = try node.exec("create table items(id integer primary key, v text)");
+
+    // Transaction control, attachment, reserved metadata, and capture
+    // pragmas are denied through the public write surface without leaving
+    // side effects; ordinary SQL keeps working afterwards.
+    const denied = [_][:0]const u8{
+        "commit",
+        "rollback",
+        "savepoint s1",
+        "attach database ':memory:' as extra",
+        "insert into __zaxon_meta values ('k', 'v')",
+        "delete from __zaxon_sessions",
+        "drop table __zaxon_meta",
+        "pragma wal_autocheckpoint = 100",
+        "pragma wal_checkpoint",
+        "pragma journal_mode = delete",
+        "insert into items(v) values ('a'); commit",
+    };
+    for (denied) |sql| {
+        try testing.expectError(error.SqliteError, node.exec(sql));
+    }
+    try testing.expectEqual(@as(i64, 0), try countItems(node));
+
+    // Read queries observe the same boundary.
+    try testing.expectError(
+        error.SqliteError,
+        node.query(gpa, "select * from __zaxon_meta"),
+    );
+
+    _ = try node.exec("insert into items(v) values ('tea')");
+    try testing.expectEqual(@as(i64, 1), try countItems(node));
+
+    // Sessions still work: their metadata writes are internal scope.
+    const session = try node.openSession();
+    _ = try node.execIdempotent(session, 1, "insert into items(v) values ('b')");
+    try testing.expectEqual(@as(i64, 2), try countItems(node));
+
+    const report = try node.integrityCheck();
+    try testing.expect(report.ok());
+}

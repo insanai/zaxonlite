@@ -14,6 +14,8 @@ const zaxonlite = @import("zaxonlite");
 const Node = zaxonlite.Node;
 
 pub fn main(init: std.process.Init) !u8 {
+    // Logic and process-crash coverage need no power-loss flush latency.
+    zaxonlite.durability.setSyncMode(.os);
     const gpa = init.gpa;
     const io = init.io;
 

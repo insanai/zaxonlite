@@ -87,8 +87,8 @@ fn spawnBackend(
     defer gpa.free(listen);
     return std.process.spawn(io, .{
         .argv = &.{
-            zaxon, "serve", "--data", directory, "--node", "1",
-            "--listen", listen, "--auth-file", auth,
+            zaxon,      "serve", "--data",      directory, "--node", "1",
+            "--listen", listen,  "--auth-file", auth,      "--sync", "os",
         },
         .stdin = .ignore,
         .stdout = .ignore,
@@ -114,8 +114,8 @@ fn spawnGateway(
     defer gpa.free(peer);
     return std.process.spawn(io, .{
         .argv = &.{
-            zaxon, "serve", "--data", ".", "--node", "99",
-            "--role", "gateway", "--listen", listen, "--peer", peer,
+            zaxon,         "serve",   "--data",   ".",    "--node", "99",
+            "--role",      "gateway", "--listen", listen, "--peer", peer,
             "--auth-file", auth,
         },
         .stdin = .ignore,

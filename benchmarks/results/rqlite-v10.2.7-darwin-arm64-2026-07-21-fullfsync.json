@@ -4,31 +4,31 @@
   "results": [
     {
       "latency_ms": {
-        "max": 329.03779199841665,
-        "p50": 35.05693749684724,
-        "p95": 41.05066599731799,
-        "p99": 45.94424999959301
+        "max": 395.398666994879,
+        "p50": 55.96133349899901,
+        "p95": 70.44349999341648,
+        "p99": 127.38279199402314
       },
       "nodes": 3,
       "operations": 1000,
-      "operations_per_second": 27.99126857655249,
+      "operations_per_second": 17.327946019280308,
       "payload_bytes": 256,
-      "seconds": 35.72542620800232,
+      "seconds": 57.71024441600457,
       "system": "zaxonlite",
       "workload": "sequential one-row durable autocommit"
     },
     {
       "latency_ms": {
-        "max": 241.16141700505977,
-        "p50": 21.948624998913147,
-        "p95": 28.414207998139318,
-        "p99": 33.694416997605
+        "max": 46.13466600130778,
+        "p50": 22.90829200137523,
+        "p95": 29.481584002496675,
+        "p99": 33.607333003601525
       },
       "nodes": 3,
       "operations": 1000,
-      "operations_per_second": 44.49032245169506,
+      "operations_per_second": 43.04757433349799,
       "payload_bytes": 256,
-      "seconds": 22.476798208997934,
+      "seconds": 23.230112624994945,
       "system": "rqlite",
       "workload": "sequential one-row durable autocommit"
     }
@@ -42,7 +42,7 @@
     "verification": "strong count and exact-payload predicate",
     "warmup_excluded": true
   },
-  "run_at_utc": "2026-07-20T18:50:40.276035+00:00",
+  "run_at_utc": "2026-07-20T18:31:35.043585+00:00",
   "tools": {
     "rqlite_cli": {
       "path": "/opt/homebrew/bin/rqlite",

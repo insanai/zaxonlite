@@ -91,6 +91,9 @@ fn runCase(
         directory,
         "--sql",
         "insert into t(v) values ('crash')",
+        // Process-kill recovery is identical under both sync policies.
+        "--sync",
+        "os",
     };
     var child = try std.process.spawn(io, .{
         .argv = &argv,

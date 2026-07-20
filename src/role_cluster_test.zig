@@ -9,6 +9,8 @@ const secret = "role-cluster-test-secret-32-bytes";
 const member_count = 6;
 
 pub fn main(init: std.process.Init) !u8 {
+    // Logic and process-crash coverage need no power-loss flush latency.
+    zaxonlite.durability.setSyncMode(.os);
     const gpa = init.gpa;
     const io = init.io;
     var tmp = try Temp.init(gpa, io);
