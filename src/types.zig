@@ -10,7 +10,11 @@ pub const Command = command.Command;
 /// Compile-time bounds for the replicated command log. `max_entries` is the
 /// hard epoch capacity; the host must checkpoint before it is reached.
 pub const log_options = paxos.ReplicatedLogOptions{
-    .max_members = 3,
+    // This is a voter bound, not a total-node bound. Non-voting learners and
+    // gateways live in the runtime product registry and do not consume these
+    // slots. Nine voters tolerate four failures; larger deployments add an
+    // arbitrary number of replicas or shard into independent voter groups.
+    .max_members = 9,
     .max_entries = 256,
     .max_batch = 16,
     .max_metadata_bytes = 256,

@@ -12,6 +12,7 @@ const Io = std.Io;
 const Crc32 = std.hash.crc.Crc32;
 
 const types = @import("types.zig");
+const durability = @import("durability.zig");
 
 const magic: u32 = 0x315a584a; // "ZXJ1" little-endian.
 const format_version: u8 = 1;
@@ -50,6 +51,8 @@ pub const Journal = struct {
         var name_buffer: [26]u8 = undefined;
         const name = fileName(&name_buffer, configuration_id);
         const file = try dir.createFile(io, name, .{ .exclusive = true, .read = true });
+        errdefer file.close(io);
+        try durability.syncDirectory(dir);
         return .{ .io = io, .file = file, .next_sequence = 1, .end_offset = 0 };
     }
 

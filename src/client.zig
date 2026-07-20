@@ -5,6 +5,8 @@
 const std = @import("std");
 const Io = std.Io;
 const wire = @import("wire.zig");
+const transport_auth = @import("transport_auth.zig");
+const durability = @import("durability.zig");
 
 pub const Endpoint = struct {
     host: []const u8,
@@ -30,8 +32,18 @@ pub const Connection = struct {
     writer: std.Io.net.Stream.Writer,
     read_buffer: []u8,
     write_buffer: []u8,
+    authenticated: ?transport_auth.Session = null,
 
     pub fn open(gpa: std.mem.Allocator, io: Io, endpoint: Endpoint) !*Connection {
+        return openWithSecret(gpa, io, endpoint, null);
+    }
+
+    pub fn openWithSecret(
+        gpa: std.mem.Allocator,
+        io: Io,
+        endpoint: Endpoint,
+        secret: ?[]const u8,
+    ) !*Connection {
         const self = try gpa.create(Connection);
         errdefer gpa.destroy(self);
         const read_buffer = try gpa.alloc(u8, 64 * 1024);
@@ -66,6 +78,15 @@ pub const Connection = struct {
         var hello_buffer: [wire.Hello.encoded_size]u8 = undefined;
         try wire.writeFrame(&self.writer.interface, .hello, hello.encode(&hello_buffer));
         try self.writer.interface.flush();
+        if (secret) |bytes| {
+            self.authenticated = try transport_auth.connect(
+                gpa,
+                &self.reader.interface,
+                &self.writer.interface,
+                bytes,
+                &hello_buffer,
+            );
+        }
         return self;
     }
 
@@ -79,11 +100,111 @@ pub const Connection = struct {
 
     /// Sends one JSON request and returns the owned JSON response body.
     pub fn call(self: *Connection, request: []const u8) ![]u8 {
-        try wire.writeFrame(&self.writer.interface, .rpc_request, request);
+        try self.writeRequest(request);
+        const frame = try self.readFrame();
+        if (frame.kind != .rpc_response) {
+            self.gpa.free(frame.body);
+            return error.InvalidFrame;
+        }
+        return frame.body;
+    }
+
+    fn writeRequest(self: *Connection, request: []const u8) !void {
+        if (self.authenticated) |*session| {
+            try session.writeFrame(&self.writer.interface, .rpc_request, request);
+        } else {
+            try wire.writeFrame(&self.writer.interface, .rpc_request, request);
+        }
         try self.writer.interface.flush();
+    }
+
+    fn readFrame(self: *Connection) !transport_auth.Frame {
+        if (self.authenticated) |*session| {
+            return session.readFrame(self.gpa, &self.reader.interface);
+        }
         const header = try wire.readFrameHeader(&self.reader.interface);
-        if (header.kind != .rpc_response) return error.InvalidFrame;
-        return wire.readFrameBody(self.gpa, &self.reader.interface, header);
+        return .{
+            .kind = header.kind,
+            .body = try wire.readFrameBody(self.gpa, &self.reader.interface, header),
+        };
+    }
+
+    /// Streams a server-side consistent backup to an atomically installed
+    /// destination and verifies its declared SHA-256 before rename.
+    pub fn backupTo(self: *Connection, destination: []const u8) !void {
+        const directory_name = std.fs.path.dirname(destination) orelse ".";
+        const file_name = std.fs.path.basename(destination);
+        if (file_name.len == 0) return error.InvalidBackupPath;
+        var directory = if (std.fs.path.isAbsolute(directory_name))
+            try Io.Dir.openDirAbsolute(self.io, directory_name, .{})
+        else
+            try Io.Dir.cwd().openDir(self.io, directory_name, .{});
+        defer directory.close(self.io);
+        if (directory.access(self.io, file_name, .{})) |_| {
+            return error.BackupDestinationExists;
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        }
+
+        var random_bytes: [8]u8 = undefined;
+        self.io.random(&random_bytes);
+        const nonce = std.mem.readInt(u64, &random_bytes, .little);
+        const temporary_name = try std.fmt.allocPrint(
+            self.gpa,
+            ".{s}.zaxon-{x}.tmp",
+            .{ file_name, nonce },
+        );
+        defer self.gpa.free(temporary_name);
+        var file = try directory.createFile(self.io, temporary_name, .{
+            .read = true,
+            .exclusive = true,
+        });
+        var file_open = true;
+        var keep_temporary = true;
+        defer {
+            if (file_open) file.close(self.io);
+            if (keep_temporary) directory.deleteFile(self.io, temporary_name) catch {};
+        }
+
+        try self.writeRequest("{\"op\":\"backup\"}");
+        const begin_frame = try self.readFrame();
+        defer self.gpa.free(begin_frame.body);
+        if (begin_frame.kind == .rpc_response) return error.RemoteBackupRejected;
+        if (begin_frame.kind != .backup_begin) return error.InvalidFrame;
+        const begin = try wire.BackupBegin.decode(begin_frame.body);
+        if (begin.size == 0 or begin.size > 1024 * 1024 * 1024 * 1024) {
+            return error.InvalidBackupSize;
+        }
+
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        var received: u64 = 0;
+        while (true) {
+            const frame = try self.readFrame();
+            defer self.gpa.free(frame.body);
+            if (frame.kind == .backup_end) break;
+            if (frame.kind != .backup_chunk or frame.body.len <= 8) {
+                return error.InvalidFrame;
+            }
+            const offset = std.mem.readInt(u64, frame.body[0..8], .little);
+            const bytes = frame.body[8..];
+            const end = std.math.add(u64, offset, bytes.len) catch
+                return error.InvalidFrame;
+            if (offset != received or end > begin.size) return error.InvalidFrame;
+            try file.writePositionalAll(self.io, bytes, offset);
+            hasher.update(bytes);
+            received = end;
+        }
+        if (received != begin.size) return error.UnexpectedEndOfStream;
+        var actual: [32]u8 = undefined;
+        hasher.final(&actual);
+        if (!std.mem.eql(u8, &actual, &begin.sha256)) return error.BackupDigestMismatch;
+        try file.sync(self.io);
+        file.close(self.io);
+        file_open = false;
+        try directory.rename(temporary_name, directory, file_name, self.io);
+        try durability.syncDirectory(directory);
+        keep_temporary = false;
     }
 };
 
@@ -104,6 +225,24 @@ pub fn callCluster(
     request: []const u8,
     require_leader: bool,
 ) !CallResult {
+    return callClusterWithSecret(
+        gpa,
+        io,
+        endpoints,
+        request,
+        require_leader,
+        null,
+    );
+}
+
+pub fn callClusterWithSecret(
+    gpa: std.mem.Allocator,
+    io: Io,
+    endpoints: []const Endpoint,
+    request: []const u8,
+    require_leader: bool,
+    secret: ?[]const u8,
+) !CallResult {
     var redirect_host_buffer: [256]u8 = undefined;
     var redirect: ?Endpoint = null;
     var attempt: usize = 0;
@@ -114,7 +253,7 @@ pub fn callCluster(
             endpoints[attempt % endpoints.len];
         redirect = null;
 
-        const connection = Connection.open(gpa, io, endpoint) catch {
+        const connection = Connection.openWithSecret(gpa, io, endpoint, secret) catch {
             io.sleep(.fromMilliseconds(150), .awake) catch {};
             continue;
         };

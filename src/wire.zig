@@ -8,9 +8,10 @@
 //! probes, and snapshot transfer streams. Client frames carry one JSON
 //! request/response pair per round trip.
 //!
-//! Ordering rule: a leader pushes `payload_data` on the same ordered stream
-//! *before* any accept or commit that references the payload hash, so a
-//! follower always stores payload bytes durably before it votes.
+//! Ordering rule: a sender pushes `payload_data`, waits for the receiver's
+//! `payload_stored` acknowledgement, and only then releases any promise,
+//! accept, or commit that references the payload hash. Thus every recovered
+//! value and every counted vote has durable payload bytes at its consumer.
 
 const std = @import("std");
 const Io = std.Io;
@@ -18,7 +19,11 @@ const paxos = @import("paxos");
 const types = @import("types.zig");
 const command = @import("command.zig");
 
-pub const protocol_version: u16 = 1;
+/// Version 4 adds voter-certified chosen-entry delivery to non-voting
+/// learners. Version 3 peers are deliberately rejected:
+/// silently falling back would turn a configuration error into a security
+/// downgrade.
+pub const protocol_version: u16 = 4;
 
 /// Upper bound for one frame body; larger frames are a protocol error.
 pub const max_frame_bytes: u32 = 64 * 1024 * 1024;
@@ -39,6 +44,89 @@ pub const FrameKind = enum(u8) {
     snapshot_end = 10,
     rpc_request = 11,
     rpc_response = 12,
+    payload_stored = 13,
+    auth_challenge = 14,
+    auth_response = 15,
+    backup_begin = 16,
+    backup_chunk = 17,
+    backup_end = 18,
+    learner_commit = 19,
+    learner_heartbeat = 20,
+};
+
+pub const LearnerHeartbeat = struct {
+    configuration_id: u64,
+    decided_through: paxos.Slot,
+
+    pub const encoded_size = 8 + 4;
+
+    pub fn encode(self: LearnerHeartbeat, buffer: *[encoded_size]u8) []const u8 {
+        std.mem.writeInt(u64, buffer[0..8], self.configuration_id, .little);
+        std.mem.writeInt(u32, buffer[8..12], self.decided_through, .little);
+        return buffer;
+    }
+
+    pub fn decode(body: []const u8) WireError!LearnerHeartbeat {
+        if (body.len != encoded_size) return error.InvalidFrame;
+        const configuration_id = std.mem.readInt(u64, body[0..8], .little);
+        if (configuration_id == 0) return error.InvalidFrame;
+        return .{
+            .configuration_id = configuration_id,
+            .decided_through = std.mem.readInt(u32, body[8..12], .little),
+        };
+    }
+};
+
+pub const LearnerCommit = struct {
+    configuration_id: u64,
+    slot: paxos.Slot,
+    entry: types.Entry,
+
+    pub fn encode(self: LearnerCommit, buffer: *[encoded_max]u8) []const u8 {
+        var cursor = types.Cursor{ .buffer = buffer };
+        cursor.int(u64, self.configuration_id);
+        cursor.int(u32, self.slot);
+        types.encodeEntry(self.entry, &cursor);
+        return buffer[0..cursor.offset];
+    }
+
+    pub fn decode(body: []const u8) WireError!LearnerCommit {
+        var reader = types.ReadCursor{ .buffer = body };
+        const configuration_id = try reader.int(u64);
+        const slot = try reader.int(u32);
+        const entry = try types.decodeEntry(&reader);
+        if (configuration_id == 0 or slot == 0 or reader.offset != body.len) {
+            return error.InvalidFrame;
+        }
+        return .{
+            .configuration_id = configuration_id,
+            .slot = slot,
+            .entry = entry,
+        };
+    }
+
+    pub const encoded_max = 8 + 4 + types.max_entry_size;
+};
+
+pub const BackupBegin = struct {
+    size: u64,
+    sha256: [32]u8,
+
+    pub const encoded_size = 8 + 32;
+
+    pub fn encode(self: BackupBegin, buffer: *[encoded_size]u8) []const u8 {
+        std.mem.writeInt(u64, buffer[0..8], self.size, .little);
+        @memcpy(buffer[8..40], &self.sha256);
+        return buffer;
+    }
+
+    pub fn decode(body: []const u8) WireError!BackupBegin {
+        if (body.len != encoded_size) return error.InvalidFrame;
+        return .{
+            .size = std.mem.readInt(u64, body[0..8], .little),
+            .sha256 = body[8..40].*,
+        };
+    }
 };
 
 pub const WireError = error{
@@ -221,11 +309,12 @@ pub fn decodeEnvelope(body: []const u8) WireError!types.Log.Envelope {
     return .{ .from = from, .to = to, .message = message };
 }
 
-/// Returns the transaction-batch payload hash carried by an accept or
-/// commit envelope, if any. A follower must have the payload durably in
-/// its store before it processes such an envelope.
+/// Returns the transaction-batch payload hash carried by a value-bearing
+/// promise, accept, or commit envelope, if any. Gating promises is essential:
+/// completing Phase 1 can emit recovery accepts in the same core transition.
 pub fn envelopePayloadHash(envelope: types.Log.Envelope) ?command.HashBytes {
     const entry: types.Entry = switch (envelope.message) {
+        .promise => |m| m.accepted.value,
         .accept => |m| m.value,
         .commit => |m| m.value,
         else => return null,
@@ -246,13 +335,15 @@ pub fn envelopePayloadHash(envelope: types.Log.Envelope) ?command.HashBytes {
 pub const FenceRequest = struct {
     ballot: paxos.Ballot,
     fence_id: u64,
+    fence_slot: paxos.Slot,
 
-    pub const encoded_size = types.ballot_size + 8;
+    pub const encoded_size = types.ballot_size + 8 + 4;
 
     pub fn encode(self: FenceRequest, buffer: *[encoded_size]u8) []const u8 {
         var cursor = types.Cursor{ .buffer = buffer };
         types.encodeBallot(self.ballot, &cursor);
         cursor.int(u64, self.fence_id);
+        cursor.int(u32, self.fence_slot);
         return buffer[0..cursor.offset];
     }
 
@@ -262,6 +353,7 @@ pub const FenceRequest = struct {
         return .{
             .ballot = try types.decodeBallot(&reader),
             .fence_id = try reader.int(u64),
+            .fence_slot = try reader.int(u32),
         };
     }
 };
@@ -386,7 +478,7 @@ pub fn readFrameBody(
 }
 
 pub fn writeFrame(writer: *Io.Writer, kind: FrameKind, body: []const u8) !void {
-    std.debug.assert(body.len + 1 <= max_frame_bytes);
+    if (body.len >= max_frame_bytes) return error.FrameTooLarge;
     var header: [header_size]u8 = undefined;
     std.mem.writeInt(u32, header[0..4], @intCast(body.len + 1), .little);
     header[4] = @intFromEnum(kind);
@@ -402,8 +494,11 @@ pub fn frameAlloc(
     parts: []const []const u8,
 ) ![]u8 {
     var body_len: usize = 0;
-    for (parts) |part| body_len += part.len;
-    std.debug.assert(body_len + 1 <= max_frame_bytes);
+    for (parts) |part| {
+        body_len = std.math.add(usize, body_len, part.len) catch
+            return error.FrameTooLarge;
+    }
+    if (body_len >= max_frame_bytes) return error.FrameTooLarge;
     const buffer = try gpa.alloc(u8, header_size + body_len);
     std.mem.writeInt(u32, buffer[0..4], @intCast(body_len + 1), .little);
     buffer[4] = @intFromEnum(kind);
@@ -525,6 +620,23 @@ test "envelope payload hash extraction" {
         &batch.payload_hash,
         &envelopePayloadHash(with_batch).?,
     );
+    const promise = types.Log.Envelope{
+        .from = 2,
+        .to = 1,
+        .message = .{ .promise = .{
+            .ballot = .{ .round = 2, .priority = 1, .node = 1 },
+            .slot = 7,
+            .accepted = .{
+                .ballot = .{ .round = 1, .priority = 2, .node = 2 },
+                .value = .{ .command = .{ .transaction_batch = batch } },
+            },
+        } },
+    };
+    try testing.expectEqualSlices(
+        u8,
+        &batch.payload_hash,
+        &envelopePayloadHash(promise).?,
+    );
     const noop = types.Log.Envelope{
         .from = 1,
         .to = 2,
@@ -561,6 +673,7 @@ test "fence frames round trip" {
     const request = FenceRequest{
         .ballot = .{ .round = 3, .priority = 1, .node = 2 },
         .fence_id = 41,
+        .fence_slot = 19,
     };
     var request_buffer: [FenceRequest.encoded_size]u8 = undefined;
     try testing.expectEqualDeep(
@@ -575,6 +688,40 @@ test "fence frames round trip" {
     };
     var ack_buffer: [FenceAck.encoded_size]u8 = undefined;
     try testing.expectEqualDeep(ack, try FenceAck.decode(ack.encode(&ack_buffer)));
+}
+
+test "learner commit round trips and rejects invalid certificates" {
+    const commit = LearnerCommit{
+        .configuration_id = 7,
+        .slot = 19,
+        .entry = .{ .command = .{ .read_barrier = .{ .nonce = 41 } } },
+    };
+    var buffer: [LearnerCommit.encoded_max]u8 = undefined;
+    const encoded = commit.encode(&buffer);
+    try testing.expectEqualDeep(commit, try LearnerCommit.decode(encoded));
+
+    var invalid = buffer;
+    std.mem.writeInt(u64, invalid[0..8], 0, .little);
+    try testing.expectError(
+        error.InvalidFrame,
+        LearnerCommit.decode(invalid[0..encoded.len]),
+    );
+    try testing.expectError(
+        error.TruncatedRecord,
+        LearnerCommit.decode(buffer[0 .. encoded.len - 1]),
+    );
+}
+
+test "learner heartbeat round trips" {
+    const heartbeat = LearnerHeartbeat{
+        .configuration_id = 8,
+        .decided_through = 144,
+    };
+    var buffer: [LearnerHeartbeat.encoded_size]u8 = undefined;
+    try testing.expectEqualDeep(
+        heartbeat,
+        try LearnerHeartbeat.decode(heartbeat.encode(&buffer)),
+    );
 }
 
 test "snapshot begin round trips and bounds the manifest" {
@@ -602,5 +749,14 @@ test "frame alloc produces a parseable frame" {
     try testing.expectEqual(
         @intFromEnum(FrameKind.payload_request),
         frame[4],
+    );
+}
+
+test "frame allocation rejects oversized bodies" {
+    const too_large = try testing.allocator.alloc(u8, max_frame_bytes);
+    defer testing.allocator.free(too_large);
+    try testing.expectError(
+        error.FrameTooLarge,
+        frameAlloc(testing.allocator, .payload_data, &.{too_large}),
     );
 }

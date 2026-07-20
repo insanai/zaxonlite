@@ -10,6 +10,12 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 
 pub const HashBytes = [32]u8;
 
+/// Maximum external payload carried by one wire frame (hash plus bytes must
+/// fit below the protocol's 64 MiB frame-body bound).
+/// Leaves room below the 64 MiB frame bound for the content hash (32),
+/// authenticated sequence (8), HMAC-SHA256 tag (32), and strict `<` bound.
+pub const max_payload_bytes: usize = 64 * 1024 * 1024 - 73;
+
 pub const TransactionBatch = struct {
     database_id: u128,
     batch_id: u128,

@@ -188,8 +188,27 @@ pub const Stmt = struct {
         try check(self.db, c.sqlite3_bind_int64(self.handle, @intCast(index), value));
     }
 
+    pub fn bindDouble(self: *Stmt, index: u32, value: f64) Error!void {
+        try check(self.db, c.sqlite3_bind_double(self.handle, @intCast(index), value));
+    }
+
+    /// Binds bytes without copying; they must outlive the final step.
+    pub fn bindBlob(self: *Stmt, index: u32, value: []const u8) Error!void {
+        try check(self.db, c.sqlite3_bind_blob(
+            self.handle,
+            @intCast(index),
+            value.ptr,
+            @intCast(value.len),
+            null,
+        ));
+    }
+
     pub fn bindNull(self: *Stmt, index: u32) Error!void {
         try check(self.db, c.sqlite3_bind_null(self.handle, @intCast(index)));
+    }
+
+    pub fn parameterCount(self: *const Stmt) u32 {
+        return @intCast(c.sqlite3_bind_parameter_count(self.handle));
     }
 
     pub fn columnCount(self: *const Stmt) u32 {

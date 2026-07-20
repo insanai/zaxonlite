@@ -95,6 +95,24 @@ pub fn build(b: *std.Build) void {
     integration_step.dependOn(&run_integration_tests.step);
     test_step.dependOn(&run_integration_tests.step);
 
+    const crash_test = b.addExecutable(.{
+        .name = "zaxon-crash-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/crash_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zaxonlite", .module = zaxonlite }},
+        }),
+    });
+    const run_crash_test = b.addRunArtifact(crash_test);
+    run_crash_test.addArtifactArg(zaxon);
+    const crash_step = b.step(
+        "test-crash",
+        "Run real-process one-node crash-point recovery tests",
+    );
+    crash_step.dependOn(&run_crash_test.step);
+    test_step.dependOn(&run_crash_test.step);
+
     // Three-process cluster scenario: a controller spawns three `zaxon
     // serve` processes and drives them over the client RPC protocol.
     const cluster_runs = b.option(
@@ -119,6 +137,52 @@ pub fn build(b: *std.Build) void {
         "Run the three-process cluster integration scenario",
     );
     cluster_step.dependOn(&run_cluster_test.step);
+
+    const role_cluster_test = b.addExecutable(.{
+        .name = "zaxon-role-cluster-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/role_cluster_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zaxonlite", .module = zaxonlite }},
+        }),
+    });
+    const run_role_cluster_test = b.addRunArtifact(role_cluster_test);
+    const role_cluster_step = b.step(
+        "test-roles",
+        "Run voter, witness, standby, and read-replica integration",
+    );
+    role_cluster_step.dependOn(&run_role_cluster_test.step);
+
+    const gateway_test = b.addExecutable(.{
+        .name = "zaxon-gateway-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/gateway_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zaxonlite", .module = zaxonlite }},
+        }),
+    });
+    const run_gateway_test = b.addRunArtifact(gateway_test);
+    run_gateway_test.addArtifactArg(zaxon);
+    const gateway_step = b.step("test-gateway", "Run stateless gateway integration");
+    gateway_step.dependOn(&run_gateway_test.step);
+
+    const fault_cluster_test = b.addExecutable(.{
+        .name = "zaxon-fault-cluster-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/fault_cluster_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zaxonlite", .module = zaxonlite }},
+        }),
+    });
+    const run_fault_cluster_test = b.addRunArtifact(fault_cluster_test);
+    const fault_cluster_step = b.step(
+        "test-fault-network",
+        "Run packet loss, duplication, reordering, fragmentation, and slow sync",
+    );
+    fault_cluster_step.dependOn(&run_fault_cluster_test.step);
 
     // CLI contract test: drives the installed zaxon binary end to end.
     const cli_test = b.addExecutable(.{

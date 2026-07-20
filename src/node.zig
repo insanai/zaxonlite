@@ -29,6 +29,9 @@ const payload_store_mod = @import("payload_store.zig");
 const sqlite = @import("sqlite.zig");
 const wal = @import("wal.zig");
 const failpoint = @import("failpoint.zig");
+const durability = @import("durability.zig");
+const prepared = @import("prepared.zig");
+const roles = @import("roles.zig");
 
 const Journal = journal_mod.Journal;
 const PayloadStore = payload_store_mod.PayloadStore;
@@ -57,6 +60,10 @@ pub const OpenOptions = struct {
     /// Database identity for a freshly created directory. Cluster members
     /// must agree on it; `null` draws a random one (single-node default).
     database_id: ?u128 = null,
+    /// Product role. Only data voters and witnesses appear in `members`.
+    role: roles.Role = .data_voter,
+    /// Test-only delay injected immediately before each journal sync.
+    test_storage_delay_ms: u64 = 0,
 };
 
 pub const SessionError = error{
@@ -76,6 +83,7 @@ pub const Status = struct {
     database_id: u128,
     configuration_id: u64,
     role: []const u8,
+    node_type: []const u8,
     leader: ?paxos.NodeId,
     ballot: paxos.Ballot,
     decided_slot: paxos.Slot,
@@ -101,6 +109,7 @@ const Identity = struct {
     node_id: paxos.NodeId,
     database_id: u128,
     configuration_id: u64,
+    role: roles.Role,
 };
 
 pub const QueryResult = struct {
@@ -134,6 +143,8 @@ pub const Node = struct {
     db_open: bool = false,
     /// True when this node was opened as a one-member configuration.
     single: bool,
+    product_role: roles.Role,
+    capabilities: roles.Capabilities,
     members: [types.log_options.max_members]paxos.NodeId,
     member_count: u16,
     leader_priority: u32,
@@ -160,6 +171,11 @@ pub const Node = struct {
     /// captured before the rollback statement clears it.
     saved_error: [512]u8 = undefined,
     saved_error_len: usize = 0,
+    /// Set after a journal/payload durability failure. A cluster host must
+    /// stop voting and serving; continuing after a failed fsync would violate
+    /// the effects contract.
+    fatal_storage_error: bool = false,
+    test_storage_delay_ms: u64 = 0,
 
     // ------------------------------------------------------------------
     // Lifecycle
@@ -169,12 +185,15 @@ pub const Node = struct {
         const self = try gpa.create(Node);
         errdefer gpa.destroy(self);
 
+        const capabilities = options.role.capabilities();
+        if (!capabilities.stores_log) return error.RoleHasNoLocalStore;
         var member_storage: [types.log_options.max_members]paxos.NodeId = undefined;
         const members: []const paxos.NodeId = blk: {
-            if (options.members.len == 0) {
+            if (options.members.len == 0 and capabilities.votes) {
                 member_storage[0] = options.node_id;
                 break :blk member_storage[0..1];
             }
+            if (options.members.len == 0) return error.VotersRequired;
             if (options.members.len > types.log_options.max_members) {
                 return error.TooManyMembers;
             }
@@ -185,8 +204,8 @@ pub const Node = struct {
         for (members) |member| {
             if (member == options.node_id) found_self = true;
         }
-        if (!found_self) return error.NotMember;
-        const single = members.len == 1;
+        if (found_self != capabilities.votes) return error.RoleMembershipMismatch;
+        const single = capabilities.votes and members.len == 1;
 
         var dir = try Io.Dir.cwd().createDirPathOpen(io, options.directory, .{});
         errdefer dir.close(io);
@@ -205,6 +224,7 @@ pub const Node = struct {
             dir,
             options.node_id,
             options.database_id,
+            options.role,
         );
 
         var store = try PayloadStore.init(io, dir);
@@ -240,10 +260,13 @@ pub const Node = struct {
             .db = undefined,
             .db_path = db_path,
             .single = single,
+            .product_role = options.role,
+            .capabilities = capabilities,
             .members = [_]paxos.NodeId{0} ** types.log_options.max_members,
             .member_count = @intCast(members.len),
             .leader_priority = options.leader_priority,
             .last_chain = command.genesisChain(identity.database_id),
+            .test_storage_delay_ms = options.test_storage_delay_ms,
         };
         @memcpy(self.members[0..members.len], members);
 
@@ -264,28 +287,70 @@ pub const Node = struct {
             &replay_info,
         )) |opened| {
             self.journal = opened;
-            try self.log.restoreWithPriority(
-                identity.node_id,
-                identity.configuration_id,
-                &membership,
-                durable,
-                options.leader_priority,
-            );
-        } else |err| switch (err) {
-            error.FileNotFound => {
-                self.journal = try Journal.create(io, dir, identity.configuration_id);
-                try self.log.initWithPriority(
+            if (capabilities.votes) {
+                try self.log.restoreWithPriority(
                     identity.node_id,
                     identity.configuration_id,
                     &membership,
+                    durable,
                     options.leader_priority,
                 );
+            } else {
+                try self.log.restoreLearner(
+                    identity.node_id,
+                    identity.configuration_id,
+                    &membership,
+                    durable,
+                );
+            }
+        } else |err| switch (err) {
+            error.FileNotFound => {
+                self.journal = try Journal.create(io, dir, identity.configuration_id);
+                if (capabilities.votes) {
+                    try self.log.initWithPriority(
+                        identity.node_id,
+                        identity.configuration_id,
+                        &membership,
+                        options.leader_priority,
+                    );
+                } else {
+                    try self.log.initLearner(
+                        identity.node_id,
+                        identity.configuration_id,
+                        &membership,
+                    );
+                }
             },
             else => return err,
         }
         errdefer self.journal.close();
 
-        if (single) {
+        // Resume a snapshot transfer that durably installed CURRENT but
+        // crashed before advancing identity. Equality is also possible: a
+        // member can have reached the sealed epoch without learning its stop
+        // sign. A normal checkpoint interruption has the stop sign and is
+        // completed by the regular rollover path below.
+        if (try self.currentSnapshotName()) |snapshot_name| {
+            const sealed = try self.validateSnapshotGeneration(snapshot_name);
+            if (sealed > self.identity.configuration_id or
+                (sealed == self.identity.configuration_id and
+                    self.log.isReconfigured() == null))
+            {
+                if (sealed == std.math.maxInt(u64)) return error.ConfigurationMismatch;
+                try self.activateInstalledSnapshot(sealed + 1, &membership);
+            } else if (!(sealed == self.identity.configuration_id and
+                self.log.isReconfigured() != null))
+            {
+                if (sealed == std.math.maxInt(u64) or
+                    sealed + 1 != self.identity.configuration_id)
+                {
+                    return error.ConfigurationMismatch;
+                }
+            }
+        }
+
+        self.log.core.setCampaignEnabled(capabilities.campaigns);
+        if (single and capabilities.campaigns) {
             // Volatile leadership: campaign on every open. A one-member
             // quorum completes phase one immediately.
             try self.log.campaign(.noop, self.effects);
@@ -303,7 +368,7 @@ pub const Node = struct {
             try self.rebuildMaterializedImage();
         }
 
-        if (single) {
+        if (single and capabilities.serves_writes) {
             try self.openLiveDatabase();
             try self.bootstrapSchema();
         }
@@ -336,6 +401,14 @@ pub const Node = struct {
         return self.log.core.role == .leader;
     }
 
+    pub fn isVoter(self: *const Node) bool {
+        return self.capabilities.votes;
+    }
+
+    pub fn role(self: *const Node) roles.Role {
+        return self.product_role;
+    }
+
     pub fn currentLeader(self: *const Node) ?paxos.NodeId {
         return self.log.currentLeader();
     }
@@ -350,6 +423,18 @@ pub const Node = struct {
     /// Processes one protocol message from a peer.
     pub fn stepEnvelope(self: *Node, envelope: Log.Envelope) !void {
         try self.log.step(envelope, self.effects);
+        try self.consumeEffects();
+    }
+
+    /// Learns a voter-certified chosen entry. The commit is journaled and
+    /// synced before it is applied to the SQLite materialization.
+    pub fn learnChosen(
+        self: *Node,
+        from: paxos.NodeId,
+        slot: paxos.Slot,
+        entry: types.Entry,
+    ) !void {
+        try self.log.learnChosen(from, slot, entry, self.effects);
         try self.consumeEffects();
     }
 
@@ -385,11 +470,42 @@ pub const Node = struct {
     /// In a one-member configuration the result is committed and applied
     /// on return; in a cluster the host must await `applied_slot`.
     pub fn exec(self: *Node, sql: [:0]const u8) !ExecResult {
+        if (!self.capabilities.serves_writes) return error.RoleCannotWrite;
         return self.writeTransaction(sql, null);
+    }
+
+    /// Executes one prepared statement as a replicated SQLite transaction.
+    /// Parameter bytes are borrowed only for the duration of this call.
+    pub fn execPrepared(
+        self: *Node,
+        sql: []const u8,
+        values: []const prepared.Value,
+    ) !ExecResult {
+        if (!self.capabilities.serves_writes) return error.RoleCannotWrite;
+        const statements = [_]prepared.Statement{.{
+            .sql = sql,
+            .values = values,
+        }};
+        return self.writePreparedTransaction(&statements, null);
+    }
+
+    /// Commits a completed multi-call transaction builder as one replicated
+    /// WAL transition. A builder is single-use even when execution fails,
+    /// preventing accidental retry without an idempotent session.
+    pub fn execTransaction(
+        self: *Node,
+        transaction: *prepared.Transaction,
+    ) !ExecResult {
+        if (!self.capabilities.serves_writes) return error.RoleCannotWrite;
+        try transaction.markFinished();
+        return self.writePreparedTransaction(transaction.slice(), null);
     }
 
     /// Opens a replicated client session for idempotent retry.
     pub fn openSession(self: *Node) !u64 {
+        if (!self.capabilities.serves_writes) return error.RoleCannotWrite;
+        if (self.fatal_storage_error) return error.StorageFailed;
+        if (self.needs_resync) try self.resyncImage();
         const next_id = 1 + try self.metaInt("session_counter");
         const sql = try std.fmt.allocPrintSentinel(
             self.gpa,
@@ -423,6 +539,8 @@ pub const Node = struct {
         session_id: u64,
         sequence: u64,
     ) !SessionCheck {
+        if (self.fatal_storage_error) return error.StorageFailed;
+        if (self.needs_resync) try self.resyncImage();
         var lease = try self.readLease();
         defer lease.release();
         var stmt = try lease.db.prepare(
@@ -492,6 +610,19 @@ pub const Node = struct {
     /// On a member without the live writer connection this opens a
     /// short-lived connection against the materialized image.
     pub fn query(self: *Node, gpa: std.mem.Allocator, sql: []const u8) !QueryResult {
+        return self.queryPrepared(gpa, sql, &.{});
+    }
+
+    /// Runs one read-only prepared query and returns copied result values.
+    pub fn queryPrepared(
+        self: *Node,
+        gpa: std.mem.Allocator,
+        sql: []const u8,
+        values: []const prepared.Value,
+    ) !QueryResult {
+        if (!self.capabilities.serves_reads) return error.RoleCannotRead;
+        if (self.fatal_storage_error) return error.StorageFailed;
+        if (self.needs_resync) try self.resyncImage();
         var lease = try self.readLease();
         defer lease.release();
 
@@ -505,6 +636,7 @@ pub const Node = struct {
         };
         defer stmt.finalize();
         if (!stmt.isReadOnly()) return error.WriteInReadQuery;
+        try prepared.bind(&stmt, values);
 
         const column_count = stmt.columnCount();
         const columns = try alloc.alloc([]const u8, column_count);
@@ -558,6 +690,7 @@ pub const Node = struct {
             .database_id = self.identity.database_id,
             .configuration_id = self.identity.configuration_id,
             .role = @tagName(self.log.core.role),
+            .node_type = self.product_role.name(),
             .leader = self.log.currentLeader(),
             .ballot = self.log.core.ballot,
             .decided_slot = self.log.decidedThrough(),
@@ -568,6 +701,10 @@ pub const Node = struct {
             .page_size = self.page_size,
             .snapshot = snapshot_name,
         };
+    }
+
+    pub fn memberIds(self: *const Node) []const paxos.NodeId {
+        return self.members[0..self.member_count];
     }
 
     /// Takes an online snapshot, seals the epoch, and starts the next one.
@@ -585,6 +722,9 @@ pub const Node = struct {
     /// stop sign that seals the epoch. Leader only; no write may be in
     /// flight. In a cluster the decision arrives asynchronously.
     pub fn prepareCheckpoint(self: *Node) !void {
+        if (!self.capabilities.serves_writes) return error.RoleCannotWrite;
+        if (self.fatal_storage_error) return error.StorageFailed;
+        if (self.needs_resync) try self.resyncImage();
         if (!self.db_open) try self.ensureWriter();
         if (self.db.inTransaction()) return error.TransactionOpen;
         if (self.capture_batch_id != null) return error.WriteInFlight;
@@ -647,12 +787,22 @@ pub const Node = struct {
         defer tmp_dir.close(self.io);
 
         try self.dir.copyFile(db_file_name, tmp_dir, "db", self.io, .{});
+        {
+            const snapshot_db = try tmp_dir.openFile(
+                self.io,
+                "db",
+                .{ .mode = .read_write },
+            );
+            defer snapshot_db.close(self.io);
+            try snapshot_db.sync(self.io);
+        }
         const db_digest = try fileSha256(self.io, tmp_dir, "db");
 
         const manifest = try self.renderManifest(manifest_applied_slot, db_digest);
         defer self.gpa.free(manifest);
         try atomicWriteFile(self.io, tmp_dir, "manifest", manifest);
         try self.dir.rename(tmp_path, self.dir, final_path, self.io);
+        try durability.syncChildDirectory(self.io, self.dir, "snapshots");
 
         var metadata = SnapshotMetadata{ .buffer = undefined, .len = 0 };
         const manifest_digest = PayloadStore.hashOf(manifest);
@@ -689,6 +839,8 @@ pub const Node = struct {
 
     /// Streams a consistent logical backup into `destination`.
     pub fn backup(self: *Node, destination: []const u8) !void {
+        if (self.fatal_storage_error) return error.StorageFailed;
+        if (self.needs_resync) try self.resyncImage();
         var lease = try self.readLease();
         defer lease.release();
         var stmt = lease.db.prepare("vacuum into ?1") catch |err| {
@@ -700,6 +852,58 @@ pub const Node = struct {
         _ = stmt.step() catch |err| {
             self.saveErrorFrom(&lease.db);
             return err;
+        };
+    }
+
+    pub const BackupHandle = struct {
+        node: *Node,
+        file: Io.File,
+        size: u64,
+        sha256: [32]u8,
+        name: [64]u8,
+        name_length: usize,
+
+        pub fn close(self: *BackupHandle) void {
+            self.file.close(self.node.io);
+            self.node.dir.deleteFile(
+                self.node.io,
+                self.name[0..self.name_length],
+            ) catch {};
+            self.* = undefined;
+        }
+    };
+
+    /// Creates an immutable logical backup for bounded streaming. The caller
+    /// must close the returned handle, which removes the temporary image.
+    pub fn openBackup(self: *Node) !BackupHandle {
+        var random_bytes: [8]u8 = undefined;
+        self.io.random(&random_bytes);
+        const nonce = std.mem.readInt(u64, &random_bytes, .little);
+        var name: [64]u8 = undefined;
+        const rendered = std.fmt.bufPrint(
+            &name,
+            ".remote-backup-{x}.db",
+            .{nonce},
+        ) catch unreachable;
+        self.dir.deleteFile(self.io, rendered) catch {};
+        const directory = std.fs.path.dirname(self.db_path) orelse ".";
+        var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const destination = try std.fmt.bufPrint(
+            &path_buffer,
+            "{s}/{s}",
+            .{ directory, rendered },
+        );
+        try self.backup(destination);
+        errdefer self.dir.deleteFile(self.io, rendered) catch {};
+        const file = try self.dir.openFile(self.io, rendered, .{});
+        errdefer file.close(self.io);
+        return .{
+            .node = self,
+            .file = file,
+            .size = try file.length(self.io),
+            .sha256 = try fileSha256(self.io, self.dir, rendered),
+            .name = name,
+            .name_length = rendered.len,
         };
     }
 
@@ -729,6 +933,8 @@ pub const Node = struct {
     /// Verifies the SQLite image, the descriptor chain, and payload
     /// availability for the committed suffix.
     pub fn integrityCheck(self: *Node) !IntegrityReport {
+        if (self.fatal_storage_error) return error.StorageFailed;
+        if (self.needs_resync) try self.resyncImage();
         var report = IntegrityReport{
             .sqlite_ok = blk: {
                 var lease = self.readLease() catch |err| {
@@ -746,6 +952,7 @@ pub const Node = struct {
             report.chain_ok = false;
             return report;
         };
+        var data_slot: paxos.Slot = 0;
         var slot: paxos.Slot = 1;
         const decided = self.log.decidedThrough();
         while (slot <= decided) : (slot += 1) {
@@ -753,15 +960,24 @@ pub const Node = struct {
             switch (entry) {
                 .command => |cmd| switch (cmd) {
                     .transaction_batch => |batch| {
-                        if (!std.mem.eql(u8, &batch.base_chain_hash, &chain) or
+                        if (batch.database_id != self.identity.database_id or
+                            batch.base_data_slot != data_slot or
+                            !std.mem.eql(u8, &batch.base_chain_hash, &chain) or
                             !command.chainValid(batch))
                         {
                             report.chain_ok = false;
                         }
                         chain = batch.result_chain_hash;
-                        if (!self.store.contains(batch.payload_hash)) {
+                        const payload = self.store.load(self.gpa, batch.payload_hash) catch {
                             report.payloads_ok = false;
-                        }
+                            continue;
+                        };
+                        defer self.gpa.free(payload);
+                        _ = self.validateBatchPayload(batch, payload) catch {
+                            report.payloads_ok = false;
+                            continue;
+                        };
+                        data_slot = slot;
                     },
                     else => {},
                 },
@@ -780,9 +996,15 @@ pub const Node = struct {
         sequence: u64,
     };
 
+    const WriteRequest = union(enum) {
+        raw: [:0]const u8,
+        prepared: []const prepared.Statement,
+    };
+
     /// Opens the live writer (capture) connection. The materialized image
     /// must be current; the host calls this when it holds leadership.
     pub fn ensureWriter(self: *Node) !void {
+        if (!self.capabilities.serves_writes) return error.RoleCannotWrite;
         if (self.db_open) return;
         std.debug.assert(!self.needs_resync);
         try self.openLiveDatabase();
@@ -844,6 +1066,24 @@ pub const Node = struct {
         sql: [:0]const u8,
         session: ?SessionUpdate,
     ) !ExecResult {
+        return self.writeRequest(.{ .raw = sql }, session);
+    }
+
+    fn writePreparedTransaction(
+        self: *Node,
+        statements: []const prepared.Statement,
+        session: ?SessionUpdate,
+    ) !ExecResult {
+        return self.writeRequest(.{ .prepared = statements }, session);
+    }
+
+    fn writeRequest(
+        self: *Node,
+        request: WriteRequest,
+        session: ?SessionUpdate,
+    ) !ExecResult {
+        if (self.fatal_storage_error) return error.StorageFailed;
+        if (self.needs_resync) try self.resyncImage();
         if (self.rollover_pending) {
             if (!self.single) return error.LogSealed;
             try self.completeClusterRollover();
@@ -866,10 +1106,19 @@ pub const Node = struct {
         // frames carry them atomically with the user's changes.
         try self.db.exec("begin immediate");
         errdefer self.db.exec("rollback") catch {};
+        var committed_without_log = false;
+        errdefer if (committed_without_log) {
+            self.capture_batch_id = null;
+            self.needs_resync = true;
+        };
 
         const changes_before = self.totalChanges();
         self.saved_error_len = 0;
-        self.db.exec(sql) catch |err| {
+        const execution = switch (request) {
+            .raw => |sql| self.db.exec(sql),
+            .prepared => |statements| prepared.execute(&self.db, statements),
+        };
+        execution catch |err| {
             self.saveErrorFrom(&self.db);
             return err;
         };
@@ -904,6 +1153,7 @@ pub const Node = struct {
             _ = try stmt.step();
         }
         try self.db.exec("commit");
+        committed_without_log = true;
 
         // Capture the committed frames and persist them as one payload.
         if (self.committed_frames <= self.captured_frames) {
@@ -935,8 +1185,14 @@ pub const Node = struct {
             &frames,
         );
         defer self.gpa.free(payload);
+        if (payload.len > command.max_payload_bytes) {
+            return error.TransactionTooLarge;
+        }
         failpoint.hit("before_payload_sync");
-        const payload_hash = try self.store.put(payload);
+        const payload_hash = self.store.put(payload) catch |err| {
+            self.fatal_storage_error = true;
+            return err;
+        };
         failpoint.hit("after_payload_sync");
 
         var batch = command.TransactionBatch{
@@ -965,6 +1221,7 @@ pub const Node = struct {
         };
         self.capture_batch_id = batch_id;
         try self.consumeEffects();
+        committed_without_log = false;
         if (self.single and self.applied_slot < slot) return error.CommitIncomplete;
         const result = ExecResult{ .changes = changes, .slot = slot };
         self.last_append = result;
@@ -1054,12 +1311,22 @@ pub const Node = struct {
         while (true) {
             const writes = self.effects.writesSlice();
             if (writes.len > 0) {
-                try self.journal.appendWrites(writes);
+                self.journal.appendWrites(writes) catch |err| {
+                    self.fatal_storage_error = true;
+                    return err;
+                };
                 failpoint.hit("after_accept_append");
-                try self.journal.sync();
+                self.delayStorage();
+                self.journal.sync() catch |err| {
+                    self.fatal_storage_error = true;
+                    return err;
+                };
                 failpoint.hit("after_accept_sync");
             }
             self.effects.confirmWritesDurable();
+            if (self.effects.committedSlice().len > 0) {
+                failpoint.hit("after_commit_sync_before_apply");
+            }
 
             var pending: usize = 0;
             for (self.effects.messagesSlice()) |envelope| {
@@ -1070,7 +1337,10 @@ pub const Node = struct {
                     try self.outbox.append(self.gpa, envelope);
                 }
             }
-            try self.accountCommitted(self.effects.committedSlice());
+            self.accountCommitted(self.effects.committedSlice()) catch |err| {
+                self.fatal_storage_error = true;
+                return err;
+            };
             self.effects.reset();
             if (pending == 0) return;
             for (self.inbox[0..pending]) |envelope| {
@@ -1085,8 +1355,15 @@ pub const Node = struct {
         while (true) {
             const writes = self.effects.writesSlice();
             if (writes.len > 0) {
-                try self.journal.appendWrites(writes);
-                try self.journal.sync();
+                self.journal.appendWrites(writes) catch |err| {
+                    self.fatal_storage_error = true;
+                    return err;
+                };
+                self.delayStorage();
+                self.journal.sync() catch |err| {
+                    self.fatal_storage_error = true;
+                    return err;
+                };
             }
             self.effects.confirmWritesDurable();
             var pending: usize = 0;
@@ -1119,7 +1396,8 @@ pub const Node = struct {
                         }
                     },
                     .transaction_batch => |batch| {
-                        if (!std.mem.eql(u8, &batch.base_chain_hash, &self.last_chain) or
+                        if (batch.database_id != self.identity.database_id or
+                            !std.mem.eql(u8, &batch.base_chain_hash, &self.last_chain) or
                             batch.base_data_slot != self.last_data_slot or
                             !command.chainValid(batch))
                         {
@@ -1157,9 +1435,21 @@ pub const Node = struct {
         }
     }
 
+    fn delayStorage(self: *Node) void {
+        if (self.test_storage_delay_ms == 0) return;
+        self.io.sleep(
+            .fromMilliseconds(@intCast(self.test_storage_delay_ms)),
+            .awake,
+        ) catch {};
+    }
+
     /// True when the host must run `resyncImage` before further service.
     pub fn needsResync(self: *const Node) bool {
         return self.needs_resync;
+    }
+
+    pub fn storageFailed(self: *const Node) bool {
+        return self.fatal_storage_error;
     }
 
     /// Applies one committed payload offline to the materialized image.
@@ -1168,11 +1458,7 @@ pub const Node = struct {
             return error.PayloadMissing;
         };
         defer self.gpa.free(payload);
-        if (payload.len != batch.payload_bytes) return error.PayloadCorrupt;
-        const view = try wal.PayloadView.parse(payload);
-        if (view.database_id != self.identity.database_id) {
-            return error.DatabaseMismatch;
-        }
+        const view = try self.validateBatchPayload(batch, payload);
         // Stale working artifacts from a previous read connection.
         self.dir.deleteFile(self.io, wal_file_name) catch {};
         self.dir.deleteFile(self.io, shm_file_name) catch {};
@@ -1183,6 +1469,29 @@ pub const Node = struct {
         defer file.close(self.io);
         try wal.applyPayload(self.io, file, &view);
         try file.sync(self.io);
+    }
+
+    /// Cross-checks the fixed Paxos descriptor against the immutable payload.
+    /// A valid content hash alone is not enough: descriptor counts, database
+    /// identity, and page geometry are part of the replicated transition.
+    fn validateBatchPayload(
+        self: *Node,
+        batch: command.TransactionBatch,
+        payload: []const u8,
+    ) !wal.PayloadView {
+        if (batch.database_id != self.identity.database_id) {
+            return error.DatabaseMismatch;
+        }
+        if (payload.len != batch.payload_bytes) return error.PayloadCorrupt;
+        const view = try wal.PayloadView.parse(payload);
+        if (view.database_id != batch.database_id) return error.DatabaseMismatch;
+        if (view.transaction_count != batch.transaction_count or
+            view.frame_count != batch.frame_count or
+            view.page_size != self.page_size)
+        {
+            return error.PayloadDescriptorMismatch;
+        }
+        return view;
     }
 
     // ------------------------------------------------------------------
@@ -1204,20 +1513,33 @@ pub const Node = struct {
             else => return err,
         };
 
-        var have_image = true;
-        self.dir.access(self.io, db_file_name, .{}) catch {
-            have_image = false;
+        // The image is never an input to recovery. Reusing it would allow a
+        // speculative or corrupted page inherited from the snapshot base but
+        // untouched by this epoch's suffix to survive replay.
+        self.dir.deleteFile(self.io, db_file_name) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
         };
-        if (!have_image) {
-            if (try self.currentSnapshotName()) |name| {
-                var snapshot_db_path_buffer: [64]u8 = undefined;
-                const snapshot_db_path = std.fmt.bufPrint(
-                    &snapshot_db_path_buffer,
-                    "snapshots/{s}/db",
-                    .{&name},
-                ) catch unreachable;
-                try self.dir.copyFile(snapshot_db_path, self.dir, db_file_name, self.io, .{});
+        var snapshot_covers_current_epoch = false;
+        if (try self.currentSnapshotName()) |name| {
+            const sealed_configuration = try self.snapshotSealedConfiguration(name);
+            if (sealed_configuration == self.identity.configuration_id) {
+                // Crash after CURRENT installation but before identity/journal
+                // rollover: this generation already covers the sealed epoch.
+                if (self.log.isReconfigured() == null) return error.CorruptManifest;
+                snapshot_covers_current_epoch = true;
+            } else if (sealed_configuration == std.math.maxInt(u64) or
+                sealed_configuration + 1 != self.identity.configuration_id)
+            {
+                return error.ConfigurationMismatch;
             }
+            var snapshot_db_path_buffer: [64]u8 = undefined;
+            const snapshot_db_path = std.fmt.bufPrint(
+                &snapshot_db_path_buffer,
+                "snapshots/{s}/db",
+                .{&name},
+            ) catch unreachable;
+            try self.dir.copyFile(snapshot_db_path, self.dir, db_file_name, self.io, .{});
         }
 
         self.last_chain = try self.epochBaseChain();
@@ -1228,6 +1550,13 @@ pub const Node = struct {
 
         const decided = self.log.decidedThrough();
         if (decided == 0) return;
+
+        if (snapshot_covers_current_epoch) {
+            self.applied_slot = decided;
+            self.rollover_pending = true;
+            self.stop_slot = decided;
+            return;
+        }
 
         const file = try self.dir.createFile(self.io, db_file_name, .{
             .read = true,
@@ -1242,7 +1571,8 @@ pub const Node = struct {
                 .command => |cmd| switch (cmd) {
                     .noop, .read_barrier => {},
                     .transaction_batch => |batch| {
-                        if (!std.mem.eql(u8, &batch.base_chain_hash, &self.last_chain) or
+                        if (batch.database_id != self.identity.database_id or
+                            !std.mem.eql(u8, &batch.base_chain_hash, &self.last_chain) or
                             batch.base_data_slot != self.last_data_slot or
                             !command.chainValid(batch))
                         {
@@ -1254,11 +1584,7 @@ pub const Node = struct {
                             return error.PayloadMissing;
                         };
                         defer self.gpa.free(payload);
-                        if (payload.len != batch.payload_bytes) return error.PayloadCorrupt;
-                        const view = try wal.PayloadView.parse(payload);
-                        if (view.database_id != self.identity.database_id) {
-                            return error.DatabaseMismatch;
-                        }
+                        const view = try self.validateBatchPayload(batch, payload);
                         try wal.applyPayload(self.io, file, &view);
                         self.last_chain = batch.result_chain_hash;
                         self.last_data_slot = slot;
@@ -1343,6 +1669,136 @@ pub const Node = struct {
             return chain;
         }
         return command.genesisChain(self.identity.database_id);
+    }
+
+    fn snapshotSealedConfiguration(self: *Node, name: [16]u8) !u64 {
+        var manifest_path_buffer: [64]u8 = undefined;
+        const manifest_path = std.fmt.bufPrint(
+            &manifest_path_buffer,
+            "snapshots/{s}/manifest",
+            .{&name},
+        ) catch unreachable;
+        const manifest = try self.dir.readFileAlloc(
+            self.io,
+            manifest_path,
+            self.gpa,
+            .limited(4096),
+        );
+        defer self.gpa.free(manifest);
+        const sealed_text = manifestValue(manifest, "sealed_configuration_id") orelse
+            return error.CorruptManifest;
+        return std.fmt.parseInt(u64, sealed_text, 10) catch
+            error.CorruptManifest;
+    }
+
+    /// Validates every field that binds an installed snapshot generation to
+    /// this database and verifies the image digest before it can become a
+    /// recovery base. Returns the sealed (previous) configuration ID.
+    fn validateSnapshotGeneration(self: *Node, name: [16]u8) !u64 {
+        var directory_path_buffer: [64]u8 = undefined;
+        const directory_path = std.fmt.bufPrint(
+            &directory_path_buffer,
+            "snapshots/{s}",
+            .{&name},
+        ) catch unreachable;
+        var snapshot_dir = try self.dir.openDir(self.io, directory_path, .{});
+        defer snapshot_dir.close(self.io);
+        const manifest = try snapshot_dir.readFileAlloc(
+            self.io,
+            "manifest",
+            self.gpa,
+            .limited(4096),
+        );
+        defer self.gpa.free(manifest);
+
+        const format = manifestValue(manifest, "format") orelse
+            return error.CorruptManifest;
+        if (!std.mem.eql(u8, format, "1")) return error.CorruptManifest;
+        const database_text = manifestValue(manifest, "database_id") orelse
+            return error.CorruptManifest;
+        const database_id = std.fmt.parseInt(u128, database_text, 16) catch
+            return error.CorruptManifest;
+        if (database_id != self.identity.database_id) return error.DatabaseMismatch;
+        const sealed_text = manifestValue(manifest, "sealed_configuration_id") orelse
+            return error.CorruptManifest;
+        const sealed = std.fmt.parseInt(u64, sealed_text, 10) catch
+            return error.CorruptManifest;
+        var expected_name_buffer: [16]u8 = undefined;
+        const expected_name = std.fmt.bufPrint(
+            &expected_name_buffer,
+            "{x:0>16}",
+            .{sealed},
+        ) catch unreachable;
+        if (!std.mem.eql(u8, expected_name, &name)) return error.CorruptManifest;
+        const applied = manifestValue(manifest, "applied_slot") orelse
+            return error.CorruptManifest;
+        _ = std.fmt.parseInt(paxos.Slot, applied, 10) catch
+            return error.CorruptManifest;
+        const chain_hex = manifestValue(manifest, "chain") orelse
+            return error.CorruptManifest;
+        var chain: command.HashBytes = undefined;
+        if (chain_hex.len != chain.len * 2) return error.CorruptManifest;
+        _ = std.fmt.hexToBytes(&chain, chain_hex) catch return error.CorruptManifest;
+        const digest_hex = manifestValue(manifest, "db_sha256") orelse
+            return error.CorruptManifest;
+        var expected_digest: [32]u8 = undefined;
+        if (digest_hex.len != expected_digest.len * 2) return error.CorruptManifest;
+        _ = std.fmt.hexToBytes(&expected_digest, digest_hex) catch
+            return error.CorruptManifest;
+        const actual_digest = try fileSha256(self.io, snapshot_dir, "db");
+        if (!std.mem.eql(u8, &actual_digest, &expected_digest)) {
+            return error.SnapshotDigestMismatch;
+        }
+        return sealed;
+    }
+
+    /// Switches an interrupted receiver to the empty epoch immediately after
+    /// its verified snapshot. The old journal remains as a recovery fallback
+    /// and is collected by a later successful rollover.
+    fn activateInstalledSnapshot(
+        self: *Node,
+        configuration_id: u64,
+        membership: *const Log.Membership,
+    ) !void {
+        var new_journal = Journal.create(
+            self.io,
+            self.dir,
+            configuration_id,
+        ) catch |err| switch (err) {
+            error.PathAlreadyExists => blk: {
+                const durable = try self.gpa.create(Log.DurableState);
+                defer self.gpa.destroy(durable);
+                durable.* = .{};
+                var info: journal_mod.ReplayInfo = undefined;
+                var opened = try Journal.open(
+                    self.io,
+                    self.gpa,
+                    self.dir,
+                    configuration_id,
+                    durable,
+                    &info,
+                );
+                if (info.record_count != 0) {
+                    opened.close();
+                    return error.ConfigurationMismatch;
+                }
+                break :blk opened;
+            },
+            else => return err,
+        };
+        var journal_installed = false;
+        errdefer if (!journal_installed) new_journal.close();
+        try writeIdentity(self.io, self.dir, .{
+            .node_id = self.identity.node_id,
+            .database_id = self.identity.database_id,
+            .configuration_id = configuration_id,
+            .role = self.identity.role,
+        });
+        self.journal.close();
+        self.journal = new_journal;
+        journal_installed = true;
+        self.identity.configuration_id = configuration_id;
+        try self.initLogForRole(configuration_id, membership);
     }
 
     fn currentSnapshotName(self: *Node) !?[16]u8 {
@@ -1452,6 +1908,10 @@ pub const Node = struct {
         if (!std.mem.eql(u8, &manifest_digest, &parsed.manifest_hash)) {
             return error.SnapshotDigestMismatch;
         }
+        const sealed_configuration = try self.validateSnapshotGeneration(parsed.name);
+        if (sealed_configuration != self.identity.configuration_id) {
+            return error.ConfigurationMismatch;
+        }
 
         // Collect payload hashes still referenced by the sealed epoch before
         // its in-memory state is replaced; they stay until its journal is
@@ -1477,7 +1937,7 @@ pub const Node = struct {
                 defer self.gpa.destroy(durable);
                 durable.* = .{};
                 var info: journal_mod.ReplayInfo = undefined;
-                break :blk try Journal.open(
+                var opened = try Journal.open(
                     self.io,
                     self.gpa,
                     self.dir,
@@ -1485,34 +1945,38 @@ pub const Node = struct {
                     durable,
                     &info,
                 );
+                if (info.record_count != 0) {
+                    opened.close();
+                    return error.ConfigurationMismatch;
+                }
+                break :blk opened;
             },
             else => return err,
         };
-        errdefer new_journal.close();
+        var journal_installed = false;
+        errdefer if (!journal_installed) new_journal.close();
 
         try writeIdentity(self.io, self.dir, .{
             .node_id = self.identity.node_id,
             .database_id = self.identity.database_id,
             .configuration_id = new_configuration,
+            .role = self.identity.role,
         });
         self.identity.configuration_id = new_configuration;
 
         self.journal.close();
         self.journal = new_journal;
+        journal_installed = true;
 
         var membership: Log.Membership = undefined;
-        try self.log.initFromStop(
-            self.identity.node_id,
-            &stop,
-            &membership,
-            self.leader_priority,
-        );
+        try membership.init(stop.membersSlice());
+        try self.initLogForRole(new_configuration, &membership);
         self.applied_slot = 0;
         self.last_data_slot = 0;
         self.rollover_pending = false;
         self.stop_slot = 0;
         self.last_chain = try self.epochBaseChain();
-        if (self.single or was_leader) {
+        if (self.capabilities.campaigns and (self.single or was_leader)) {
             try self.log.campaign(.noop, self.effects);
             try self.consumeEffects();
         }
@@ -1546,11 +2010,40 @@ pub const Node = struct {
         }
 
         // Validate the transferred image against the manifest.
+        const format = manifestValue(manifest, "format") orelse
+            return error.CorruptManifest;
+        if (!std.mem.eql(u8, format, "1")) return error.CorruptManifest;
         const database_text = manifestValue(manifest, "database_id") orelse
             return error.CorruptManifest;
         const database_id = std.fmt.parseInt(u128, database_text, 16) catch
             return error.CorruptManifest;
         if (database_id != self.identity.database_id) return error.DatabaseMismatch;
+        const sealed_text = manifestValue(manifest, "sealed_configuration_id") orelse
+            return error.CorruptManifest;
+        const sealed_configuration = std.fmt.parseInt(u64, sealed_text, 10) catch
+            return error.CorruptManifest;
+        if (sealed_configuration == std.math.maxInt(u64) or
+            sealed_configuration + 1 != configuration_id)
+        {
+            return error.ConfigurationMismatch;
+        }
+        var expected_name_buffer: [16]u8 = undefined;
+        const expected_name = std.fmt.bufPrint(
+            &expected_name_buffer,
+            "{x:0>16}",
+            .{sealed_configuration},
+        ) catch unreachable;
+        if (!std.mem.eql(u8, expected_name, &name)) return error.CorruptManifest;
+        const applied_text = manifestValue(manifest, "applied_slot") orelse
+            return error.CorruptManifest;
+        _ = std.fmt.parseInt(paxos.Slot, applied_text, 10) catch
+            return error.CorruptManifest;
+        const chain_hex = manifestValue(manifest, "chain") orelse
+            return error.CorruptManifest;
+        var snapshot_chain: command.HashBytes = undefined;
+        if (chain_hex.len != snapshot_chain.len * 2) return error.CorruptManifest;
+        _ = std.fmt.hexToBytes(&snapshot_chain, chain_hex) catch
+            return error.CorruptManifest;
         const digest_hex = manifestValue(manifest, "db_sha256") orelse
             return error.CorruptManifest;
         var expected_digest: [32]u8 = undefined;
@@ -1575,6 +2068,7 @@ pub const Node = struct {
         ) catch unreachable;
         self.dir.deleteTree(self.io, final_path) catch {};
         try self.dir.rename(install_tmp_dir, self.dir, final_path, self.io);
+        try durability.syncChildDirectory(self.io, self.dir, "snapshots");
         try atomicWriteFile(self.io, self.dir, current_file_name, &name);
 
         // The old epoch is sealed and fully covered by this snapshot; its
@@ -1589,18 +2083,14 @@ pub const Node = struct {
             .node_id = self.identity.node_id,
             .database_id = self.identity.database_id,
             .configuration_id = configuration_id,
+            .role = self.identity.role,
         });
         self.identity.configuration_id = configuration_id;
         self.journal = try Journal.create(self.io, self.dir, configuration_id);
 
         var membership: Log.Membership = undefined;
         try membership.init(self.members[0..self.member_count]);
-        try self.log.initWithPriority(
-            self.identity.node_id,
-            configuration_id,
-            &membership,
-            self.leader_priority,
-        );
+        try self.initLogForRole(configuration_id, &membership);
         self.capture_batch_id = null;
         self.needs_resync = false;
         self.rollover_pending = false;
@@ -1608,6 +2098,28 @@ pub const Node = struct {
 
         self.dir.deleteFile(self.io, db_file_name) catch {};
         try self.rebuildMaterializedImage();
+    }
+
+    fn initLogForRole(
+        self: *Node,
+        configuration_id: u64,
+        membership: *const Log.Membership,
+    ) !void {
+        if (self.capabilities.votes) {
+            try self.log.initWithPriority(
+                self.identity.node_id,
+                configuration_id,
+                membership,
+                self.leader_priority,
+            );
+            self.log.core.setCampaignEnabled(self.capabilities.campaigns);
+        } else {
+            try self.log.initLearner(
+                self.identity.node_id,
+                configuration_id,
+                membership,
+            );
+        }
     }
 
     fn deleteAllJournals(self: *Node) !void {
@@ -1670,7 +2182,7 @@ pub const Node = struct {
             var name_buffer: [26]u8 = undefined;
             const name = journal_mod.fileName(&name_buffer, configuration);
             self.dir.deleteFile(self.io, name) catch |err| switch (err) {
-                error.FileNotFound => break,
+                error.FileNotFound => continue,
                 else => return err,
             };
         }
@@ -1792,6 +2304,7 @@ fn loadOrCreateIdentity(
     dir: Io.Dir,
     node_id: paxos.NodeId,
     fixed_database_id: ?u128,
+    requested_role: roles.Role,
 ) !Identity {
     const bytes = dir.readFileAlloc(io, identity_file_name, gpa, .limited(4096)) catch |err|
         switch (err) {
@@ -1805,6 +2318,7 @@ fn loadOrCreateIdentity(
                     .node_id = node_id,
                     .database_id = database_id,
                     .configuration_id = 1,
+                    .role = requested_role,
                 };
                 try writeIdentity(io, dir, identity);
                 return identity;
@@ -1814,11 +2328,18 @@ fn loadOrCreateIdentity(
     defer gpa.free(bytes);
 
     const format = manifestValue(bytes, "format") orelse return error.CorruptIdentity;
-    if (!std.mem.eql(u8, format, "1")) return error.CorruptIdentity;
+    if (!std.mem.eql(u8, format, "1") and !std.mem.eql(u8, format, "2")) {
+        return error.CorruptIdentity;
+    }
     const node_text = manifestValue(bytes, "node_id") orelse return error.CorruptIdentity;
     const database_text = manifestValue(bytes, "database_id") orelse return error.CorruptIdentity;
     const configuration_text = manifestValue(bytes, "configuration_id") orelse
         return error.CorruptIdentity;
+    const persisted_role = if (std.mem.eql(u8, format, "2")) blk: {
+        const role_text = manifestValue(bytes, "role") orelse
+            return error.CorruptIdentity;
+        break :blk roles.Role.parse(role_text) catch return error.CorruptIdentity;
+    } else roles.Role.data_voter;
 
     const identity = Identity{
         .node_id = std.fmt.parseInt(paxos.NodeId, node_text, 10) catch
@@ -1827,8 +2348,10 @@ fn loadOrCreateIdentity(
             return error.CorruptIdentity,
         .configuration_id = std.fmt.parseInt(u64, configuration_text, 10) catch
             return error.CorruptIdentity,
+        .role = persisted_role,
     };
     if (identity.node_id != node_id) return error.NodeIdMismatch;
+    if (identity.role != requested_role) return error.NodeRoleMismatch;
     if (fixed_database_id) |fixed| {
         if (identity.database_id != fixed) return error.DatabaseMismatch;
     }
@@ -1839,13 +2362,19 @@ fn writeIdentity(io: Io, dir: Io.Dir, identity: Identity) !void {
     var buffer: [256]u8 = undefined;
     const contents = std.fmt.bufPrint(
         &buffer,
-        \\format=1
+        \\format=2
         \\node_id={d}
         \\database_id={x:0>32}
         \\configuration_id={d}
+        \\role={s}
         \\
     ,
-        .{ identity.node_id, identity.database_id, identity.configuration_id },
+        .{
+            identity.node_id,
+            identity.database_id,
+            identity.configuration_id,
+            identity.role.name(),
+        },
     ) catch unreachable;
     try atomicWriteFile(io, dir, identity_file_name, contents);
 }
@@ -1868,6 +2397,7 @@ fn atomicWriteFile(io: Io, dir: Io.Dir, name: []const u8, contents: []const u8) 
     try atomic.file.writePositionalAll(io, contents, 0);
     try atomic.file.sync(io);
     try atomic.replace(io);
+    try durability.syncDirectory(dir);
 }
 
 fn fileSha256(io: Io, dir: Io.Dir, name: []const u8) ![32]u8 {

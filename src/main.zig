@@ -7,8 +7,8 @@
 //!   RPC protocol to running `zaxon serve` processes, following leader
 //!   redirects.
 //!
-//! `zaxon serve` hosts one node behind a TCP endpoint, alone or as one of
-//! three voters.
+//! `zaxon serve` hosts one role-aware node behind a TCP endpoint, alone or in
+//! a runtime-sized cluster registry.
 
 const std = @import("std");
 const zaxonlite = @import("zaxonlite");
@@ -16,6 +16,10 @@ const zaxonlite = @import("zaxonlite");
 const Node = zaxonlite.Node;
 const server = zaxonlite.server;
 const client = zaxonlite.client;
+const gateway = zaxonlite.gateway;
+const configuration = zaxonlite.configuration;
+const diagnostic = zaxonlite.diagnostic;
+const Role = zaxonlite.Role;
 
 const exit_ok: u8 = 0;
 const exit_sql: u8 = 1;
@@ -30,32 +34,37 @@ const usage_text =
     \\  zaxon <command> --data <dir> [options]          embedded mode
     \\  zaxon <command> --connect host:port[,...]       client mode
     \\  zaxon serve --data <dir> --node <id> --listen host:port
-    \\        [--peer <id>@host:port ...] [--cluster-id <text>]
-    \\        [--enable-failpoints]
+    \\        [--role <role>] [--peer <id>@host:port[/role] ...]
+    \\        [--cluster-id <text>]
+    \\        [--auth-file <path>] [--enable-failpoints]
     \\
     \\Commands:
     \\  sql               Interactive SQL shell (embedded or client mode).
     \\  exec              Execute SQL; --session/--sequence for idempotent retry.
-    \\  query             Read-only query. --json; --level any|leader|linearizable.
+    \\  query             Read query. --level any|leader|linearizable.
     \\  session           Open a client session and print its ID.
     \\  status            Show node status. --json for automation.
+    \\  members           Show cluster membership and node roles.
     \\  leader            Show the current leader (client mode).
     \\  wait              Wait for --applied <slot> and/or --leader (client mode).
     \\  snapshot          Take a snapshot and seal the current journal epoch.
     \\  backup            Stream a consistent logical backup. --to <path>.
     \\  integrity-check   Verify SQLite image, descriptor chain, and payloads.
+    \\  recover           Rebuild from authoritative state and verify it.
     \\  expire-sessions   Delete idle sessions; --retain <n> newest activity.
     \\  serve             Host this node behind a TCP endpoint.
     \\  stop              Ask a served node to shut down (client mode).
     \\  version           Print the zaxonlite version.
     \\
     \\Options:
+    \\  --config <path>     JSON config; or ZAXON_CONFIG.
     \\  --data <dir>        Node data directory (created when missing).
     \\  --connect <list>    Comma-separated server endpoints for client mode.
     \\  --sql <text>        SQL for exec/query.
     \\  --session <id>      Session ID for exec.
     \\  --sequence <n>      Monotonic per-session sequence for exec.
-    \\  --level <level>     Read level for query (default leader).
+    \\  --level <level>     Read level for query (default linearizable).
+    \\  --freshness-ms <n>  Maximum age for a local learner read.
     \\  --to <path>         Backup destination path.
     \\  --retain <n>        Activity window for expire-sessions.
     \\  --applied <slot>    Slot to wait for (wait).
@@ -63,8 +72,10 @@ const usage_text =
     \\  --timeout-ms <n>    Wait deadline in milliseconds.
     \\  --node <id>         This node's ID (serve).
     \\  --listen host:port  Listen endpoint (serve).
-    \\  --peer id@host:port Voting peer (repeat; serve).
+    \\  --role <role>       data-voter|witness|standby|read-replica.
+    \\  --peer <spec>       id@host:port[/role] (repeat; serve).
     \\  --cluster-id <text> Extra entropy for the derived database identity.
+    \\  --auth-file <path>  PSK provider; or ZAXON_AUTH_FILE. Never a literal key.
     \\  --enable-failpoints Honor failpoint RPCs (test controllers only).
     \\  --json              Machine-readable output on stdout.
     \\
@@ -75,21 +86,26 @@ const usage_text =
 
 const Options = struct {
     command: []const u8,
+    config: ?[]const u8 = null,
     data: ?[]const u8 = null,
     connect: ?[]const u8 = null,
     sql: ?[:0]const u8 = null,
     session: ?u64 = null,
     sequence: ?u64 = null,
     level: ?[]const u8 = null,
+    freshness_ms: ?u64 = null,
     to: ?[]const u8 = null,
     retain: ?u64 = null,
     applied: ?u64 = null,
     wait_leader: bool = false,
     timeout_ms: ?u64 = null,
     node_id: ?u32 = null,
+    role: Role = .data_voter,
+    role_set: bool = false,
     listen: ?[]const u8 = null,
     peers: std.ArrayList([]const u8) = .empty,
     cluster_id: ?[]const u8 = null,
+    auth_file: ?[]const u8 = null,
     enable_failpoints: bool = false,
     json: bool = false,
 };
@@ -105,8 +121,20 @@ pub fn main(init: std.process.Init) !u8 {
     var stderr_writer = std.Io.File.stderr().writerStreaming(io, &stderr_buffer);
     const err_out = &stderr_writer.interface;
 
-    const code = run(gpa, io, init.minimal.args, out, err_out) catch |err| blk: {
-        err_out.print("zaxon: {s}\n", .{@errorName(err)}) catch {};
+    const code = run(
+        gpa,
+        io,
+        init.minimal.args,
+        init.environ_map,
+        out,
+        err_out,
+    ) catch |err| blk: {
+        diagnostic.write(
+            err_out,
+            "command failed",
+            @errorName(err),
+            "Preserve the error and node logs before retrying.",
+        ) catch {};
         break :blk exit_unavailable;
     };
     out.flush() catch {};
@@ -118,6 +146,7 @@ fn run(
     gpa: std.mem.Allocator,
     io: std.Io,
     args: std.process.Args,
+    environ: *std.process.Environ.Map,
     out: *std.Io.Writer,
     err_out: *std.Io.Writer,
 ) !u8 {
@@ -133,7 +162,10 @@ fn run(
     defer options.peers.deinit(gpa);
 
     while (iterator.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--data")) {
+        if (std.mem.eql(u8, arg, "--config")) {
+            options.config = iterator.next() orelse
+                return usageError(err_out, "--config needs a value");
+        } else if (std.mem.eql(u8, arg, "--data")) {
             options.data = iterator.next() orelse return usageError(err_out, "--data needs a value");
         } else if (std.mem.eql(u8, arg, "--connect")) {
             options.connect = iterator.next() orelse return usageError(err_out, "--connect needs a value");
@@ -149,6 +181,11 @@ fn run(
                 return usageError(err_out, "--sequence must be an integer");
         } else if (std.mem.eql(u8, arg, "--level")) {
             options.level = iterator.next() orelse return usageError(err_out, "--level needs a value");
+        } else if (std.mem.eql(u8, arg, "--freshness-ms")) {
+            const text = iterator.next() orelse
+                return usageError(err_out, "--freshness-ms needs a value");
+            options.freshness_ms = std.fmt.parseInt(u64, text, 10) catch
+                return usageError(err_out, "--freshness-ms must be an integer");
         } else if (std.mem.eql(u8, arg, "--to")) {
             options.to = iterator.next() orelse return usageError(err_out, "--to needs a value");
         } else if (std.mem.eql(u8, arg, "--retain")) {
@@ -171,11 +208,20 @@ fn run(
                 return usageError(err_out, "--node must be an integer");
         } else if (std.mem.eql(u8, arg, "--listen")) {
             options.listen = iterator.next() orelse return usageError(err_out, "--listen needs a value");
+        } else if (std.mem.eql(u8, arg, "--role")) {
+            const text = iterator.next() orelse
+                return usageError(err_out, "--role needs a value");
+            options.role = Role.parse(text) catch
+                return usageError(err_out, "--role is not a known node role");
+            options.role_set = true;
         } else if (std.mem.eql(u8, arg, "--peer")) {
             const text = iterator.next() orelse return usageError(err_out, "--peer needs a value");
             try options.peers.append(gpa, text);
         } else if (std.mem.eql(u8, arg, "--cluster-id")) {
             options.cluster_id = iterator.next() orelse return usageError(err_out, "--cluster-id needs a value");
+        } else if (std.mem.eql(u8, arg, "--auth-file")) {
+            options.auth_file = iterator.next() orelse
+                return usageError(err_out, "--auth-file needs a value");
         } else if (std.mem.eql(u8, arg, "--enable-failpoints")) {
             options.enable_failpoints = true;
         } else if (std.mem.eql(u8, arg, "--json")) {
@@ -184,7 +230,12 @@ fn run(
             try out.writeAll(usage_text);
             return exit_ok;
         } else {
-            try err_out.print("zaxon: unknown option '{s}'\n", .{arg});
+            try diagnostic.write(
+                err_out,
+                "unknown option",
+                arg,
+                "Run 'zaxon help' and remove or correct this option.",
+            );
             return exit_usage;
         }
     }
@@ -197,11 +248,42 @@ fn run(
         try out.writeAll(usage_text);
         return exit_ok;
     }
+    const config_path = options.config orelse environ.get("ZAXON_CONFIG");
+    var loaded_config: ?configuration.Loaded = if (config_path) |path|
+        configuration.loadFile(gpa, io, path) catch |err| {
+            try diagnostic.write(
+                err_out,
+                "configuration unreadable",
+                @errorName(err),
+                "Check the provider path, permissions, and JSON fields.",
+            );
+            return exit_usage;
+        }
+    else
+        null;
+    defer if (loaded_config) |*loaded| loaded.deinit();
+    const file_config = if (loaded_config) |*loaded| loaded.value() else null;
+    applyConfiguration(gpa, environ, file_config, &options, err_out) catch
+        return exit_usage;
+    var secret: ?configuration.Secret = if (options.auth_file) |path|
+        configuration.loadSecret(gpa, io, path) catch |err| {
+            try diagnostic.write(
+                err_out,
+                "authentication provider unreadable",
+                @errorName(err),
+                "Use a readable provider file containing at least 32 bytes.",
+            );
+            return exit_usage;
+        }
+    else
+        null;
+    defer if (secret) |*value| value.deinit(gpa);
+    const secret_bytes: ?[]const u8 = if (secret) |*value| value.bytes else null;
     if (std.mem.eql(u8, command, "serve")) {
-        return serveCommand(gpa, io, &options, err_out);
+        return serveCommand(gpa, io, &options, secret_bytes, err_out);
     }
     if (options.connect != null) {
-        return remote(gpa, io, &options, out, err_out);
+        return remote(gpa, io, &options, secret_bytes, out, err_out);
     }
 
     const data = options.data orelse
@@ -209,11 +291,21 @@ fn run(
 
     const node = Node.open(gpa, io, .{ .directory = data }) catch |err| switch (err) {
         error.NodeLocked => {
-            try err_out.writeAll("zaxon: node directory is locked by another process\n");
+            try diagnostic.write(
+                err_out,
+                "node directory locked",
+                "Another process owns this data directory.",
+                "Stop that process or choose a different --data directory.",
+            );
             return exit_unavailable;
         },
         else => {
-            try err_out.print("zaxon: cannot open node: {s}\n", .{@errorName(err)});
+            try diagnostic.write(
+                err_out,
+                "node open failed",
+                @errorName(err),
+                "Inspect identity, journal, payload, and filesystem diagnostics.",
+            );
             return exit_unavailable;
         },
     };
@@ -238,6 +330,22 @@ fn run(
     } else if (std.mem.eql(u8, command, "status")) {
         try printStatus(node, options.json, out);
         return exit_ok;
+    } else if (std.mem.eql(u8, command, "members")) {
+        const status = node.status();
+        if (options.json) try out.writeAll("{\"membership\":\"static\",\"members\":[");
+        for (node.memberIds(), 0..) |member, index| {
+            if (options.json) {
+                if (index > 0) try out.writeAll(",");
+                try out.print("{d}", .{member});
+            } else {
+                try out.print("node {d}{s}\n", .{
+                    member,
+                    if (member == status.node_id) " (self)" else "",
+                });
+            }
+        }
+        if (options.json) try out.writeAll("]}\n");
+        return exit_ok;
     } else if (std.mem.eql(u8, command, "snapshot")) {
         try node.snapshot();
         const status = node.status();
@@ -257,14 +365,21 @@ fn run(
         const destination = options.to orelse return usageError(err_out, "backup needs --to");
         node.backup(destination) catch |err| switch (err) {
             error.SqliteError => {
-                try err_out.print("zaxon: backup failed: {s}\n", .{node.lastSqliteMessage()});
+                try diagnostic.write(
+                    err_out,
+                    "backup failed",
+                    node.lastSqliteMessage(),
+                    "Choose a new path and verify its parent directory.",
+                );
                 return exit_sql;
             },
             else => return err,
         };
         try out.print("backup written to {s}\n", .{destination});
         return exit_ok;
-    } else if (std.mem.eql(u8, command, "integrity-check")) {
+    } else if (std.mem.eql(u8, command, "integrity-check") or
+        std.mem.eql(u8, command, "recover"))
+    {
         const report = try node.integrityCheck();
         if (options.json) {
             try out.print(
@@ -276,6 +391,9 @@ fn run(
                 "sqlite: {s}\nchain: {s}\npayloads: {s}\n",
                 .{ passFail(report.sqlite_ok), passFail(report.chain_ok), passFail(report.payloads_ok) },
             );
+            if (std.mem.eql(u8, command, "recover")) {
+                try out.writeAll("recovery rebuild complete\n");
+            }
         }
         return if (report.ok()) exit_ok else exit_integrity;
     } else if (std.mem.eql(u8, command, "expire-sessions")) {
@@ -286,14 +404,117 @@ fn run(
         return exit_ok;
     }
 
-    try err_out.print("zaxon: unknown command '{s}'\n", .{command});
+    try diagnostic.write(
+        err_out,
+        "unknown command",
+        command,
+        "Run 'zaxon help' to list the supported commands.",
+    );
     try out.writeAll(usage_text);
     return exit_usage;
 }
 
+/// Applies the public precedence contract: explicit CLI values are already in
+/// `options`; environment values then override file values.
+fn applyConfiguration(
+    gpa: std.mem.Allocator,
+    environ: *std.process.Environ.Map,
+    file: ?*const configuration.File,
+    options: *Options,
+    err_out: *std.Io.Writer,
+) !void {
+    if (options.data == null) {
+        options.data = environ.get("ZAXON_DATA") orelse
+            if (file) |value| value.data else null;
+    }
+    if (options.connect == null) {
+        options.connect = environ.get("ZAXON_CONNECT") orelse
+            if (file) |value| value.connect else null;
+    }
+    if (options.listen == null) {
+        options.listen = environ.get("ZAXON_LISTEN") orelse
+            if (file) |value| value.listen else null;
+    }
+    if (options.cluster_id == null) {
+        options.cluster_id = environ.get("ZAXON_CLUSTER_ID") orelse
+            if (file) |value| value.cluster_id else null;
+    }
+    if (options.auth_file == null) {
+        options.auth_file = environ.get("ZAXON_AUTH_FILE") orelse
+            if (file) |value| value.auth_file else null;
+    }
+    if (options.node_id == null) {
+        if (environ.get("ZAXON_NODE")) |text| {
+            options.node_id = std.fmt.parseInt(u32, text, 10) catch {
+                _ = try usageError(err_out, "ZAXON_NODE must be an integer");
+                return error.InvalidEnvironment;
+            };
+        } else if (file) |value| {
+            options.node_id = value.node;
+        }
+    }
+    if (!options.role_set) {
+        const role_text = environ.get("ZAXON_ROLE") orelse
+            if (file) |value| value.role else null;
+        if (role_text) |text| {
+            options.role = Role.parse(text) catch {
+                _ = try usageError(err_out, "ZAXON_ROLE/config role is unknown");
+                return error.InvalidEnvironment;
+            };
+        }
+    }
+    if (options.peers.items.len == 0) {
+        if (environ.get("ZAXON_PEERS")) |text| {
+            var peers = std.mem.tokenizeScalar(u8, text, ',');
+            while (peers.next()) |peer| try options.peers.append(gpa, peer);
+        } else if (file) |value| {
+            try options.peers.appendSlice(gpa, value.peers);
+        }
+    }
+}
+
 fn usageError(err_out: *std.Io.Writer, message: []const u8) !u8 {
-    try err_out.print("zaxon: {s}\n", .{message});
+    try diagnostic.write(
+        err_out,
+        "invalid command",
+        message,
+        "Run 'zaxon help' to see commands and required options.",
+    );
     return exit_usage;
+}
+
+fn noLeaderDiagnostic(err_out: *std.Io.Writer) !void {
+    try diagnostic.write(
+        err_out,
+        "no reachable leader",
+        "No configured endpoint could complete a leader-only request.",
+        "Restore a voter quorum or verify --connect addresses and credentials.",
+    );
+}
+
+fn malformedResponseDiagnostic(err_out: *std.Io.Writer) !void {
+    try diagnostic.write(
+        err_out,
+        "malformed response",
+        "The peer returned a body outside the Zaxonlite JSON contract.",
+        "Check protocol versions and preserve the peer log for diagnosis.",
+    );
+}
+
+fn remoteHint(code: []const u8) []const u8 {
+    if (std.mem.eql(u8, code, "not_leader")) {
+        return "Retry the advertised leader or restore a voter quorum.";
+    }
+    if (std.mem.eql(u8, code, "stale")) {
+        return "Wait for learner catch-up, relax freshness, or query the leader.";
+    }
+    if (std.mem.eql(u8, code, "sql")) {
+        return "Correct the SQL statement; use exec for statements that write.";
+    }
+    if (std.mem.eql(u8, code, "session")) {
+        return "Retry only the latest sequence in the same unexpired session.";
+    }
+    return "Inspect node status and retry only when the reported condition is resolved.";
 }
 
 fn passFail(ok: bool) []const u8 {
@@ -308,6 +529,7 @@ fn serveCommand(
     gpa: std.mem.Allocator,
     io: std.Io,
     options: *Options,
+    auth_secret: ?[]const u8,
     err_out: *std.Io.Writer,
 ) !u8 {
     const data = options.data orelse
@@ -325,6 +547,7 @@ fn serveCommand(
         .id = node_id,
         .host = listen.host,
         .port = listen.port,
+        .role = options.role,
     });
     for (options.peers.items) |peer_text| {
         const at = std.mem.indexOfScalar(u8, peer_text, '@') orelse
@@ -332,12 +555,21 @@ fn serveCommand(
         const id = std.fmt.parseInt(u32, peer_text[0..at], 10) catch
             return usageError(err_out, "--peer must be id@host:port");
         if (id == node_id) continue;
-        const endpoint = client.Endpoint.parse(peer_text[at + 1 ..]) catch
-            return usageError(err_out, "--peer must be id@host:port");
+        const address_and_role = peer_text[at + 1 ..];
+        const slash = std.mem.lastIndexOfScalar(u8, address_and_role, '/');
+        const address = if (slash) |index| address_and_role[0..index] else address_and_role;
+        const role = if (slash) |index|
+            Role.parse(address_and_role[index + 1 ..]) catch
+                return usageError(err_out, "--peer has an unknown role")
+        else
+            Role.data_voter;
+        const endpoint = client.Endpoint.parse(address) catch
+            return usageError(err_out, "--peer must be id@host:port[/role]");
         try members.append(gpa, .{
             .id = id,
             .host = endpoint.host,
             .port = endpoint.port,
+            .role = role,
         });
     }
 
@@ -346,6 +578,26 @@ fn serveCommand(
     else
         null;
 
+    if (options.role == .gateway) {
+        var backends: std.ArrayList(client.Endpoint) = .empty;
+        defer backends.deinit(gpa);
+        for (members.items) |member| {
+            const capabilities = member.role.capabilities();
+            if (member.id == node_id or
+                (!capabilities.serves_reads and !capabilities.serves_writes))
+            {
+                continue;
+            }
+            try backends.append(gpa, .{ .host = member.host, .port = member.port });
+        }
+        return gateway.serve(gpa, io, .{
+            .listen_host = listen.host,
+            .listen_port = listen.port,
+            .backends = backends.items,
+            .authenticated = auth_secret != null,
+        }, err_out);
+    }
+
     return server.serve(gpa, io, .{
         .directory = data,
         .node_id = node_id,
@@ -353,6 +605,7 @@ fn serveCommand(
         .listen_port = listen.port,
         .members = members.items,
         .database_id = database_id,
+        .auth_secret = auth_secret,
         .enable_failpoints = options.enable_failpoints,
     }, err_out);
 }
@@ -379,6 +632,7 @@ fn remote(
     gpa: std.mem.Allocator,
     io: std.Io,
     options: *Options,
+    auth_secret: ?[]const u8,
     out: *std.Io.Writer,
     err_out: *std.Io.Writer,
 ) !u8 {
@@ -388,7 +642,53 @@ fn remote(
 
     const command = options.command;
     if (std.mem.eql(u8, command, "sql")) {
-        return remoteShell(gpa, io, endpoints.items, out, err_out);
+        return remoteShell(gpa, io, endpoints.items, auth_secret, out, err_out);
+    }
+    if (std.mem.eql(u8, command, "backup")) {
+        const destination = options.to orelse
+            return usageError(err_out, "backup needs --to");
+        const probe = client.callClusterWithSecret(
+            gpa,
+            io,
+            endpoints.items,
+            "{\"op\":\"query\",\"sql\":\"select 1\"}",
+            true,
+            auth_secret,
+        ) catch {
+            try noLeaderDiagnostic(err_out);
+            return exit_unavailable;
+        };
+        defer gpa.free(probe.body);
+        const connection = client.Connection.openWithSecret(
+            gpa,
+            io,
+            probe.endpoint,
+            auth_secret,
+        ) catch {
+            try diagnostic.write(
+                err_out,
+                "backup interrupted",
+                "The selected leader became unavailable.",
+                "Retry against the endpoint list; the destination was not installed.",
+            );
+            return exit_unavailable;
+        };
+        defer connection.close();
+        connection.backupTo(destination) catch |err| {
+            try diagnostic.write(
+                err_out,
+                "remote backup failed",
+                @errorName(err),
+                "Check the destination, cluster health, and transport logs.",
+            );
+            return exit_unavailable;
+        };
+        if (options.json) {
+            try out.writeAll("{\"ok\":true}\n");
+        } else {
+            try out.print("backup written to {s}\n", .{destination});
+        }
+        return exit_ok;
     }
 
     var request: std.Io.Writer.Allocating = .init(gpa);
@@ -412,14 +712,21 @@ fn remote(
         try writer.writeAll("}");
     } else if (std.mem.eql(u8, command, "query")) {
         const sql = options.sql orelse return usageError(err_out, "query needs --sql");
-        const level = options.level orelse "leader";
+        const level = options.level orelse "linearizable";
         require_leader = !std.mem.eql(u8, level, "any");
         try writer.writeAll("{\"op\":\"query\",\"sql\":");
         try writeJsonString(writer, sql);
-        try writer.print(",\"level\":\"{s}\"}}", .{level});
+        try writer.print(",\"level\":\"{s}\"", .{level});
+        if (options.freshness_ms) |freshness| {
+            try writer.print(",\"freshness_ms\":{d}", .{freshness});
+        }
+        try writer.writeAll("}");
     } else if (std.mem.eql(u8, command, "status")) {
         require_leader = false;
         try writer.writeAll("{\"op\":\"status\"}");
+    } else if (std.mem.eql(u8, command, "members")) {
+        require_leader = false;
+        try writer.writeAll("{\"op\":\"members\"}");
     } else if (std.mem.eql(u8, command, "leader")) {
         require_leader = false;
         try writer.writeAll("{\"op\":\"leader\"}");
@@ -448,18 +755,24 @@ fn remote(
         require_leader = false;
         try writer.writeAll("{\"op\":\"stop\"}");
     } else {
-        try err_out.print("zaxon: command '{s}' is not available in client mode\n", .{command});
+        try diagnostic.write(
+            err_out,
+            "unsupported client command",
+            command,
+            "Use --data for this operation or select a remote-capable command.",
+        );
         return exit_usage;
     }
 
-    const result = client.callCluster(
+    const result = client.callClusterWithSecret(
         gpa,
         io,
         endpoints.items,
         request.written(),
         require_leader,
+        auth_secret,
     ) catch {
-        try err_out.writeAll("zaxon: no reachable leader\n");
+        try noLeaderDiagnostic(err_out);
         return exit_unavailable;
     };
     defer gpa.free(result.body);
@@ -476,14 +789,14 @@ fn renderRemote(
     err_out: *std.Io.Writer,
 ) !u8 {
     const parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch {
-        try err_out.print("zaxon: malformed response: {s}\n", .{body});
+        try malformedResponseDiagnostic(err_out);
         return exit_unavailable;
     };
     defer parsed.deinit();
     const object = switch (parsed.value) {
         .object => |*obj| obj,
         else => {
-            try err_out.print("zaxon: malformed response: {s}\n", .{body});
+            try malformedResponseDiagnostic(err_out);
             return exit_unavailable;
         },
     };
@@ -515,7 +828,7 @@ fn renderRemote(
         if (options.json) {
             try out.print("{s}\n", .{body});
         } else {
-            try err_out.print("zaxon: {s}: {s}\n", .{ code, message });
+            try diagnostic.write(err_out, code, message, remoteHint(code));
         }
         if (std.mem.eql(u8, code, "sql") or std.mem.eql(u8, code, "session")) {
             return exit_sql;
@@ -579,6 +892,8 @@ fn renderRemote(
         try out.print("{d} session(s) expired\n", .{jsonInt(object.get("expired")) orelse 0});
     } else if (std.mem.eql(u8, command, "status")) {
         try out.print("{s}\n", .{body});
+    } else if (std.mem.eql(u8, command, "members")) {
+        try out.print("{s}\n", .{body});
     } else {
         try out.print("{s}\n", .{body});
     }
@@ -631,6 +946,7 @@ fn remoteShell(
     gpa: std.mem.Allocator,
     io: std.Io,
     endpoints: []const client.Endpoint,
+    auth_secret: ?[]const u8,
     out: *std.Io.Writer,
     err_out: *std.Io.Writer,
 ) !u8 {
@@ -648,7 +964,12 @@ fn remoteShell(
         try out.flush();
         const raw_line = in.takeDelimiter('\n') catch |err| switch (err) {
             error.StreamTooLong => {
-                try err_out.writeAll("zaxon: input line too long\n");
+                try diagnostic.write(
+                    err_out,
+                    "input line too long",
+                    "The shell statement exceeds its bounded input buffer.",
+                    "Split the statement or run a smaller --sql request.",
+                );
                 try err_out.flush();
                 continue;
             },
@@ -668,14 +989,19 @@ fn remoteShell(
                 pseudo.command = "status";
                 pseudo.json = true;
             } else {
-                try err_out.print("zaxon: unknown dot command '{s}'\n", .{line});
+                try diagnostic.write(
+                    err_out,
+                    "unknown shell command",
+                    line,
+                    "Use .status or .quit, or enter a SQL statement.",
+                );
                 try err_out.flush();
                 continue;
             }
         } else if (isReadStatement(line)) {
             try request.writer.writeAll("{\"op\":\"query\",\"sql\":");
             try writeJsonString(&request.writer, line);
-            try request.writer.writeAll(",\"level\":\"leader\"}");
+            try request.writer.writeAll(",\"level\":\"linearizable\"}");
         } else {
             pseudo.command = "exec";
             try request.writer.writeAll("{\"op\":\"exec\",\"sql\":");
@@ -683,14 +1009,15 @@ fn remoteShell(
             try request.writer.writeAll("}");
         }
 
-        const result = client.callCluster(
+        const result = client.callClusterWithSecret(
             gpa,
             io,
             endpoints,
             request.written(),
             true,
+            auth_secret,
         ) catch {
-            try err_out.writeAll("zaxon: no reachable leader\n");
+            try noLeaderDiagnostic(err_out);
             try err_out.flush();
             continue;
         };
@@ -723,11 +1050,21 @@ fn execCommand(
         break :blk node.exec(sql);
     } catch |err| switch (err) {
         error.SqliteError, error.SqliteBusy => {
-            try err_out.print("zaxon: sql error: {s}\n", .{node.lastSqliteMessage()});
+            try diagnostic.write(
+                err_out,
+                "sql error",
+                node.lastSqliteMessage(),
+                "Correct the statement and retry it as a new request.",
+            );
             return exit_sql;
         },
         error.UnknownSession, error.SequenceGap, error.ResultExpired => {
-            try err_out.print("zaxon: session error: {s}\n", .{@errorName(err)});
+            try diagnostic.write(
+                err_out,
+                "session error",
+                @errorName(err),
+                "Use the same live session and its next monotonic sequence.",
+            );
             return exit_sql;
         },
         else => return err,
@@ -759,7 +1096,12 @@ fn queryCommand(
                 "statement is not read-only; use exec"
             else
                 node.lastSqliteMessage();
-            try err_out.print("zaxon: query error: {s}\n", .{message});
+            try diagnostic.write(
+                err_out,
+                "query error",
+                message,
+                "Use query only for read-only SQL; use exec for writes.",
+            );
             return exit_sql;
         },
         else => return err,
@@ -845,6 +1187,7 @@ fn printStatus(node: *Node, json: bool, out: *std.Io.Writer) !void {
         try out.print(
             "{{\"node_id\":{d},\"database_id\":\"{x:0>32}\"," ++
                 "\"configuration_id\":{d},\"role\":\"{s}\"," ++
+                "\"node_type\":\"{s}\"," ++
                 "\"leader\":{?d}," ++
                 "\"decided_slot\":{d},\"applied_slot\":{d}," ++
                 "\"journal_records\":{d},\"epoch_capacity\":{d}," ++
@@ -852,7 +1195,8 @@ fn printStatus(node: *Node, json: bool, out: *std.Io.Writer) !void {
             .{
                 status.node_id,          status.database_id,
                 status.configuration_id, status.role,
-                status.leader,           status.decided_slot,
+                status.node_type,        status.leader,
+                status.decided_slot,
                 status.applied_slot,     status.journal_records,
                 status.epoch_capacity,   &chain_hex,
                 status.page_size,
@@ -869,6 +1213,7 @@ fn printStatus(node: *Node, json: bool, out: *std.Io.Writer) !void {
             \\database id:      {x:0>32}
             \\configuration id: {d}
             \\role:             {s}
+            \\node type:        {s}
             \\decided slot:     {d}
             \\applied slot:     {d}
             \\journal records:  {d}
@@ -882,6 +1227,7 @@ fn printStatus(node: *Node, json: bool, out: *std.Io.Writer) !void {
             status.database_id,
             status.configuration_id,
             status.role,
+            status.node_type,
             status.decided_slot,
             status.applied_slot,
             status.journal_records,
@@ -918,7 +1264,12 @@ fn shell(
         try out.flush();
         const raw_line = in.takeDelimiter('\n') catch |err| switch (err) {
             error.StreamTooLong => {
-                try err_out.writeAll("zaxon: input line too long\n");
+                try diagnostic.write(
+                    err_out,
+                    "input line too long",
+                    "The shell statement exceeds its bounded input buffer.",
+                    "Split the statement or run a smaller --sql request.",
+                );
                 try err_out.flush();
                 continue;
             },
@@ -946,7 +1297,12 @@ fn shell(
                 );
                 continue;
             }
-            try err_out.print("zaxon: unknown dot command '{s}'\n", .{line});
+            try diagnostic.write(
+                err_out,
+                "unknown shell command",
+                line,
+                "Use .status, .tables, or .quit, or enter SQL.",
+            );
             try err_out.flush();
             continue;
         }
