@@ -35,6 +35,21 @@ pub const WalHook = *const fn (
     frame_count: c_int,
 ) callconv(.c) c_int;
 
+pub const Authorizer = *const fn (
+    context: ?*anyopaque,
+    action: c_int,
+    arg1: [*c]const u8,
+    arg2: [*c]const u8,
+    database_name: [*c]const u8,
+    trigger_name: [*c]const u8,
+) callconv(.c) c_int;
+
+/// True when the linked amalgamation was compiled with `option`
+/// (without the `SQLITE_` prefix), e.g. "OMIT_LOAD_EXTENSION".
+pub fn compileOptionUsed(option: [:0]const u8) bool {
+    return c.sqlite3_compileoption_used(option.ptr) != 0;
+}
+
 pub const Db = struct {
     handle: *c.sqlite3,
 
@@ -98,6 +113,24 @@ pub const Db = struct {
     /// every commit into `counter`. The counter must outlive the hook.
     pub fn trackCommittedFrames(self: *Db, counter: *u32) void {
         self.setWalHook(frameCounterHook, counter);
+    }
+
+    /// Re-registers the frame-counting hook and reports whether the hook
+    /// it replaced was already bound to `counter` — i.e. whether the
+    /// capture hook survived everything executed since it was installed.
+    pub fn frameHookIs(self: *Db, counter: *u32) bool {
+        const previous = c.sqlite3_wal_hook(self.handle, frameCounterHook, counter);
+        return previous == @as(?*anyopaque, counter);
+    }
+
+    /// Installs (or clears, with null) a prepare-time authorizer. The
+    /// context must outlive the connection or the next call to this.
+    pub fn setAuthorizer(
+        self: *Db,
+        authorizer: ?Authorizer,
+        context: ?*anyopaque,
+    ) void {
+        _ = c.sqlite3_set_authorizer(self.handle, authorizer, context);
     }
 
     /// Runs a TRUNCATE checkpoint; the WAL is empty afterwards. Requires no

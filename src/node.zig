@@ -8,6 +8,9 @@
 //! Ordering contract per write:
 //!   execute -> capture frames -> persist payload -> Paxos append ->
 //!   journal + fsync -> confirmWritesDurable -> committed -> acknowledge.
+//! The payload install flushes to the drive; the journal fsync is the one
+//! storage barrier per write and makes both power-loss durable together
+//! (see durability.zig on group fsync).
 //!
 //! Cluster shape: the same node type serves one-member and multi-member
 //! configurations. Only the current leader keeps a live SQLite writer
@@ -27,6 +30,7 @@ const types = @import("types.zig");
 const journal_mod = @import("journal.zig");
 const payload_store_mod = @import("payload_store.zig");
 const sqlite = @import("sqlite.zig");
+const guard_mod = @import("guard.zig");
 const wal = @import("wal.zig");
 const failpoint = @import("failpoint.zig");
 const durability = @import("durability.zig");
@@ -141,6 +145,9 @@ pub const Node = struct {
     db_path: [:0]u8,
     /// True while the live SQLite writer (capture) connection is open.
     db_open: bool = false,
+    /// Authorizer state for the live connection. Application statements
+    /// are screened; zaxonlite's own statements run in internal scope.
+    guard: guard_mod.Guard = .{},
     /// True when this node was opened as a one-member configuration.
     single: bool,
     product_role: roles.Role,
@@ -471,7 +478,7 @@ pub const Node = struct {
     /// on return; in a cluster the host must await `applied_slot`.
     pub fn exec(self: *Node, sql: [:0]const u8) !ExecResult {
         if (!self.capabilities.serves_writes) return error.RoleCannotWrite;
-        return self.writeTransaction(sql, null);
+        return self.writeTransaction(.application, sql, null);
     }
 
     /// Executes one prepared statement as a replicated SQLite transaction.
@@ -486,7 +493,7 @@ pub const Node = struct {
             .sql = sql,
             .values = values,
         }};
-        return self.writePreparedTransaction(&statements, null);
+        return self.writePreparedTransaction(.application, &statements, null);
     }
 
     /// Commits a completed multi-call transaction builder as one replicated
@@ -498,7 +505,7 @@ pub const Node = struct {
     ) !ExecResult {
         if (!self.capabilities.serves_writes) return error.RoleCannotWrite;
         try transaction.markFinished();
-        return self.writePreparedTransaction(transaction.slice(), null);
+        return self.writePreparedTransaction(.application, transaction.slice(), null);
     }
 
     /// Opens a replicated client session for idempotent retry.
@@ -521,7 +528,7 @@ pub const Node = struct {
             0,
         );
         defer self.gpa.free(sql);
-        _ = try self.writeTransaction(sql, null);
+        _ = try self.writeTransaction(.internal, sql, null);
         return @intCast(next_id);
     }
 
@@ -584,7 +591,7 @@ pub const Node = struct {
             .replay => |result| return result,
             .execute => {},
         }
-        return self.writeTransaction(sql, .{
+        return self.writeTransaction(.application, sql, .{
             .session_id = session_id,
             .sequence = sequence,
         });
@@ -603,7 +610,7 @@ pub const Node = struct {
             0,
         );
         defer self.gpa.free(sql);
-        return self.writeTransaction(sql, null);
+        return self.writeTransaction(.internal, sql, null);
     }
 
     /// Runs a read-only query. The result owns its memory via an arena.
@@ -625,6 +632,19 @@ pub const Node = struct {
         if (self.needs_resync) try self.resyncImage();
         var lease = try self.readLease();
         defer lease.release();
+
+        // Reads are application statements too: the reserved namespace and
+        // checkpoint pragmas must stay unreachable. A short-lived lease
+        // connection gets its own guard; the live connection reuses the
+        // node's. The guard outlives the statement because the lease is
+        // released (and any owned connection closed) before this returns.
+        var lease_guard = guard_mod.Guard{};
+        const read_guard: *guard_mod.Guard = if (lease.owned) blk: {
+            lease_guard.install(&lease.db);
+            break :blk &lease_guard;
+        } else &self.guard;
+        read_guard.scope = .application;
+        defer read_guard.scope = .internal;
 
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
@@ -794,7 +814,7 @@ pub const Node = struct {
                 .{ .mode = .read_write },
             );
             defer snapshot_db.close(self.io);
-            try snapshot_db.sync(self.io);
+            try durability.syncFile(self.io, snapshot_db);
         }
         const db_digest = try fileSha256(self.io, tmp_dir, "db");
 
@@ -1063,22 +1083,25 @@ pub const Node = struct {
     /// also committed and applied on return.
     fn writeTransaction(
         self: *Node,
+        scope: guard_mod.Scope,
         sql: [:0]const u8,
         session: ?SessionUpdate,
     ) !ExecResult {
-        return self.writeRequest(.{ .raw = sql }, session);
+        return self.writeRequest(scope, .{ .raw = sql }, session);
     }
 
     fn writePreparedTransaction(
         self: *Node,
+        scope: guard_mod.Scope,
         statements: []const prepared.Statement,
         session: ?SessionUpdate,
     ) !ExecResult {
-        return self.writeRequest(.{ .prepared = statements }, session);
+        return self.writeRequest(scope, .{ .prepared = statements }, session);
     }
 
     fn writeRequest(
         self: *Node,
+        scope: guard_mod.Scope,
         request: WriteRequest,
         session: ?SessionUpdate,
     ) !ExecResult {
@@ -1114,14 +1137,33 @@ pub const Node = struct {
 
         const changes_before = self.totalChanges();
         self.saved_error_len = 0;
-        const execution = switch (request) {
-            .raw => |sql| self.db.exec(sql),
-            .prepared => |statements| prepared.execute(&self.db, statements),
-        };
-        execution catch |err| {
-            self.saveErrorFrom(&self.db);
-            return err;
-        };
+        {
+            // Only the caller's SQL runs in its scope; the metadata and
+            // commit statements below are always internal.
+            self.guard.scope = scope;
+            defer self.guard.scope = .internal;
+            const execution = switch (request) {
+                .raw => |sql| self.db.exec(sql),
+                .prepared => |statements| prepared.execute(&self.db, statements),
+            };
+            execution catch |err| {
+                self.saveErrorFrom(&self.db);
+                return err;
+            };
+        }
+        if (scope == .application) {
+            // The authorizer already denied contract-changing statements;
+            // this cheap re-check keeps capture robust to anything the
+            // deny list missed before the frames are extracted.
+            guard_mod.verifyCaptureContract(
+                &self.db,
+                self.page_size,
+                &self.committed_frames,
+            ) catch |err| {
+                self.saveErrorText("application SQL broke the capture contract");
+                return err;
+            };
+        }
         const changes: i64 = self.totalChanges() - changes_before;
 
         if (session) |update| {
@@ -1266,7 +1308,10 @@ pub const Node = struct {
     }
 
     fn saveErrorFrom(self: *Node, db: *const sqlite.Db) void {
-        const message = db.errmsg();
+        self.saveErrorText(db.errmsg());
+    }
+
+    fn saveErrorText(self: *Node, message: []const u8) void {
         self.saved_error_len = @min(message.len, self.saved_error.len);
         @memcpy(
             self.saved_error[0..self.saved_error_len],
@@ -1468,7 +1513,7 @@ pub const Node = struct {
         });
         defer file.close(self.io);
         try wal.applyPayload(self.io, file, &view);
-        try file.sync(self.io);
+        try durability.syncFile(self.io, file);
     }
 
     /// Cross-checks the fixed Paxos descriptor against the immutable payload.
@@ -1597,7 +1642,7 @@ pub const Node = struct {
             }
             self.applied_slot = slot;
         }
-        try file.sync(self.io);
+        try durability.syncFile(self.io, file);
     }
 
     fn openLiveDatabase(self: *Node) !void {
@@ -1612,14 +1657,28 @@ pub const Node = struct {
         self.captured_frames = 0;
         self.db.trackCommittedFrames(&self.committed_frames);
         self.page_size = try self.db.pageSize();
+        // The guard outlives the connection: it is embedded in this Node,
+        // and every application statement below runs through it.
+        self.guard.scope = .internal;
+        self.guard.install(&self.db);
         self.db_open = true;
     }
 
     fn bootstrapSchema(self: *Node) !void {
-        if (try self.schemaReady()) return;
+        _ = try self.bootstrapSchemaIfMissing();
+    }
+
+    /// Replicates the schema bootstrap batch when it is absent. Runs in
+    /// internal scope: bootstrap creates the reserved `__zaxon_*` tables
+    /// that the application authorizer denies. An already present schema
+    /// returns a replayed result, so a raced bootstrap is harmless.
+    pub fn bootstrapSchemaIfMissing(self: *Node) !ExecResult {
+        if (try self.schemaReady()) {
+            return .{ .changes = 0, .slot = 0, .replayed = true };
+        }
         const sql = try self.bootstrapSql(self.gpa);
         defer self.gpa.free(sql);
-        _ = try self.writeTransaction(sql, null);
+        return self.writeTransaction(.internal, sql, null);
     }
 
     /// After rebuild, the materialized image's recorded batch marker must
@@ -2395,7 +2454,7 @@ fn atomicWriteFile(io: Io, dir: Io.Dir, name: []const u8, contents: []const u8) 
     var atomic = try dir.createFileAtomic(io, name, .{ .replace = true });
     defer atomic.deinit(io);
     try atomic.file.writePositionalAll(io, contents, 0);
-    try atomic.file.sync(io);
+    try durability.syncFile(io, atomic.file);
     try atomic.replace(io);
     try durability.syncDirectory(dir);
 }
