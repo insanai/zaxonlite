@@ -1,0 +1,226 @@
+{
+  "failure_schedule": [
+    "healthy",
+    "crash one follower; continue traffic; restart and catch up",
+    "crash leader; retry traffic; elect; restart and catch up",
+    "crash all nodes; restart same identities; verify every copy"
+  ],
+  "format": 1,
+  "host": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+  "results": [
+    {
+      "correctness": {
+        "expected": {
+          "distinct_operations": 372,
+          "ledger_entries": 372,
+          "negative_stock_rows": 0,
+          "order_lines": 372,
+          "orders": 372,
+          "revenue_cents": 4428073,
+          "units_sold": 942
+        },
+        "integrity": {
+          "1": {"chain_ok": true, "ok": true, "payloads_ok": true, "sqlite_ok": true},
+          "2": {"chain_ok": true, "ok": true, "payloads_ok": true, "sqlite_ok": true},
+          "3": {"chain_ok": true, "ok": true, "payloads_ok": true, "sqlite_ok": true}
+        },
+        "per_node": {
+          "1": [372, 372, 372, 372, 942, 4428073, 0],
+          "2": [372, 372, 372, 372, 942, 4428073, 0],
+          "3": [372, 372, 372, 372, 942, 4428073, 0]
+        }
+      },
+      "initial_startup_ms": 334.8150000001624,
+      "nodes": 3,
+      "phases": [
+        {
+          "concurrency": 4,
+          "latency_ms": {
+            "all": {"max": 26.701250000769505, "p50": 1.6251249999186257, "p95": 5.5790829992474755, "p99": 9.68391700007487},
+            "reads": {"max": 26.701250000769505, "p50": 1.1372919998393627, "p95": 1.7982499994104728, "p99": 2.3006250012258533},
+            "writes": {"max": 16.041458999097813, "p50": 3.823749999355641, "p95": 7.581750000099419, "p99": 11.330125000313274}
+          },
+          "name": "healthy",
+          "operations": 400,
+          "operations_per_second": 1796.00321933196,
+          "reads": 285,
+          "retry_attempts": 2,
+          "seconds": 0.22271675000047253,
+          "time_to_first_success_ms": 0.6807080008002231,
+          "writes": 115
+        },
+        {
+          "catch_up_ms": 166.24533299909672,
+          "caught_up_state": {"2": [248, 248, 248, 248, 650, 3052820, 0]},
+          "concurrency": 4,
+          "latency_ms": {
+            "all": {"max": 151.9362919989362, "p50": 1.2104369998269249, "p95": 5.615417001536116, "p99": 16.60004199948162},
+            "reads": {"max": 68.66970900045999, "p50": 0.7173329995566746, "p95": 1.7418750012438977, "p99": 3.8723329998902045},
+            "writes": {"max": 151.9362919989362, "p50": 3.604583000196726, "p95": 7.766540999000426, "p99": 18.800666999595705}
+          },
+          "name": "one_follower_crashed",
+          "operations": 400,
+          "operations_per_second": 1045.2500724513284,
+          "reads": 291,
+          "restarted_node": 2,
+          "retry_attempts": 6,
+          "seconds": 0.38268354199863097,
+          "time_to_first_success_ms": 1.7293749988311902,
+          "writes": 109
+        },
+        {
+          "caught_up_state": {"1": [372, 372, 372, 372, 942, 4428073, 0]},
+          "concurrency": 4,
+          "crashed_node": 1,
+          "latency_ms": {
+            "all": {"max": 947.9532500008645, "p50": 1.570395999806351, "p95": 3.8480830007756595, "p99": 7.732624999334803},
+            "reads": {"max": 947.9532500008645, "p50": 0.6231454999579, "p95": 2.848250000170083, "p99": 601.6835830014315},
+            "writes": {"max": 7.732624999334803, "p50": 2.149354500033951, "p95": 4.370791999463108, "p99": 7.256750001033652}
+          },
+          "name": "leader_crashed",
+          "operations": 400,
+          "operations_per_second": 366.9625455087402,
+          "reads": 276,
+          "restarted_node_catch_up_ms": 174.59341700123332,
+          "retry_attempts": 32,
+          "seconds": 1.0900295000010374,
+          "time_to_first_success_ms": 596.7061669998657,
+          "writes": 124
+        }
+      ],
+      "schema_and_seed_ms": 52.59649999970861,
+      "system": "zaxonlite",
+      "total_cluster_restart": {
+        "recovery_ms": 457.4021250009537,
+        "state": {
+          "1": [372, 372, 372, 372, 942, 4428073, 0],
+          "2": [372, 372, 372, 372, 942, 4428073, 0],
+          "3": [372, 372, 372, 372, 942, 4428073, 0]
+        }
+      }
+    },
+    {
+      "cli_evidence": {"evidence_file": "rqlite-cli-final-nodes.txt", "reachable_voters": 3},
+      "correctness": {
+        "expected": {
+          "distinct_operations": 372,
+          "ledger_entries": 372,
+          "negative_stock_rows": 0,
+          "order_lines": 372,
+          "orders": 372,
+          "revenue_cents": 4428073,
+          "units_sold": 942
+        },
+        "integrity": {
+          "1": {"sqlite_ok": true},
+          "2": {"sqlite_ok": true},
+          "3": {"sqlite_ok": true}
+        },
+        "per_node": {
+          "1": [372, 372, 372, 372, 942, 4428073, 0],
+          "2": [372, 372, 372, 372, 942, 4428073, 0],
+          "3": [372, 372, 372, 372, 942, 4428073, 0]
+        }
+      },
+      "initial_startup_ms": 3272.566707999431,
+      "nodes": 3,
+      "phases": [
+        {
+          "concurrency": 4,
+          "latency_ms": {
+            "all": {"max": 103.32874999949127, "p50": 15.255729500495363, "p95": 68.58333300078812, "p99": 93.59754199977033},
+            "reads": {"max": 41.4274579998164, "p50": 3.727541999978712, "p95": 29.78162500039616, "p99": 39.74129199923482},
+            "writes": {"max": 103.32874999949127, "p50": 54.463500000565546, "p95": 85.63154200055578, "p99": 98.55533299923991}
+          },
+          "name": "healthy",
+          "operations": 400,
+          "operations_per_second": 170.11130245572573,
+          "reads": 285,
+          "retry_attempts": 0,
+          "seconds": 2.3514016660010384,
+          "time_to_first_success_ms": 2.388124999924912,
+          "writes": 115
+        },
+        {
+          "catch_up_ms": 840.8239580003283,
+          "caught_up_state": {"2": [248, 248, 248, 248, 650, 3052820, 0]},
+          "concurrency": 4,
+          "latency_ms": {
+            "all": {"max": 91.20900000016263, "p50": 6.571666500349238, "p95": 59.84833300135506, "p99": 70.1091249993624},
+            "reads": {"max": 41.71554200001992, "p50": 1.3426669993350515, "p95": 25.554541000019526, "p99": 32.136084000740084},
+            "writes": {"max": 91.20900000016263, "p50": 46.92379200059804, "p95": 69.99225000072329, "p99": 76.71808399936708}
+          },
+          "name": "one_follower_crashed",
+          "operations": 400,
+          "operations_per_second": 214.30363837414546,
+          "reads": 291,
+          "restarted_node": 2,
+          "retry_attempts": 1,
+          "seconds": 1.8665105410000251,
+          "time_to_first_success_ms": 1.911415998620214,
+          "writes": 109
+        },
+        {
+          "caught_up_state": {"1": [372, 372, 372, 372, 942, 4428073, 0]},
+          "concurrency": 4,
+          "crashed_node": 1,
+          "latency_ms": {
+            "all": {"max": 2588.338333000138, "p50": 4.257520999999542, "p95": 65.55466700046964, "p99": 77.2482909997052},
+            "reads": {"max": 2588.338333000138, "p50": 0.9457914993618033, "p95": 27.08912500020233, "p99": 2410.7710420012154},
+            "writes": {"max": 77.2482909997052, "p50": 49.847104500258865, "p95": 68.63679200068873, "p99": 75.75708299918915}
+          },
+          "name": "leader_crashed",
+          "operations": 400,
+          "operations_per_second": 89.23947443372496,
+          "reads": 276,
+          "restarted_node_catch_up_ms": 554.4439590012189,
+          "retry_attempts": 65,
+          "seconds": 4.482321333000073,
+          "time_to_first_success_ms": 2402.179208000234,
+          "writes": 124
+        }
+      ],
+      "schema_and_seed_ms": 211.60045900069235,
+      "system": "rqlite",
+      "total_cluster_restart": {
+        "recovery_ms": 1293.9384580004116,
+        "state": {
+          "1": [372, 372, 372, 372, 942, 4428073, 0],
+          "2": [372, 372, 372, 372, 942, 4428073, 0],
+          "3": [372, 372, 372, 372, 942, 4428073, 0]
+        }
+      }
+    }
+  ],
+  "run_at_utc": "2026-07-20T08:25:14.665755+00:00",
+  "tools": {
+    "rqlite_cli": {
+      "path": "/opt/homebrew/Cellar/rqlite/10.2.7/bin/rqlite",
+      "version": "Version v10.2.7, commit unknown, built on 2026-07-06T01:01:15Z"
+    },
+    "rqlited": {
+      "path": "/opt/homebrew/Cellar/rqlite/10.2.7/bin/rqlited",
+      "version": "rqlited v10.2.7 darwin arm64 go1.26.4 sqlite3.53.2 (commit unknown, compiler gc)"
+    },
+    "zaxon": {
+      "path": "/Users/vikrantrathore/projects/insan.ai/paxos-zig/zaxonlite/zig-out/bin/zaxon",
+      "version": "zaxon unreleased"
+    }
+  },
+  "workload": {
+    "concurrency": 4,
+    "customers": 1000,
+    "name": "order processing with inventory and ledger fanout",
+    "phase_operations": 400,
+    "products": 500,
+    "read_consistency": {
+      "rqlite": "linearizable ReadIndex-style fence",
+      "zaxonlite": "linearizable quorum fence"
+    },
+    "read_percent": 70,
+    "seed": 20260720,
+    "warmup_operations": 100,
+    "write_percent": 30,
+    "write_retry": "unique operation ID plus insert-or-ignore"
+  }
+}

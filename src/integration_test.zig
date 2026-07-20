@@ -71,6 +71,122 @@ test "node persists across close and reopen" {
     }
 }
 
+test "prepared explicit transaction is one durable replicated transition" {
+    const gpa = testing.allocator;
+    var test_dir = try TestDir.init(gpa);
+    defer test_dir.deinit(gpa);
+    const dir = try test_dir.nodeDir(gpa);
+    defer gpa.free(dir);
+
+    {
+        const node = try openNode(dir);
+        defer node.close();
+        _ = try node.exec(
+            "create table items(id integer primary key, v text, amount real, raw blob)",
+        );
+        var transaction = zaxonlite.Transaction.init(gpa);
+        defer transaction.deinit();
+        try transaction.exec(
+            "insert into items(v, amount, raw) values (?1, ?2, ?3)",
+            &.{
+                .{ .text = "tea" },
+                .{ .real = 2.5 },
+                .{ .blob = &.{ 0, 1, 2, 255 } },
+            },
+        );
+        try transaction.exec(
+            "insert into items(v, amount, raw) values (?1, ?2, ?3)",
+            &.{
+                .{ .text = "coffee" },
+                .{ .null_value = {} },
+                .{ .blob = "beans" },
+            },
+        );
+        const result = try node.execTransaction(&transaction);
+        try testing.expectEqual(@as(i64, 2), result.changes);
+
+        var query = try node.queryPrepared(
+            gpa,
+            "select v, hex(raw) from items where amount > ?1 order by id",
+            &.{.{ .real = 2.0 }},
+        );
+        defer query.deinit();
+        try testing.expectEqual(@as(usize, 1), query.rows.len);
+        try testing.expectEqualStrings("tea", query.rows[0][0].?);
+        try testing.expectEqualStrings("000102FF", query.rows[0][1].?);
+    }
+
+    const reopened = try openNode(dir);
+    defer reopened.close();
+    try testing.expectEqual(@as(i64, 2), try countItems(reopened));
+    const report = try reopened.integrityCheck();
+    try testing.expect(report.ok());
+}
+
+test "one MiB payload survives journal-only image recovery" {
+    const gpa = testing.allocator;
+    var test_dir = try TestDir.init(gpa);
+    defer test_dir.deinit(gpa);
+    const dir = try test_dir.nodeDir(gpa);
+    defer gpa.free(dir);
+    const payload = try gpa.alloc(u8, 1024 * 1024);
+    defer gpa.free(payload);
+    for (payload, 0..) |*byte, index| byte.* = @truncate(index *% 131);
+
+    {
+        const node = try openNode(dir);
+        defer node.close();
+        _ = try node.exec("create table large_payload(value blob)");
+        _ = try node.execPrepared(
+            "insert into large_payload values (?1)",
+            &.{.{ .blob = payload }},
+        );
+    }
+    var node_dir = try std.Io.Dir.cwd().openDir(testing.io, dir, .{});
+    defer node_dir.close(testing.io);
+    try node_dir.deleteFile(testing.io, "current.db");
+
+    const recovered = try openNode(dir);
+    defer recovered.close();
+    var result = try recovered.query(
+        gpa,
+        "select length(value), hex(substr(value, 1, 4)) from large_payload",
+    );
+    defer result.deinit();
+    try testing.expectEqualStrings("1048576", result.rows[0][0].?);
+    try testing.expectEqualStrings("00830689", result.rows[0][1].?);
+    try testing.expect((try recovered.integrityCheck()).ok());
+}
+
+test "a data directory cannot silently change learner role" {
+    const gpa = testing.allocator;
+    var test_dir = try TestDir.init(gpa);
+    defer test_dir.deinit(gpa);
+    const dir = try test_dir.nodeDir(gpa);
+    defer gpa.free(dir);
+    const voters = [_]u32{ 1, 2 };
+    {
+        const node = try Node.open(gpa, testing.io, .{
+            .directory = dir,
+            .node_id = 3,
+            .members = &voters,
+            .database_id = 77,
+            .role = .standby,
+        });
+        node.close();
+    }
+    try testing.expectError(
+        error.NodeRoleMismatch,
+        Node.open(gpa, testing.io, .{
+            .directory = dir,
+            .node_id = 3,
+            .members = &voters,
+            .database_id = 77,
+            .role = .read_replica,
+        }),
+    );
+}
+
 test "journal is authoritative: materialized image rebuilds from scratch" {
     const gpa = testing.allocator;
     var test_dir = try TestDir.init(gpa);
@@ -296,6 +412,143 @@ test "snapshot seals the epoch and recovery uses snapshot plus suffix" {
         const report = try node.integrityCheck();
         try testing.expect(report.ok());
     }
+}
+
+test "recovery discards a corrupt materialized image even with an empty suffix" {
+    const gpa = testing.allocator;
+    var test_dir = try TestDir.init(gpa);
+    defer test_dir.deinit(gpa);
+    const dir = try test_dir.nodeDir(gpa);
+    defer gpa.free(dir);
+
+    {
+        const node = try openNode(dir);
+        defer node.close();
+        _ = try node.exec("create table items(id integer primary key, v text)");
+        _ = try node.exec("insert into items(v) values ('snapshot-only')");
+        try node.snapshot();
+        try testing.expectEqual(@as(u32, 0), node.log.decidedThrough());
+    }
+
+    // Damage a page in the non-authoritative working image. The current
+    // epoch has no suffix entries that could happen to overwrite it.
+    var node_dir = try std.Io.Dir.cwd().openDir(testing.io, dir, .{});
+    defer node_dir.close(testing.io);
+    const file = try node_dir.openFile(
+        testing.io,
+        "current.db",
+        .{ .mode = .read_write },
+    );
+    try file.writePositionalAll(testing.io, "not sqlite", 0);
+    try file.sync(testing.io);
+    file.close(testing.io);
+
+    const reopened = try openNode(dir);
+    defer reopened.close();
+    try testing.expectEqual(@as(i64, 1), try countItems(reopened));
+    const report = try reopened.integrityCheck();
+    try testing.expect(report.ok());
+}
+
+test "recovery completes rollover after CURRENT advances before identity" {
+    const gpa = testing.allocator;
+    var test_dir = try TestDir.init(gpa);
+    defer test_dir.deinit(gpa);
+    const dir = try test_dir.nodeDir(gpa);
+    defer gpa.free(dir);
+
+    var database_id: u128 = 0;
+    {
+        const node = try openNode(dir);
+        defer node.close();
+        _ = try node.exec("create table items(id integer primary key, v text)");
+        _ = try node.exec("insert into items(v) values ('durable')");
+        database_id = node.identity.database_id;
+        try node.snapshot();
+        try testing.expectEqual(@as(u64, 2), node.identity.configuration_id);
+    }
+
+    // Recreate the durable prefix immediately after CURRENT was installed:
+    // the sealed epoch-1 journal and snapshot exist, while identity still
+    // names epoch 1; the next-epoch journal has not been created yet.
+    var node_dir = try std.Io.Dir.cwd().openDir(testing.io, dir, .{});
+    defer node_dir.close(testing.io);
+    var identity_buffer: [256]u8 = undefined;
+    const identity = std.fmt.bufPrint(
+        &identity_buffer,
+        "format=1\nnode_id=1\ndatabase_id={x:0>32}\nconfiguration_id=1\n",
+        .{database_id},
+    ) catch unreachable;
+    const file = try node_dir.createFile(testing.io, "identity", .{
+        .read = true,
+        .truncate = true,
+    });
+    try file.writePositionalAll(testing.io, identity, 0);
+    try file.sync(testing.io);
+    file.close(testing.io);
+    // At the represented crash point the next-epoch journal has not received
+    // any protocol writes. Remove the later campaign record produced by the
+    // fully completed setup run.
+    try node_dir.deleteFile(testing.io, "paxos-0000000000000002.log");
+
+    const reopened = try openNode(dir);
+    defer reopened.close();
+    try testing.expectEqual(@as(u64, 2), reopened.identity.configuration_id);
+    try testing.expectEqual(@as(i64, 1), try countItems(reopened));
+    const report = try reopened.integrityCheck();
+    try testing.expect(report.ok());
+}
+
+test "recovery completes interrupted snapshot install without a stop sign" {
+    const gpa = testing.allocator;
+    var test_dir = try TestDir.init(gpa);
+    defer test_dir.deinit(gpa);
+    const dir = try test_dir.nodeDir(gpa);
+    defer gpa.free(dir);
+
+    var database_id: u128 = 0;
+    {
+        const node = try openNode(dir);
+        defer node.close();
+        _ = try node.exec("create table items(id integer primary key, v text)");
+        _ = try node.exec("insert into items(v) values ('transferred')");
+        database_id = node.identity.database_id;
+        try node.snapshot();
+    }
+
+    var node_dir = try std.Io.Dir.cwd().openDir(testing.io, dir, .{});
+    defer node_dir.close(testing.io);
+    var identity_buffer: [256]u8 = undefined;
+    const identity = std.fmt.bufPrint(
+        &identity_buffer,
+        "format=1\nnode_id=1\ndatabase_id={x:0>32}\nconfiguration_id=1\n",
+        .{database_id},
+    ) catch unreachable;
+    {
+        const file = try node_dir.createFile(testing.io, "identity", .{
+            .read = true,
+            .truncate = true,
+        });
+        try file.writePositionalAll(testing.io, identity, 0);
+        try file.sync(testing.io);
+        file.close(testing.io);
+    }
+    // A receiver that installed the snapshot but never learned the sealing
+    // stop sign has an empty old journal.
+    try node_dir.deleteFile(testing.io, "paxos-0000000000000001.log");
+    try node_dir.deleteFile(testing.io, "paxos-0000000000000002.log");
+    const empty = try node_dir.createFile(
+        testing.io,
+        "paxos-0000000000000001.log",
+        .{ .read = true },
+    );
+    try empty.sync(testing.io);
+    empty.close(testing.io);
+
+    const reopened = try openNode(dir);
+    defer reopened.close();
+    try testing.expectEqual(@as(u64, 2), reopened.identity.configuration_id);
+    try testing.expectEqual(@as(i64, 1), try countItems(reopened));
 }
 
 test "epoch capacity triggers automatic snapshot rollover" {

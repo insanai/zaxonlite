@@ -133,6 +133,18 @@ pub fn main(init: std.process.Init) !u8 {
     defer gpa.free(data);
     const backup_path = try std.fmt.allocPrint(gpa, "{s}/backup.db", .{root});
     defer gpa.free(backup_path);
+    const config_path = try std.fmt.allocPrint(gpa, "{s}/config.json", .{root});
+    defer gpa.free(config_path);
+    const config_json = try std.fmt.allocPrint(
+        gpa,
+        "{{\"data\":\"{s}\"}}",
+        .{data},
+    );
+    defer gpa.free(config_json);
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = config_path,
+        .data = config_json,
+    });
 
     // --- usage and version -------------------------------------------
     try expect(gpa, io, "no arguments prints usage, exit 2", &.{}, null, 2, "Usage:", null);
@@ -146,7 +158,7 @@ pub fn main(init: std.process.Init) !u8 {
         null,
         2,
         null,
-        "unknown option",
+        "-- UNKNOWN OPTION --",
     );
     try expect(
         gpa,
@@ -168,6 +180,26 @@ pub fn main(init: std.process.Init) !u8 {
         null,
         0,
         "0 row(s) changed",
+        null,
+    );
+    try expect(
+        gpa,
+        io,
+        "config file supplies data directory",
+        &.{ "status", "--config", config_path, "--json" },
+        null,
+        0,
+        "\"node_id\":1",
+        null,
+    );
+    try expect(
+        gpa,
+        io,
+        "CLI overrides config file",
+        &.{ "status", "--config", config_path, "--data", data, "--json" },
+        null,
+        0,
+        "\"node_id\":1",
         null,
     );
     try expect(
@@ -329,6 +361,26 @@ pub fn main(init: std.process.Init) !u8 {
     try expect(
         gpa,
         io,
+        "recover rebuilds and verifies",
+        &.{ "recover", "--data", data },
+        null,
+        0,
+        "recovery rebuild complete",
+        null,
+    );
+    try expect(
+        gpa,
+        io,
+        "members reports static membership",
+        &.{ "members", "--data", data, "--json" },
+        null,
+        0,
+        "\"membership\":\"static\"",
+        null,
+    );
+    try expect(
+        gpa,
+        io,
         "expire-sessions runs",
         &.{ "expire-sessions", "--data", data, "--retain", "1000" },
         null,
@@ -361,7 +413,7 @@ pub fn main(init: std.process.Init) !u8 {
             null,
             4,
             null,
-            "locked",
+            "-- NODE DIRECTORY LOCKED --",
         );
     }
 
@@ -374,7 +426,7 @@ pub fn main(init: std.process.Init) !u8 {
         null,
         4,
         null,
-        "no reachable leader",
+        "-- NO REACHABLE LEADER --",
     );
 
     if (failures == 0) {

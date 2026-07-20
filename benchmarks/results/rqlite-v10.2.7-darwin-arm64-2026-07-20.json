@@ -1,0 +1,61 @@
+{
+  "format": 1,
+  "host": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+  "results": [
+    {
+      "latency_ms": {
+        "max": 109.44970899981854,
+        "p50": 1.6873120002856012,
+        "p95": 1.9747499991353834,
+        "p99": 2.3156660008680774
+      },
+      "nodes": 3,
+      "operations": 1000,
+      "operations_per_second": 474.63979768507244,
+      "payload_bytes": 256,
+      "seconds": 2.106860833999235,
+      "system": "zaxonlite",
+      "workload": "sequential one-row durable autocommit"
+    },
+    {
+      "latency_ms": {
+        "max": 45.1155419996212,
+        "p50": 21.957499999189167,
+        "p95": 27.958459000728908,
+        "p99": 33.044458001313615
+      },
+      "nodes": 3,
+      "operations": 1000,
+      "operations_per_second": 44.98028196702993,
+      "payload_bytes": 256,
+      "seconds": 22.231963791000453,
+      "system": "rqlite",
+      "workload": "sequential one-row durable autocommit"
+    }
+  ],
+  "rules": {
+    "client": "one sequential persistent connection",
+    "durability": "persistent quorum state and node directories",
+    "nodes": 3,
+    "queued_writes": false,
+    "transaction": "one row per autocommit",
+    "verification": "strong count and exact-payload predicate",
+    "warmup_excluded": true
+  },
+  "run_at_utc": "2026-07-20T08:12:16.819091+00:00",
+  "tools": {
+    "rqlite_cli": {
+      "path": "/opt/homebrew/bin/rqlite",
+      "used_for": "cluster membership and final row verification",
+      "version": "Version v10.2.7, commit unknown, built on 2026-07-06T01:01:15Z"
+    },
+    "rqlited": {
+      "path": "/opt/homebrew/bin/rqlited",
+      "version": "rqlited v10.2.7 darwin arm64 go1.26.4 sqlite3.53.2 (commit unknown, compiler gc)"
+    },
+    "zaxon": {
+      "path": "/Users/vikrantrathore/projects/insan.ai/paxos-zig/zaxonlite/benchmarks/../zig-out/bin/zaxon",
+      "version": "zaxon unreleased"
+    }
+  }
+}

@@ -18,6 +18,7 @@ const zaxonlite = @import("zaxonlite");
 const client = zaxonlite.client;
 
 const Endpoint = client.Endpoint;
+const cluster_secret = "cluster-test-secret-32-bytes-minimum";
 
 const NodeProc = struct {
     id: u32,
@@ -32,6 +33,7 @@ const Cluster = struct {
     io: Io,
     zaxon: []const u8,
     root: []const u8,
+    auth_file: []const u8,
     nodes: [3]NodeProc,
     endpoints: [3]Endpoint,
     host_buffers: [3][32]u8 = undefined,
@@ -74,6 +76,7 @@ const Cluster = struct {
             try argv.appendSlice(self.gpa, &.{ "--peer", peer_text });
         }
         try argv.append(self.gpa, "--enable-failpoints");
+        try argv.appendSlice(self.gpa, &.{ "--auth-file", self.auth_file });
         _ = extra_env;
 
         // Each (re)start truncates the node's log; on failure we dump the
@@ -155,10 +158,11 @@ fn dumpDiagnostics(cluster: *Cluster) void {
 // ----------------------------------------------------------------------
 
 fn rpcTry(cluster: *Cluster, endpoint: Endpoint, request: []const u8) ?[]u8 {
-    const connection = client.Connection.open(
+    const connection = client.Connection.openWithSecret(
         cluster.gpa,
         cluster.io,
         endpoint,
+        cluster_secret,
     ) catch return null;
     defer connection.close();
     return connection.call(request) catch null;
@@ -213,12 +217,13 @@ fn mustCall(
 ) []u8 {
     var elapsed: u64 = 0;
     while (elapsed <= deadline_ms) {
-        const result = client.callCluster(
+        const result = client.callClusterWithSecret(
             cluster.gpa,
             cluster.io,
             cluster.endpointList(),
             request,
             true,
+            cluster_secret,
         ) catch {
             elapsed += 500;
             cluster.io.sleep(.fromMilliseconds(500), .awake) catch {};
@@ -330,12 +335,11 @@ fn writeJsonString(out: *Io.Writer, text: []const u8) void {
     out.writeAll("\"") catch unreachable;
 }
 
-/// Counts rows in table t via a linearizable read.
+/// Counts rows through the default read level, which is linearizable.
 fn linearizableCount(cluster: *Cluster, deadline_ms: u64) i64 {
     const body = mustCall(
         cluster,
-        "{\"op\":\"query\",\"sql\":\"select count(*) from t\"," ++
-            "\"level\":\"linearizable\"}",
+        "{\"op\":\"query\",\"sql\":\"select count(*) from t\"}",
         deadline_ms,
     );
     defer cluster.gpa.free(body);
@@ -482,12 +486,19 @@ fn runScenario(
     defer gpa.free(root);
     try Io.Dir.cwd().createDirPath(io, root);
     defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    const auth_file = try std.fmt.allocPrint(gpa, "{s}/auth.secret", .{root});
+    defer gpa.free(auth_file);
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = auth_file,
+        .data = cluster_secret,
+    });
 
     var cluster = Cluster{
         .gpa = gpa,
         .io = io,
         .zaxon = zaxon,
         .root = root,
+        .auth_file = auth_file,
         .nodes = undefined,
         .endpoints = undefined,
     };
@@ -520,6 +531,31 @@ fn runScenario(
     step("wait for one leader");
     for (cluster.endpoints) |endpoint| {
         waitFor(&cluster, endpoint, hasLeader, {}, 15_000, "leader knowledge");
+    }
+
+    step("reject a client with the wrong transport secret");
+    if (client.Connection.openWithSecret(
+        gpa,
+        io,
+        cluster.endpoints[0],
+        "wrong-transport-secret-32-bytes!",
+    )) |connection| {
+        connection.close();
+        fail(&cluster, "wrong transport secret was accepted", .{});
+    } else |_| {}
+
+    const members_body = rpcTry(
+        &cluster,
+        cluster.endpoints[0],
+        "{\"op\":\"members\"}",
+    ) orelse fail(&cluster, "members RPC unavailable", .{});
+    defer gpa.free(members_body);
+    if (std.mem.indexOf(
+        u8,
+        members_body,
+        "\"voter_membership\":\"static\"",
+    ) == null) {
+        fail(&cluster, "members RPC malformed: {s}", .{members_body});
     }
 
     step("create schema");
@@ -589,6 +625,30 @@ fn runScenario(
         );
         cluster.gpa.free(body);
     }
+
+    step("stream and verify an authenticated remote backup");
+    const backup_path = try std.fmt.allocPrintSentinel(
+        gpa,
+        "{s}/remote-backup.db",
+        .{root},
+        0,
+    );
+    defer gpa.free(backup_path);
+    const backup_connection = try client.Connection.openWithSecret(
+        gpa,
+        io,
+        leaderEndpoint(&cluster),
+        cluster_secret,
+    );
+    try backup_connection.backupTo(backup_path);
+    backup_connection.close();
+    var backup_db = try zaxonlite.sqlite.Db.open(backup_path);
+    defer backup_db.close();
+    try std.testing.expect(try backup_db.integrityCheckOk());
+    var backup_count = try backup_db.prepare("select count(*) from t");
+    defer backup_count.finalize();
+    try std.testing.expect(try backup_count.step());
+    try std.testing.expectEqual(@as(i64, 100), backup_count.columnInt64(0));
 
     step("stop one follower");
     const leader_before = leaderIndex(&cluster);
