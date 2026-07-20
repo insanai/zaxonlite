@@ -2,9 +2,19 @@
 //!
 //! A payload is named by the SHA-256 of its bytes and installed with
 //! write-temp, sync, atomic-rename. Bytes stored under a hash are never
-//! mutated. A descriptor may enter the Paxos core only after its payload is
-//! present and durable here; deletion requires a durable reachability proof
+//! mutated. A descriptor may enter the Paxos core only after its payload
+//! is installed here; deletion requires a durable reachability proof
 //! owned by the host, never age alone.
+//!
+//! Durability contract: `put`/`putNamed` flush the object and its
+//! directory entries to the drive but deliberately stop before the
+//! drive-cache barrier. The host's next journal sync — which precedes
+//! every vote, recovered-value message, and client acknowledgement — is
+//! the single barrier that makes installed payloads power-loss durable
+//! (see `durability.zig`). Epoch installs likewise barrier before the
+//! CURRENT pointer moves. So every counted vote and every acknowledged
+//! write still implies durable payload bytes at its consumer, at one
+//! full flush per commit point instead of three.
 
 const std = @import("std");
 const Io = std.Io;
@@ -41,8 +51,10 @@ pub const PayloadStore = struct {
         return digest;
     }
 
-    /// Stores `bytes` durably under their content hash and returns the hash.
-    /// Idempotent: an already-installed payload is left untouched.
+    /// Stores `bytes` under their content hash and returns the hash;
+    /// power-loss durability follows at the caller's next storage
+    /// barrier (see the module comment). Idempotent: an
+    /// already-installed payload is left untouched.
     pub fn put(self: *PayloadStore, bytes: []const u8) !Hash {
         const digest = hashOf(bytes);
         try self.putNamed(digest, bytes);
@@ -73,14 +85,14 @@ pub const PayloadStore = struct {
         });
         defer atomic.deinit(self.io);
         try atomic.file.writePositionalAll(self.io, bytes, 0);
-        try atomic.file.sync(self.io);
+        try durability.syncFileBeforeBarrier(self.io, atomic.file);
         atomic.link(self.io) catch |err| switch (err) {
             // Another writer installed identical content first.
             error.PathAlreadyExists => {},
             else => return err,
         };
-        try durability.syncChildDirectory(self.io, self.dir, path[0..2]);
-        try durability.syncDirectory(self.dir);
+        try durability.syncChildDirectoryBeforeBarrier(self.io, self.dir, path[0..2]);
+        try durability.syncDirectoryBeforeBarrier(self.dir);
     }
 
     pub fn contains(self: *PayloadStore, digest: Hash) bool {

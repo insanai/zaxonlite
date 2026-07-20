@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const Io = std.Io;
+const durability = @import("durability.zig");
 
 pub const wal_header_size = 32;
 pub const frame_header_size = 24;
@@ -360,7 +361,7 @@ fn rebuildFromPayloads(dir: Io.Dir, name: []const u8, payloads: []const []u8) !v
         const view = try PayloadView.parse(payload);
         try applyPayload(io, file, &view);
     }
-    try file.sync(io);
+    try durability.syncFile(io, file);
 }
 
 fn expectSameFileBytes(dir: Io.Dir, left: []const u8, right: []const u8) !void {

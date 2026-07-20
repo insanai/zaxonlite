@@ -74,7 +74,7 @@ pub const Journal = struct {
         info.* = try replay(io, gpa, file, durable);
         if (info.truncated_bytes > 0) {
             try file.setLength(io, info.end_offset);
-            try file.sync(io);
+            try durability.syncFile(io, file);
         }
         return .{
             .io = io,
@@ -104,7 +104,7 @@ pub const Journal = struct {
 
     /// Makes every appended record durable.
     pub fn sync(self: *Journal) !void {
-        try self.file.sync(self.io);
+        try durability.syncFile(self.io, self.file);
     }
 };
 
