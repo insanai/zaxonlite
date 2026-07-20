@@ -14,6 +14,11 @@ const roles = @import("roles.zig");
 const types = @import("types.zig");
 const gateway = @import("gateway.zig");
 
+/// Upper bound for one static member registry, voters plus learners.
+/// Callers (the C ABI in particular) check declared counts against this
+/// before allocating or copying any list.
+pub const max_registry_members = 4 * types.log_options.max_members;
+
 /// One static cluster member. Every process must pass the identical member
 /// list to `Embedded.open`; membership cannot change while the cluster runs.
 pub const Member = struct {
@@ -94,7 +99,11 @@ pub const Embedded = struct {
         io: Io,
         options: OpenOptions,
     ) !*Embedded {
-        if (options.members.len == 0) return error.InvalidMemberCount;
+        if (options.members.len == 0 or
+            options.members.len > max_registry_members)
+        {
+            return error.InvalidMemberCount;
+        }
         var voter_count: usize = 0;
         var campaigner_count: usize = 0;
         var ids = std.AutoHashMap(u32, void).init(gpa);

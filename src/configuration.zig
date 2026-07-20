@@ -20,6 +20,10 @@ pub const File = struct {
     peers: []const []const u8 = &.{},
     cluster_id: ?[]const u8 = null,
     auth_file: ?[]const u8 = null,
+    tls_cert: ?[]const u8 = null,
+    tls_key: ?[]const u8 = null,
+    tls_ca: ?[]const u8 = null,
+    sync: ?[]const u8 = null,
 };
 
 pub const Loaded = struct {

@@ -29,9 +29,22 @@ fn addSqliteLibrary(
     });
 }
 
+/// Links the system OpenSSL 3 (libssl/libcrypto) that backs the optional
+/// mTLS transport in `src/tls.zig`.
+fn linkOpenSsl(b: *std.Build, module: *std.Build.Module, prefix: []const u8) void {
+    module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{prefix}) });
+    module.linkSystemLibrary("ssl", .{});
+    module.linkSystemLibrary("crypto", .{});
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const openssl_prefix = b.option(
+        []const u8,
+        "openssl-prefix",
+        "OpenSSL 3 installation prefix (default: Homebrew openssl@3)",
+    ) orelse "/opt/homebrew/opt/openssl@3";
 
     const paxos = b.dependency("paxos", .{
         .target = target,
@@ -58,6 +71,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     zaxonlite.linkLibrary(sqlite_lib);
+    linkOpenSsl(b, zaxonlite, openssl_prefix);
 
     const zaxon = b.addExecutable(.{
         .name = "zaxon",
@@ -265,6 +279,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     bench_zaxonlite.linkLibrary(bench_sqlite);
+    linkOpenSsl(b, bench_zaxonlite, openssl_prefix);
     const bench_exe = b.addExecutable(.{
         .name = "zaxon-bench",
         .root_module = b.createModule(.{
@@ -281,6 +296,41 @@ pub fn build(b: *std.Build) void {
         "Run write/read/recovery benchmarks (ReleaseFast)",
     );
     bench_step.dependOn(&run_bench.step);
+
+    // Three-node cluster benchmark: ReleaseFast server binary driven by a
+    // ReleaseFast controller, in plaintext, PSK, or mTLS transport mode.
+    const zaxon_fast = b.addExecutable(.{
+        .name = "zaxon-fast",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{.{ .name = "zaxonlite", .module = bench_zaxonlite }},
+        }),
+    });
+    const cluster_bench_exe = b.addExecutable(.{
+        .name = "zaxon-cluster-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/cluster_bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{.{ .name = "zaxonlite", .module = bench_zaxonlite }},
+        }),
+    });
+    const run_cluster_bench = b.addRunArtifact(cluster_bench_exe);
+    run_cluster_bench.addArtifactArg(zaxon_fast);
+    // Recorded runs update the JSON table the Zaxonlite book compiles in.
+    run_cluster_bench.addArgs(&.{
+        "--record",
+        "benchmarks/results/transport-latest.json",
+    });
+    if (b.args) |args| run_cluster_bench.addArgs(args);
+    const cluster_bench_step = b.step(
+        "bench-cluster",
+        "Run the three-node cluster benchmark " ++
+            "(args: [--sync os|full] mode writes reads)",
+    );
+    cluster_bench_step.dependOn(&run_cluster_bench.step);
 
     // C ABI: libzaxonlite static library plus installed header.
     const capi_lib = b.addLibrary(.{

@@ -10,8 +10,12 @@
 //!
 //! Ordering rule: a sender pushes `payload_data`, waits for the receiver's
 //! `payload_stored` acknowledgement, and only then releases any promise,
-//! accept, or commit that references the payload hash. Thus every recovered
-//! value and every counted vote has durable payload bytes at its consumer.
+//! accept, or commit that references the payload hash. The acknowledgement
+//! means the receiver has installed and drive-flushed the object; the
+//! receiver's journal barrier — which precedes every vote and recovered
+//! value it emits — then makes it power-loss durable. Thus every counted
+//! vote and every recovered value has durable payload bytes at its
+//! consumer, at one full flush per commit point.
 
 const std = @import("std");
 const Io = std.Io;
@@ -27,6 +31,12 @@ pub const protocol_version: u16 = 4;
 
 /// Upper bound for one frame body; larger frames are a protocol error.
 pub const max_frame_bytes: u32 = 64 * 1024 * 1024;
+
+/// Default upper bound for one declared snapshot or backup transfer.
+/// Sized for the intended small embedded database profile, not for the
+/// theoretical SQLite maximum; deployments with larger images raise the
+/// server's `max_transfer_bytes` explicitly.
+pub const max_transfer_bytes: u64 = 4 * 1024 * 1024 * 1024;
 
 /// Generous fixed bound for one encoded envelope frame body.
 pub const max_envelope_size: usize = 16 + types.max_entry_size + 64;

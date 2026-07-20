@@ -27,6 +27,10 @@ pub const PayloadStore = payload_store.PayloadStore;
 pub const wal = @import("wal.zig");
 /// Narrow SQLite C API bindings; the only module that touches the C header.
 pub const sqlite = @import("sqlite.zig");
+/// SQLite invariant authorizer: keeps application SQL inside the
+/// replication contract (transaction ownership, reserved metadata,
+/// capture pragmas) without sandboxing ordinary SQLite usage.
+pub const guard = @import("guard.zig");
 /// Prepared parameter values and the copied, bounded transaction builder.
 pub const prepared = @import("prepared.zig");
 /// One bound SQL parameter: null, integer, real, text, or blob.
@@ -37,10 +41,15 @@ pub const Transaction = prepared.Transaction;
 pub const wire = @import("wire.zig");
 /// Mutual PSK authentication and per-frame HMAC integrity for TCP streams.
 pub const transport_auth = @import("transport_auth.zig");
+/// Optional mutual TLS 1.3 transport (OpenSSL 3): per-node certificates
+/// verified against a cluster CA, beside the PSK mode.
+pub const tls = @import("tls.zig");
 /// Configuration loading with CLI > environment > file precedence.
 pub const configuration = @import("configuration.zig");
 /// Elm-style operator diagnostics: boundary header, explanation, and hint.
 pub const diagnostic = @import("diagnostic.zig");
+/// Shared fsync policy and helpers: `full` (F_FULLFSYNC on macOS) or `os`.
+pub const durability = @import("durability.zig");
 /// The embedded node host: one data directory, journal, payloads, SQLite image.
 pub const node = @import("node.zig");
 /// Product node roles and their consensus/storage capabilities.
@@ -76,11 +85,14 @@ test {
     _ = @import("journal.zig");
     _ = @import("payload_store.zig");
     _ = @import("sqlite.zig");
+    _ = @import("guard.zig");
     _ = @import("prepared.zig");
     _ = @import("wal.zig");
     _ = @import("wire.zig");
     _ = @import("transport_auth.zig");
+    _ = @import("tls.zig");
     _ = @import("configuration.zig");
+    _ = @import("durability.zig");
     _ = @import("node.zig");
     _ = @import("roles.zig");
     _ = @import("server.zig");

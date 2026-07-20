@@ -6,14 +6,31 @@ const std = @import("std");
 const Io = std.Io;
 const wire = @import("wire.zig");
 const transport_auth = @import("transport_auth.zig");
+const tls = @import("tls.zig");
 const durability = @import("durability.zig");
+
+/// How a client authenticates its connections: the PSK secret, a mutual
+/// TLS identity, both (the PSK handshake then runs inside TLS), or
+/// neither for loopback/unix development use.
+pub const Transport = struct {
+    secret: ?[]const u8 = null,
+    tls: ?*const tls.Context = null,
+};
 
 pub const Endpoint = struct {
     host: []const u8,
-    port: u16,
+    port: u16 = 0,
+    /// When set, `host`/`port` are unused and the connection dials this
+    /// Unix-domain socket path instead of TCP.
+    unix_path: ?[]const u8 = null,
 
-    /// Parses `host:port`.
+    /// Parses `host:port` or `unix:<path>`.
     pub fn parse(text: []const u8) !Endpoint {
+        if (std.mem.startsWith(u8, text, "unix:")) {
+            const path = text["unix:".len..];
+            if (path.len == 0) return error.InvalidEndpoint;
+            return .{ .host = path, .unix_path = path };
+        }
         const colon = std.mem.lastIndexOfScalar(u8, text, ':') orelse
             return error.InvalidEndpoint;
         const port = std.fmt.parseInt(u16, text[colon + 1 ..], 10) catch
@@ -33,9 +50,12 @@ pub const Connection = struct {
     read_buffer: []u8,
     write_buffer: []u8,
     authenticated: ?transport_auth.Session = null,
+    /// Set when the connection runs over mutual TLS; `reader`/`writer`
+    /// are then unused and the TLS interfaces carry all frames.
+    tls_stream: ?*tls.Stream = null,
 
     pub fn open(gpa: std.mem.Allocator, io: Io, endpoint: Endpoint) !*Connection {
-        return openWithSecret(gpa, io, endpoint, null);
+        return openWithTransport(gpa, io, endpoint, .{});
     }
 
     pub fn openWithSecret(
@@ -44,6 +64,15 @@ pub const Connection = struct {
         endpoint: Endpoint,
         secret: ?[]const u8,
     ) !*Connection {
+        return openWithTransport(gpa, io, endpoint, .{ .secret = secret });
+    }
+
+    pub fn openWithTransport(
+        gpa: std.mem.Allocator,
+        io: Io,
+        endpoint: Endpoint,
+        transport: Transport,
+    ) !*Connection {
         const self = try gpa.create(Connection);
         errdefer gpa.destroy(self);
         const read_buffer = try gpa.alloc(u8, 64 * 1024);
@@ -51,8 +80,16 @@ pub const Connection = struct {
         const write_buffer = try gpa.alloc(u8, 64 * 1024);
         errdefer gpa.free(write_buffer);
 
-        const address = try std.Io.net.IpAddress.parse(endpoint.host, endpoint.port);
-        var stream = try address.connect(io, .{ .mode = .stream });
+        var stream = if (endpoint.unix_path) |path| blk: {
+            const address = try std.Io.net.UnixAddress.init(path);
+            break :blk try address.connect(io);
+        } else blk: {
+            const address = try std.Io.net.IpAddress.parse(
+                endpoint.host,
+                endpoint.port,
+            );
+            break :blk try address.connect(io, .{ .mode = .stream });
+        };
         errdefer stream.close(io);
 
         self.* = .{
@@ -64,8 +101,24 @@ pub const Connection = struct {
             .read_buffer = read_buffer,
             .write_buffer = write_buffer,
         };
-        self.reader = self.stream.reader(io, self.read_buffer);
-        self.writer = self.stream.writer(io, self.write_buffer);
+        if (transport.tls) |context| {
+            const tls_stream = try gpa.create(tls.Stream);
+            errdefer gpa.destroy(tls_stream);
+            tls_stream.* = try tls.Stream.connect(
+                context,
+                stream,
+                read_buffer,
+                write_buffer,
+            );
+            self.tls_stream = tls_stream;
+        } else {
+            self.reader = self.stream.reader(io, self.read_buffer);
+            self.writer = self.stream.writer(io, self.write_buffer);
+        }
+        errdefer if (self.tls_stream) |tls_stream| {
+            tls_stream.deinit();
+            gpa.destroy(tls_stream);
+        };
 
         // Client handshake.
         const hello = wire.Hello{
@@ -76,13 +129,13 @@ pub const Connection = struct {
             .configuration_id = 0,
         };
         var hello_buffer: [wire.Hello.encoded_size]u8 = undefined;
-        try wire.writeFrame(&self.writer.interface, .hello, hello.encode(&hello_buffer));
-        try self.writer.interface.flush();
-        if (secret) |bytes| {
+        try wire.writeFrame(self.writerInterface(), .hello, hello.encode(&hello_buffer));
+        try self.writerInterface().flush();
+        if (transport.secret) |bytes| {
             self.authenticated = try transport_auth.connect(
                 gpa,
-                &self.reader.interface,
-                &self.writer.interface,
+                self.readerInterface(),
+                self.writerInterface(),
                 bytes,
                 &hello_buffer,
             );
@@ -90,7 +143,21 @@ pub const Connection = struct {
         return self;
     }
 
+    fn readerInterface(self: *Connection) *Io.Reader {
+        if (self.tls_stream) |tls_stream| return &tls_stream.reader;
+        return &self.reader.interface;
+    }
+
+    fn writerInterface(self: *Connection) *Io.Writer {
+        if (self.tls_stream) |tls_stream| return &tls_stream.writer;
+        return &self.writer.interface;
+    }
+
     pub fn close(self: *Connection) void {
+        if (self.tls_stream) |tls_stream| {
+            tls_stream.deinit();
+            self.gpa.destroy(tls_stream);
+        }
         self.stream.close(self.io);
         self.gpa.free(self.read_buffer);
         self.gpa.free(self.write_buffer);
@@ -111,21 +178,21 @@ pub const Connection = struct {
 
     fn writeRequest(self: *Connection, request: []const u8) !void {
         if (self.authenticated) |*session| {
-            try session.writeFrame(&self.writer.interface, .rpc_request, request);
+            try session.writeFrame(self.writerInterface(), .rpc_request, request);
         } else {
-            try wire.writeFrame(&self.writer.interface, .rpc_request, request);
+            try wire.writeFrame(self.writerInterface(), .rpc_request, request);
         }
-        try self.writer.interface.flush();
+        try self.writerInterface().flush();
     }
 
     fn readFrame(self: *Connection) !transport_auth.Frame {
         if (self.authenticated) |*session| {
-            return session.readFrame(self.gpa, &self.reader.interface);
+            return session.readFrame(self.gpa, self.readerInterface());
         }
-        const header = try wire.readFrameHeader(&self.reader.interface);
+        const header = try wire.readFrameHeader(self.readerInterface());
         return .{
             .kind = header.kind,
-            .body = try wire.readFrameBody(self.gpa, &self.reader.interface, header),
+            .body = try wire.readFrameBody(self.gpa, self.readerInterface(), header),
         };
     }
 
@@ -173,7 +240,7 @@ pub const Connection = struct {
         if (begin_frame.kind == .rpc_response) return error.RemoteBackupRejected;
         if (begin_frame.kind != .backup_begin) return error.InvalidFrame;
         const begin = try wire.BackupBegin.decode(begin_frame.body);
-        if (begin.size == 0 or begin.size > 1024 * 1024 * 1024 * 1024) {
+        if (begin.size == 0 or begin.size > wire.max_transfer_bytes) {
             return error.InvalidBackupSize;
         }
 
@@ -199,7 +266,7 @@ pub const Connection = struct {
         var actual: [32]u8 = undefined;
         hasher.final(&actual);
         if (!std.mem.eql(u8, &actual, &begin.sha256)) return error.BackupDigestMismatch;
-        try file.sync(self.io);
+        try durability.syncFile(self.io, file);
         file.close(self.io);
         file_open = false;
         try directory.rename(temporary_name, directory, file_name, self.io);
@@ -211,7 +278,8 @@ pub const Connection = struct {
 pub const CallResult = struct {
     /// Owned JSON response body.
     body: []u8,
-    /// The endpoint that answered (after redirects).
+    /// The endpoint that answered (after redirects). Always one of the
+    /// caller's configured endpoints, borrowing its memory.
     endpoint: Endpoint,
 };
 
@@ -243,7 +311,24 @@ pub fn callClusterWithSecret(
     require_leader: bool,
     secret: ?[]const u8,
 ) !CallResult {
-    var redirect_host_buffer: [256]u8 = undefined;
+    return callClusterWithTransport(
+        gpa,
+        io,
+        endpoints,
+        request,
+        require_leader,
+        .{ .secret = secret },
+    );
+}
+
+pub fn callClusterWithTransport(
+    gpa: std.mem.Allocator,
+    io: Io,
+    endpoints: []const Endpoint,
+    request: []const u8,
+    require_leader: bool,
+    transport: Transport,
+) !CallResult {
     var redirect: ?Endpoint = null;
     var attempt: usize = 0;
     const max_attempts = 12;
@@ -253,7 +338,12 @@ pub fn callClusterWithSecret(
             endpoints[attempt % endpoints.len];
         redirect = null;
 
-        const connection = Connection.openWithSecret(gpa, io, endpoint, secret) catch {
+        const connection = Connection.openWithTransport(
+            gpa,
+            io,
+            endpoint,
+            transport,
+        ) catch {
             io.sleep(.fromMilliseconds(150), .awake) catch {};
             continue;
         };
@@ -282,20 +372,30 @@ pub fn callClusterWithSecret(
         if (code != .string or !std.mem.eql(u8, code.string, "not_leader")) {
             return .{ .body = body, .endpoint = endpoint };
         }
+        // A leader hint is followed only when it names one of the
+        // caller's configured endpoints: a redirect must not send the
+        // client outside its known cluster. An unmatched hint falls back
+        // to round-robin over the configured list.
         if (object.get("leader")) |leader|
             switch (leader) {
                 .object => |leader_object| {
                     const host = leader_object.get("host");
                     const port = leader_object.get("port");
                     if (host != null and port != null and
-                        host.? == .string and port.? == .integer)
+                        host.? == .string and port.? == .integer and
+                        port.?.integer >= 0 and
+                        port.?.integer <= std.math.maxInt(u16))
                     {
-                        const len = @min(host.?.string.len, redirect_host_buffer.len);
-                        @memcpy(redirect_host_buffer[0..len], host.?.string[0..len]);
-                        redirect = .{
-                            .host = redirect_host_buffer[0..len],
-                            .port = @intCast(port.?.integer),
-                        };
+                        const hinted_port: u16 = @intCast(port.?.integer);
+                        for (endpoints) |candidate| {
+                            if (candidate.unix_path != null) continue;
+                            if (candidate.port == hinted_port and
+                                std.mem.eql(u8, candidate.host, host.?.string))
+                            {
+                                redirect = candidate;
+                                break;
+                            }
+                        }
                     }
                 },
                 else => {},
@@ -312,4 +412,8 @@ test "endpoint parsing" {
     try std.testing.expectEqual(@as(u16, 9901), endpoint.port);
     try std.testing.expectError(error.InvalidEndpoint, Endpoint.parse("nope"));
     try std.testing.expectError(error.InvalidEndpoint, Endpoint.parse(":123"));
+
+    const unix = try Endpoint.parse("unix:/run/zaxon.sock");
+    try std.testing.expectEqualStrings("/run/zaxon.sock", unix.unix_path.?);
+    try std.testing.expectError(error.InvalidEndpoint, Endpoint.parse("unix:"));
 }

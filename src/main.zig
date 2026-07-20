@@ -19,6 +19,7 @@ const client = zaxonlite.client;
 const gateway = zaxonlite.gateway;
 const configuration = zaxonlite.configuration;
 const diagnostic = zaxonlite.diagnostic;
+const tls = zaxonlite.tls;
 const Role = zaxonlite.Role;
 
 const exit_ok: u8 = 0;
@@ -33,7 +34,7 @@ const usage_text =
     \\Usage:
     \\  zaxon <command> --data <dir> [options]          embedded mode
     \\  zaxon <command> --connect host:port[,...]       client mode
-    \\  zaxon serve --data <dir> --node <id> --listen host:port
+    \\  zaxon serve --data <dir> --node <id> --listen <endpoint>
     \\        [--role <role>] [--peer <id>@host:port[/role] ...]
     \\        [--cluster-id <text>]
     \\        [--auth-file <path>] [--enable-failpoints]
@@ -59,7 +60,7 @@ const usage_text =
     \\Options:
     \\  --config <path>     JSON config; or ZAXON_CONFIG.
     \\  --data <dir>        Node data directory (created when missing).
-    \\  --connect <list>    Comma-separated server endpoints for client mode.
+    \\  --connect <list>    Comma-separated endpoints (host:port or unix:<path>).
     \\  --sql <text>        SQL for exec/query.
     \\  --session <id>      Session ID for exec.
     \\  --sequence <n>      Monotonic per-session sequence for exec.
@@ -71,11 +72,17 @@ const usage_text =
     \\  --leader            Also wait for a known leader (wait).
     \\  --timeout-ms <n>    Wait deadline in milliseconds.
     \\  --node <id>         This node's ID (serve).
-    \\  --listen host:port  Listen endpoint (serve).
+    \\  --listen <endpoint> host:port, or unix:<path> for owner-only local
+    \\                      service over a Unix-domain socket (serve).
     \\  --role <role>       data-voter|witness|standby|read-replica.
     \\  --peer <spec>       id@host:port[/role] (repeat; serve).
     \\  --cluster-id <text> Extra entropy for the derived database identity.
     \\  --auth-file <path>  PSK provider; or ZAXON_AUTH_FILE. Never a literal key.
+    \\  --tls-cert <path>   Node certificate PEM (mutual TLS; needs all three).
+    \\  --tls-key <path>    Node private key PEM.
+    \\  --tls-ca <path>     Cluster CA PEM that peer certificates chain to.
+    \\  --sync <mode>       full (default; F_FULLFSYNC on macOS, survives power
+    \\                      loss) or os (plain fsync; faster, development only).
     \\  --enable-failpoints Honor failpoint RPCs (test controllers only).
     \\  --json              Machine-readable output on stdout.
     \\
@@ -106,6 +113,10 @@ const Options = struct {
     peers: std.ArrayList([]const u8) = .empty,
     cluster_id: ?[]const u8 = null,
     auth_file: ?[]const u8 = null,
+    tls_cert: ?[]const u8 = null,
+    tls_key: ?[]const u8 = null,
+    tls_ca: ?[]const u8 = null,
+    sync: ?[]const u8 = null,
     enable_failpoints: bool = false,
     json: bool = false,
 };
@@ -222,6 +233,18 @@ fn run(
         } else if (std.mem.eql(u8, arg, "--auth-file")) {
             options.auth_file = iterator.next() orelse
                 return usageError(err_out, "--auth-file needs a value");
+        } else if (std.mem.eql(u8, arg, "--tls-cert")) {
+            options.tls_cert = iterator.next() orelse
+                return usageError(err_out, "--tls-cert needs a value");
+        } else if (std.mem.eql(u8, arg, "--tls-key")) {
+            options.tls_key = iterator.next() orelse
+                return usageError(err_out, "--tls-key needs a value");
+        } else if (std.mem.eql(u8, arg, "--tls-ca")) {
+            options.tls_ca = iterator.next() orelse
+                return usageError(err_out, "--tls-ca needs a value");
+        } else if (std.mem.eql(u8, arg, "--sync")) {
+            options.sync = iterator.next() orelse
+                return usageError(err_out, "--sync needs a value");
         } else if (std.mem.eql(u8, arg, "--enable-failpoints")) {
             options.enable_failpoints = true;
         } else if (std.mem.eql(u8, arg, "--json")) {
@@ -265,6 +288,13 @@ fn run(
     const file_config = if (loaded_config) |*loaded| loaded.value() else null;
     applyConfiguration(gpa, environ, file_config, &options, err_out) catch
         return exit_usage;
+    if (options.sync) |sync_text| {
+        const mode = std.meta.stringToEnum(
+            zaxonlite.durability.SyncMode,
+            sync_text,
+        ) orelse return usageError(err_out, "--sync must be os or full");
+        zaxonlite.durability.setSyncMode(mode);
+    }
     var secret: ?configuration.Secret = if (options.auth_file) |path|
         configuration.loadSecret(gpa, io, path) catch |err| {
             try diagnostic.write(
@@ -279,11 +309,49 @@ fn run(
         null;
     defer if (secret) |*value| value.deinit(gpa);
     const secret_bytes: ?[]const u8 = if (secret) |*value| value.bytes else null;
+    const tls_config: ?tls.Config = blk: {
+        const any = options.tls_cert != null or options.tls_key != null or
+            options.tls_ca != null;
+        if (!any) break :blk null;
+        if (options.tls_cert == null or options.tls_key == null or
+            options.tls_ca == null)
+        {
+            return usageError(
+                err_out,
+                "--tls-cert, --tls-key, and --tls-ca must be given together",
+            );
+        }
+        break :blk .{
+            .cert_path = options.tls_cert.?,
+            .key_path = options.tls_key.?,
+            .ca_path = options.tls_ca.?,
+        };
+    };
     if (std.mem.eql(u8, command, "serve")) {
-        return serveCommand(gpa, io, &options, secret_bytes, err_out);
+        return serveCommand(gpa, io, &options, secret_bytes, tls_config, err_out);
     }
     if (options.connect != null) {
-        return remote(gpa, io, &options, secret_bytes, out, err_out);
+        // One client TLS identity serves every connection this command
+        // makes, including redirect follow-ups.
+        var tls_context: ?tls.Context = null;
+        defer if (tls_context) |*context| context.deinit();
+        if (tls_config) |config| {
+            tls_context = tls.Context.initClient(config) catch |err| {
+                try diagnostic.write(
+                    err_out,
+                    "tls identity failed",
+                    @errorName(err),
+                    "Check that --tls-cert, --tls-key, and --tls-ca name " ++
+                        "readable PEM files.",
+                );
+                return exit_usage;
+            };
+        }
+        const transport = client.Transport{
+            .secret = secret_bytes,
+            .tls = if (tls_context) |*context| context else null,
+        };
+        return remote(gpa, io, &options, transport, out, err_out);
     }
 
     const data = options.data orelse
@@ -443,6 +511,22 @@ fn applyConfiguration(
         options.auth_file = environ.get("ZAXON_AUTH_FILE") orelse
             if (file) |value| value.auth_file else null;
     }
+    if (options.tls_cert == null) {
+        options.tls_cert = environ.get("ZAXON_TLS_CERT") orelse
+            if (file) |value| value.tls_cert else null;
+    }
+    if (options.tls_key == null) {
+        options.tls_key = environ.get("ZAXON_TLS_KEY") orelse
+            if (file) |value| value.tls_key else null;
+    }
+    if (options.tls_ca == null) {
+        options.tls_ca = environ.get("ZAXON_TLS_CA") orelse
+            if (file) |value| value.tls_ca else null;
+    }
+    if (options.sync == null) {
+        options.sync = environ.get("ZAXON_SYNC") orelse
+            if (file) |value| value.sync else null;
+    }
     if (options.node_id == null) {
         if (environ.get("ZAXON_NODE")) |text| {
             options.node_id = std.fmt.parseInt(u32, text, 10) catch {
@@ -530,6 +614,7 @@ fn serveCommand(
     io: std.Io,
     options: *Options,
     auth_secret: ?[]const u8,
+    tls_config: ?tls.Config,
     err_out: *std.Io.Writer,
 ) !u8 {
     const data = options.data orelse
@@ -539,7 +624,18 @@ fn serveCommand(
     const listen_text = options.listen orelse
         return usageError(err_out, "serve needs --listen");
     const listen = client.Endpoint.parse(listen_text) catch
-        return usageError(err_out, "--listen must be host:port");
+        return usageError(err_out, "--listen must be host:port or unix:<path>");
+    if (listen.unix_path != null) {
+        if (options.role == .gateway) {
+            return usageError(err_out, "gateway mode listens on TCP");
+        }
+        if (options.peers.items.len > 0) {
+            return usageError(
+                err_out,
+                "unix socket service is single-node; peers need host:port",
+            );
+        }
+    }
 
     var members: std.ArrayList(server.PeerAddress) = .empty;
     defer members.deinit(gpa);
@@ -579,6 +675,13 @@ fn serveCommand(
         null;
 
     if (options.role == .gateway) {
+        if (tls_config != null) {
+            return usageError(
+                err_out,
+                "gateway mode does not support --tls yet; front it with TLS " ++
+                    "termination or use PSK",
+            );
+        }
         var backends: std.ArrayList(client.Endpoint) = .empty;
         defer backends.deinit(gpa);
         for (members.items) |member| {
@@ -603,9 +706,11 @@ fn serveCommand(
         .node_id = node_id,
         .listen_host = listen.host,
         .listen_port = listen.port,
+        .listen_unix = listen.unix_path,
         .members = members.items,
         .database_id = database_id,
         .auth_secret = auth_secret,
+        .tls = tls_config,
         .enable_failpoints = options.enable_failpoints,
     }, err_out);
 }
@@ -632,7 +737,7 @@ fn remote(
     gpa: std.mem.Allocator,
     io: std.Io,
     options: *Options,
-    auth_secret: ?[]const u8,
+    transport: client.Transport,
     out: *std.Io.Writer,
     err_out: *std.Io.Writer,
 ) !u8 {
@@ -642,28 +747,28 @@ fn remote(
 
     const command = options.command;
     if (std.mem.eql(u8, command, "sql")) {
-        return remoteShell(gpa, io, endpoints.items, auth_secret, out, err_out);
+        return remoteShell(gpa, io, endpoints.items, transport, out, err_out);
     }
     if (std.mem.eql(u8, command, "backup")) {
         const destination = options.to orelse
             return usageError(err_out, "backup needs --to");
-        const probe = client.callClusterWithSecret(
+        const probe = client.callClusterWithTransport(
             gpa,
             io,
             endpoints.items,
             "{\"op\":\"query\",\"sql\":\"select 1\"}",
             true,
-            auth_secret,
+            transport,
         ) catch {
             try noLeaderDiagnostic(err_out);
             return exit_unavailable;
         };
         defer gpa.free(probe.body);
-        const connection = client.Connection.openWithSecret(
+        const connection = client.Connection.openWithTransport(
             gpa,
             io,
             probe.endpoint,
-            auth_secret,
+            transport,
         ) catch {
             try diagnostic.write(
                 err_out,
@@ -764,13 +869,13 @@ fn remote(
         return exit_usage;
     }
 
-    const result = client.callClusterWithSecret(
+    const result = client.callClusterWithTransport(
         gpa,
         io,
         endpoints.items,
         request.written(),
         require_leader,
-        auth_secret,
+        transport,
     ) catch {
         try noLeaderDiagnostic(err_out);
         return exit_unavailable;
@@ -946,7 +1051,7 @@ fn remoteShell(
     gpa: std.mem.Allocator,
     io: std.Io,
     endpoints: []const client.Endpoint,
-    auth_secret: ?[]const u8,
+    transport: client.Transport,
     out: *std.Io.Writer,
     err_out: *std.Io.Writer,
 ) !u8 {
@@ -1009,13 +1114,13 @@ fn remoteShell(
             try request.writer.writeAll("}");
         }
 
-        const result = client.callClusterWithSecret(
+        const result = client.callClusterWithTransport(
             gpa,
             io,
             endpoints,
             request.written(),
             true,
-            auth_secret,
+            transport,
         ) catch {
             try noLeaderDiagnostic(err_out);
             try err_out.flush();
@@ -1196,10 +1301,9 @@ fn printStatus(node: *Node, json: bool, out: *std.Io.Writer) !void {
                 status.node_id,          status.database_id,
                 status.configuration_id, status.role,
                 status.node_type,        status.leader,
-                status.decided_slot,
-                status.applied_slot,     status.journal_records,
-                status.epoch_capacity,   &chain_hex,
-                status.page_size,
+                status.decided_slot,     status.applied_slot,
+                status.journal_records,  status.epoch_capacity,
+                &chain_hex,              status.page_size,
             },
         );
         if (status.snapshot) |name| {
