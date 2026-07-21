@@ -80,8 +80,21 @@ pub const PayloadStore = struct {
 
         var path_buffer: [65]u8 = undefined;
         const path = pathOf(&path_buffer, digest);
+        // Only a newly created two-hex shard changes the payload root. The
+        // previous implementation fsynced that unchanged root for every
+        // object, adding one syscall per voter per write. The shard itself
+        // still receives a positional directory sync after the link.
+        const shard_status = try self.dir.createDirPathStatus(
+            self.io,
+            path[0..2],
+            @enumFromInt(0o700),
+        );
+        if (shard_status == .created) {
+            try durability.syncDirectoryBeforeBarrier(self.dir);
+        }
         var atomic = try self.dir.createFileAtomic(self.io, path, .{
-            .make_path = true,
+            .make_path = false,
+            .permissions = @enumFromInt(0o600),
         });
         defer atomic.deinit(self.io);
         try atomic.file.writePositionalAll(self.io, bytes, 0);
@@ -92,7 +105,6 @@ pub const PayloadStore = struct {
             else => return err,
         };
         try durability.syncChildDirectoryBeforeBarrier(self.io, self.dir, path[0..2]);
-        try durability.syncDirectoryBeforeBarrier(self.dir);
     }
 
     pub fn contains(self: *PayloadStore, digest: Hash) bool {

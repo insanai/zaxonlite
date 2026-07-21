@@ -12,6 +12,7 @@ pub const Error = error{
     SqliteError,
     SqliteBusy,
     SqliteMisuse,
+    SqliteInterrupted,
 };
 
 fn check(db: ?*c.sqlite3, rc: c_int) Error!void {
@@ -19,6 +20,7 @@ fn check(db: ?*c.sqlite3, rc: c_int) Error!void {
         c.SQLITE_OK, c.SQLITE_DONE, c.SQLITE_ROW => {},
         c.SQLITE_BUSY, c.SQLITE_LOCKED => return error.SqliteBusy,
         c.SQLITE_MISUSE => return error.SqliteMisuse,
+        c.SQLITE_INTERRUPT => return error.SqliteInterrupted,
         else => {
             if (db != null and std.debug.runtime_safety) {
                 std.log.debug("sqlite error {d}: {s}", .{ rc, c.sqlite3_errmsg(db) });
@@ -43,6 +45,8 @@ pub const Authorizer = *const fn (
     database_name: [*c]const u8,
     trigger_name: [*c]const u8,
 ) callconv(.c) c_int;
+
+pub const ProgressHandler = *const fn (context: ?*anyopaque) callconv(.c) c_int;
 
 /// True when the linked amalgamation was compiled with `option`
 /// (without the `SQLITE_` prefix), e.g. "OMIT_LOAD_EXTENSION".
@@ -131,6 +135,22 @@ pub const Db = struct {
         context: ?*anyopaque,
     ) void {
         _ = c.sqlite3_set_authorizer(self.handle, authorizer, context);
+    }
+
+    /// Invokes `handler` after roughly every `vm_operations` SQLite virtual
+    /// machine instructions. Returning non-zero interrupts the statement.
+    pub fn setProgressHandler(
+        self: *Db,
+        vm_operations: u32,
+        handler: ?ProgressHandler,
+        context: ?*anyopaque,
+    ) void {
+        c.sqlite3_progress_handler(
+            self.handle,
+            @intCast(vm_operations),
+            handler,
+            context,
+        );
     }
 
     /// Runs a TRUNCATE checkpoint; the WAL is empty afterwards. Requires no

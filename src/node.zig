@@ -7,19 +7,26 @@
 //!
 //! Ordering contract per write:
 //!   execute -> capture frames -> persist payload -> Paxos append ->
-//!   journal + fsync -> confirmWritesDurable -> committed -> acknowledge.
+//!   journal + required sync -> confirmWritesDurable -> committed -> acknowledge.
 //! The payload install flushes to the drive; the journal fsync is the one
 //! storage barrier per write and makes both power-loss durable together
 //! (see durability.zig on group fsync).
+//! Promise and accept records require that barrier. A later commit-only
+//! marker is reconstructible from the durable accepting quorum, so Zaxonlite
+//! does not duplicate it in the authoritative journal. This matches classic
+//! Paxos: a restart re-learns the chosen value from the accepting quorum.
 //!
 //! Cluster shape: the same node type serves one-member and multi-member
 //! configurations. Only the current leader keeps a live SQLite writer
 //! connection (the capture connection); every other member applies
 //! committed payloads offline, page by page, to the materialized image.
 //! Protocol messages addressed to peers accumulate in `outbox`; the
-//! transport host (`server.zig`) drains it after every protocol call, and
-//! the journal fsync inside `consumeEffects` precedes any envelope leaving
-//! the process, preserving sync-before-send.
+//! transport host (`server.zig`) drains it after every protocol call.  The
+//! sole pipelined exception is a phase-two `accept` request: it may leave
+//! after the journal append while the leader's barrier is in progress,
+//! because it asks a follower to persist a vote and asserts no durable fact
+//! about the leader.  Promise evidence, vote acknowledgements, commits, and
+//! client replies still remain behind the local barrier.
 
 const std = @import("std");
 const Io = std.Io;
@@ -29,6 +36,7 @@ const command = @import("command.zig");
 const types = @import("types.zig");
 const journal_mod = @import("journal.zig");
 const payload_store_mod = @import("payload_store.zig");
+const checkpoint_proof = @import("checkpoint_proof.zig");
 const sqlite = @import("sqlite.zig");
 const guard_mod = @import("guard.zig");
 const wal = @import("wal.zig");
@@ -127,6 +135,34 @@ pub const QueryResult = struct {
     }
 };
 
+/// Optional result and SQLite VM budgets. Zero means unlimited, which remains
+/// the default for trusted embedded callers. Network hosts pass conservative
+/// non-zero limits so one query cannot monopolize memory or CPU indefinitely.
+pub const QueryLimits = struct {
+    max_rows: usize = 0,
+    max_bytes: usize = 0,
+    max_vm_steps: u64 = 0,
+};
+
+const QueryProgress = struct {
+    callbacks_remaining: u64,
+};
+
+fn queryProgress(context: ?*anyopaque) callconv(.c) c_int {
+    const progress: *QueryProgress = @ptrCast(@alignCast(context.?));
+    if (progress.callbacks_remaining == 0) return 1;
+    progress.callbacks_remaining -= 1;
+    return 0;
+}
+
+/// Host callback used to release protocol-core messages explicitly
+/// classified as safe before the current journal barrier.  The callback is
+/// optional so the embedded storage node remains transport-independent.
+pub const PreDurableOutboxHook = struct {
+    context: *anyopaque,
+    run: *const fn (context: *anyopaque) anyerror!void,
+};
+
 pub const Node = struct {
     gpa: std.mem.Allocator,
     io: Io,
@@ -138,9 +174,11 @@ pub const Node = struct {
     log: *Log.Node,
     effects: *Log.Effects,
     inbox: []Log.Envelope,
-    /// Envelopes addressed to peers, appended by `consumeEffects` after the
-    /// backing journal writes are durable. The transport drains this.
+    /// Envelopes addressed to peers. Most are appended after the backing
+    /// journal writes are durable; phase-two accepts may be appended during
+    /// the barrier and released through `pre_durable_outbox_hook`.
     outbox: std.ArrayList(Log.Envelope) = .empty,
+    pre_durable_outbox_hook: ?PreDurableOutboxHook = null,
     db: sqlite.Db,
     db_path: [:0]u8,
     /// True while the live SQLite writer (capture) connection is open.
@@ -214,8 +252,11 @@ pub const Node = struct {
         if (found_self != capabilities.votes) return error.RoleMembershipMismatch;
         const single = capabilities.votes and members.len == 1;
 
-        var dir = try Io.Dir.cwd().createDirPathOpen(io, options.directory, .{});
+        var dir = try Io.Dir.cwd().createDirPathOpen(io, options.directory, .{
+            .permissions = @enumFromInt(0o700),
+        });
         errdefer dir.close(io);
+        try dir.setPermissions(io, @enumFromInt(0o700));
 
         // One process per data directory.
         const lock_file = try dir.createFile(io, lock_file_name, .{
@@ -620,12 +661,31 @@ pub const Node = struct {
         return self.queryPrepared(gpa, sql, &.{});
     }
 
+    pub fn queryWithLimits(
+        self: *Node,
+        gpa: std.mem.Allocator,
+        sql: []const u8,
+        limits: QueryLimits,
+    ) !QueryResult {
+        return self.queryPreparedWithLimits(gpa, sql, &.{}, limits);
+    }
+
     /// Runs one read-only prepared query and returns copied result values.
     pub fn queryPrepared(
         self: *Node,
         gpa: std.mem.Allocator,
         sql: []const u8,
         values: []const prepared.Value,
+    ) !QueryResult {
+        return self.queryPreparedWithLimits(gpa, sql, values, .{});
+    }
+
+    pub fn queryPreparedWithLimits(
+        self: *Node,
+        gpa: std.mem.Allocator,
+        sql: []const u8,
+        values: []const prepared.Value,
+        limits: QueryLimits,
     ) !QueryResult {
         if (!self.capabilities.serves_reads) return error.RoleCannotRead;
         if (self.fatal_storage_error) return error.StorageFailed;
@@ -646,6 +706,28 @@ pub const Node = struct {
         read_guard.scope = .application;
         defer read_guard.scope = .internal;
 
+        // A VM-instruction budget is deterministic and SQLite-native. It is
+        // intentionally optional: embedded callers and approved migrations
+        // can retain SQLite's normal unlimited behavior.
+        const progress_granularity: u64 = 1_000;
+        var progress = QueryProgress{
+            .callbacks_remaining = if (limits.max_vm_steps == 0)
+                0
+            else
+                @max(@as(u64, 1), (limits.max_vm_steps +| progress_granularity - 1) /
+                    progress_granularity),
+        };
+        if (limits.max_vm_steps != 0) {
+            lease.db.setProgressHandler(
+                @intCast(progress_granularity),
+                queryProgress,
+                &progress,
+            );
+        }
+        defer if (limits.max_vm_steps != 0) {
+            lease.db.setProgressHandler(0, null, null);
+        };
+
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
         const alloc = arena.allocator();
@@ -660,8 +742,15 @@ pub const Node = struct {
 
         const column_count = stmt.columnCount();
         const columns = try alloc.alloc([]const u8, column_count);
+        var result_bytes: usize = 0;
         for (columns, 0..) |*column, index| {
-            column.* = try alloc.dupe(u8, stmt.columnName(@intCast(index)));
+            const name = stmt.columnName(@intCast(index));
+            result_bytes = std.math.add(usize, result_bytes, name.len) catch
+                return error.QueryResultTooLarge;
+            if (limits.max_bytes != 0 and result_bytes > limits.max_bytes) {
+                return error.QueryResultTooLarge;
+            }
+            column.* = try alloc.dupe(u8, name);
         }
 
         var rows: std.ArrayList([]const ?[]const u8) = .empty;
@@ -669,12 +758,27 @@ pub const Node = struct {
             self.saveErrorFrom(&lease.db);
             return err;
         }) {
+            if (limits.max_rows != 0 and rows.items.len >= limits.max_rows) {
+                return error.QueryRowLimit;
+            }
             const row = try alloc.alloc(?[]const u8, column_count);
             for (row, 0..) |*cell, index| {
-                cell.* = if (stmt.isColumnNull(@intCast(index)))
-                    null
-                else
-                    try alloc.dupe(u8, stmt.columnText(@intCast(index)));
+                if (stmt.isColumnNull(@intCast(index))) {
+                    cell.* = null;
+                } else {
+                    const text = stmt.columnText(@intCast(index));
+                    result_bytes = std.math.add(
+                        usize,
+                        result_bytes,
+                        text.len,
+                    ) catch return error.QueryResultTooLarge;
+                    if (limits.max_bytes != 0 and
+                        result_bytes > limits.max_bytes)
+                    {
+                        return error.QueryResultTooLarge;
+                    }
+                    cell.* = try alloc.dupe(u8, text);
+                }
             }
             try rows.append(alloc, row);
         }
@@ -725,6 +829,16 @@ pub const Node = struct {
 
     pub fn memberIds(self: *const Node) []const paxos.NodeId {
         return self.members[0..self.member_count];
+    }
+
+    /// Installs the transport host's pre-barrier outbox drain. The host must
+    /// serialize node transitions until the callback returns and the storage
+    /// barrier completes; `server.zig` does so with its node mutex.
+    pub fn setPreDurableOutboxHook(
+        self: *Node,
+        hook: ?PreDurableOutboxHook,
+    ) void {
+        self.pre_durable_outbox_hook = hook;
     }
 
     /// Takes an online snapshot, seals the epoch, and starts the next one.
@@ -1356,25 +1470,64 @@ pub const Node = struct {
         while (true) {
             const writes = self.effects.writesSlice();
             if (writes.len > 0) {
-                self.journal.appendWrites(writes) catch |err| {
-                    self.fatal_storage_error = true;
-                    return err;
-                };
-                failpoint.hit("after_accept_append");
-                self.delayStorage();
-                self.journal.sync() catch |err| {
-                    self.fatal_storage_error = true;
-                    return err;
-                };
-                failpoint.hit("after_accept_sync");
+                const requires_barrier = self.effects.requiresPowerLossBarrier();
+                if (requires_barrier) {
+                    self.journal.appendWrites(writes) catch |err| {
+                        self.fatal_storage_error = true;
+                        return err;
+                    };
+                    failpoint.hit("after_accept_append");
+
+                    // Phase-two requests do not claim the leader's local vote
+                    // is durable. Queue and release only those requests now so
+                    // follower barriers overlap this node's barrier. The host
+                    // mutex prevents a reply from entering the core early.
+                    var early = self.effects.preDurableMessages();
+                    var queued_early = false;
+                    while (early.next()) |envelope| {
+                        std.debug.assert(envelope.to != self.identity.node_id);
+                        try self.outbox.append(self.gpa, envelope);
+                        queued_early = true;
+                    }
+                    if (queued_early) {
+                        if (self.pre_durable_outbox_hook) |hook| {
+                            hook.run(hook.context) catch |err| {
+                                // The request may already have reached a peer.
+                                // Make the local vote durable before returning
+                                // the transport failure to the host.
+                                self.delayStorage();
+                                self.journal.sync() catch |sync_err| {
+                                    self.fatal_storage_error = true;
+                                    return sync_err;
+                                };
+                                self.effects.confirmWritesDurable();
+                                return err;
+                            };
+                        }
+                    }
+                    self.delayStorage();
+                    self.journal.sync() catch |err| {
+                        self.fatal_storage_error = true;
+                        return err;
+                    };
+                    failpoint.hit("after_accept_sync");
+                }
             }
             self.effects.confirmWritesDurable();
             if (self.effects.committedSlice().len > 0) {
+                // Legacy failpoint name retained for crash-matrix stability.
+                // Commit-only markers are now derived and need no second sync;
+                // this boundary means chosen-before-materialized-apply.
                 failpoint.hit("after_commit_sync_before_apply");
             }
 
             var pending: usize = 0;
             for (self.effects.messagesSlice()) |envelope| {
+                // Already queued above when this transition had writes.
+                if (self.effects.requiresPowerLossBarrier()) switch (envelope.message) {
+                    .accept => continue,
+                    else => {},
+                };
                 if (envelope.to == self.identity.node_id) {
                     self.inbox[pending] = envelope;
                     pending += 1;
@@ -1513,7 +1666,10 @@ pub const Node = struct {
         });
         defer file.close(self.io);
         try wal.applyPayload(self.io, file, &view);
-        try durability.syncFile(self.io, file);
+        // `current.db` is a materialized cache, rebuilt from the snapshot,
+        // accepted journal records, and payload store on every open. The page
+        // writes need to finish before local reads, but do not require a
+        // second power-loss barrier per chosen transaction.
     }
 
     /// Cross-checks the fixed Paxos descriptor against the immutable payload.
@@ -1972,6 +2128,33 @@ pub const Node = struct {
             return error.ConfigurationMismatch;
         }
 
+        // Retain the exact already-chosen stop sign beside the image. This
+        // is deliberately not a signature over a locally materialized
+        // SQLite file and does not add a consensus round: all fields below
+        // are either the chosen stop value or values bound by its manifest
+        // digest. A lagging receiver asks a read quorum to confirm the
+        // canonical proof digest before installing the transferred image.
+        const proof = try checkpoint_proof.create(
+            self.identity.database_id,
+            self.identity.configuration_id,
+            stop.configuration_id,
+            self.stop_slot,
+            self.stop_slot - 1,
+            self.last_chain,
+            manifest_digest,
+            stop.membersSlice(),
+            stop.metadataSlice(),
+        );
+        var snapshot_path_buffer: [64]u8 = undefined;
+        const snapshot_path = std.fmt.bufPrint(
+            &snapshot_path_buffer,
+            "snapshots/{s}",
+            .{&parsed.name},
+        ) catch unreachable;
+        var snapshot_dir = try self.dir.openDir(self.io, snapshot_path, .{});
+        defer snapshot_dir.close(self.io);
+        try atomicWriteFile(self.io, snapshot_dir, "proof", proof.slice());
+
         // Collect payload hashes still referenced by the sealed epoch before
         // its in-memory state is replaced; they stay until its journal is
         // garbage-collected.
@@ -2062,11 +2245,22 @@ pub const Node = struct {
         configuration_id: u64,
         name: [16]u8,
         manifest: []const u8,
+        proof_bytes: []const u8,
     ) !void {
         if (configuration_id <= self.identity.configuration_id) {
             self.dir.deleteTree(self.io, install_tmp_dir) catch {};
             return error.StaleSnapshot;
         }
+
+        // Validate the already-chosen stop evidence before trusting the
+        // transferred image. The transport host separately confirms this
+        // proof digest with a voter quorum.
+        _ = try self.validateCheckpointProof(
+            proof_bytes,
+            configuration_id,
+            name,
+            manifest,
+        );
 
         // Validate the transferred image against the manifest.
         const format = manifestValue(manifest, "format") orelse
@@ -2117,6 +2311,7 @@ pub const Node = struct {
                 return error.SnapshotDigestMismatch;
             }
             try atomicWriteFile(self.io, tmp_dir, "manifest", manifest);
+            try atomicWriteFile(self.io, tmp_dir, "proof", proof_bytes);
         }
 
         var final_path_buffer: [64]u8 = undefined;
@@ -2312,12 +2507,14 @@ pub const Node = struct {
         configuration_id: u64,
         name: [16]u8,
         manifest: []u8,
+        proof: []u8,
         db_size: u64,
         file: Io.File,
 
         pub fn close(self: *SnapshotHandle, io: Io, gpa: std.mem.Allocator) void {
             self.file.close(io);
             gpa.free(self.manifest);
+            gpa.free(self.proof);
             self.* = undefined;
         }
     };
@@ -2341,15 +2538,111 @@ pub const Node = struct {
             .limited(4096),
         );
         errdefer self.gpa.free(manifest);
+        const proof = try snapshot_dir.readFileAlloc(
+            self.io,
+            "proof",
+            self.gpa,
+            .limited(checkpoint_proof.max_encoded_bytes),
+        );
+        errdefer self.gpa.free(proof);
+        _ = try self.validateCheckpointProof(
+            proof,
+            self.identity.configuration_id,
+            name,
+            manifest,
+        );
         const file = try snapshot_dir.openFile(self.io, "db", .{});
         errdefer file.close(self.io);
         return .{
             .configuration_id = self.identity.configuration_id,
             .name = name,
             .manifest = manifest,
+            .proof = proof,
             .db_size = try file.length(self.io),
             .file = file,
         };
+    }
+
+    /// Validates the canonical stop proof and returns the digest peers use
+    /// for quorum confirmation. This checks logical Paxos state (epoch,
+    /// voters, stop slot, chain, exact metadata) and the manifest digest;
+    /// the database file itself is verified separately against the manifest.
+    pub fn validateCheckpointProof(
+        self: *const Node,
+        proof_bytes: []const u8,
+        configuration_id: u64,
+        name: [16]u8,
+        manifest: []const u8,
+    ) ![32]u8 {
+        const proof = try checkpoint_proof.decode(proof_bytes);
+        if (proof.database_id != self.identity.database_id or
+            proof.next_configuration_id != configuration_id or
+            proof.sealed_configuration_id + 1 != configuration_id or
+            proof.membersSlice().len != self.member_count or
+            !std.mem.eql(
+                paxos.NodeId,
+                proof.membersSlice(),
+                self.members[0..self.member_count],
+            ))
+        {
+            return error.InvalidCheckpointProof;
+        }
+
+        const parsed = try parseStopMetadata(proof.metadataSlice());
+        if (!std.mem.eql(u8, &parsed.name, &name)) {
+            return error.InvalidCheckpointProof;
+        }
+        const manifest_digest = PayloadStore.hashOf(manifest);
+        if (!std.mem.eql(u8, &manifest_digest, &proof.manifest_sha256) or
+            !std.mem.eql(u8, &manifest_digest, &parsed.manifest_hash))
+        {
+            return error.InvalidCheckpointProof;
+        }
+
+        const database_text = manifestValue(manifest, "database_id") orelse
+            return error.InvalidCheckpointProof;
+        const database_id = std.fmt.parseInt(u128, database_text, 16) catch
+            return error.InvalidCheckpointProof;
+        const sealed_text = manifestValue(
+            manifest,
+            "sealed_configuration_id",
+        ) orelse return error.InvalidCheckpointProof;
+        const sealed = std.fmt.parseInt(u64, sealed_text, 10) catch
+            return error.InvalidCheckpointProof;
+        const applied_text = manifestValue(manifest, "applied_slot") orelse
+            return error.InvalidCheckpointProof;
+        const applied = std.fmt.parseInt(paxos.Slot, applied_text, 10) catch
+            return error.InvalidCheckpointProof;
+        const chain_hex = manifestValue(manifest, "chain") orelse
+            return error.InvalidCheckpointProof;
+        var chain: [32]u8 = undefined;
+        if (chain_hex.len != chain.len * 2) return error.InvalidCheckpointProof;
+        _ = std.fmt.hexToBytes(&chain, chain_hex) catch
+            return error.InvalidCheckpointProof;
+        if (database_id != proof.database_id or
+            sealed != proof.sealed_configuration_id or
+            applied != proof.applied_slot or
+            proof.stop_slot != applied + 1 or
+            !std.mem.eql(u8, &chain, &proof.chain))
+        {
+            return error.InvalidCheckpointProof;
+        }
+        return checkpoint_proof.digest(proof_bytes);
+    }
+
+    /// Returns the digest of this node's retained proof for a sealed epoch.
+    /// Used only to answer another member's quorum-confirmation probe.
+    pub fn currentCheckpointProofDigest(
+        self: *Node,
+        sealed_configuration_id: u64,
+    ) ![32]u8 {
+        var handle = try self.openCurrentSnapshot();
+        defer handle.close(self.io, self.gpa);
+        const proof = try checkpoint_proof.decode(handle.proof);
+        if (proof.sealed_configuration_id != sealed_configuration_id) {
+            return error.ConfigurationMismatch;
+        }
+        return checkpoint_proof.digest(handle.proof);
     }
 };
 
