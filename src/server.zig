@@ -8,13 +8,15 @@
 //! write path's natural serialization.
 //!
 //! Ordering guarantees preserved here:
-//! * `Node.consumeEffects` fsyncs the journal before an envelope reaches
-//!   the outbox, so draining the outbox to sender queues keeps
-//!   sync-before-send.
-//! * A payload is pushed and durably acknowledged before any promise,
-//!   accept, or commit that references it is released to that peer. A
-//!   receiver independently verifies the object before stepping the envelope,
-//!   so Phase-1 recovery and every counted vote have recoverable bytes.
+//! * `Node.consumeEffects` keeps every durable claim behind the journal
+//!   barrier. Phase-two `accept` requests are the narrow exception: the
+//!   server queues them after append and while the leader barrier runs, so
+//!   follower barriers overlap it. The node mutex prevents their replies
+//!   from being processed until the leader vote is durable.
+//! * A payload is queued immediately before any dependent envelope on the
+//!   ordered stream. The receiver stores it before reading the envelope and
+//!   independently gates any reordered/missing-payload envelope, so Phase-1
+//!   recovery and every counted vote have recoverable bytes.
 //! * A client write is acknowledged only after its slot commits and the
 //!   decided value at that slot is the client's own batch.
 
@@ -29,10 +31,13 @@ const transport_auth = @import("transport_auth.zig");
 const tls = @import("tls.zig");
 const node_mod = @import("node.zig");
 const payload_store_mod = @import("payload_store.zig");
+const checkpoint_proof = @import("checkpoint_proof.zig");
+const enrollment = @import("enrollment.zig");
 const failpoint = @import("failpoint.zig");
 const roles = @import("roles.zig");
 const diagnostic = @import("diagnostic.zig");
 const durability = @import("durability.zig");
+const configuration = @import("configuration.zig");
 
 const Node = node_mod.Node;
 const Log = types.Log;
@@ -63,14 +68,29 @@ pub const ServeOptions = struct {
     /// Shared database identity; derived from the member list when null.
     database_id: ?u128 = null,
     /// Shared transport secret loaded by the host from a protected provider.
-    /// When present, mutual PSK authentication and per-frame integrity
-    /// protection are mandatory. A non-loopback endpoint requires this or
-    /// `tls` (or both; the PSK handshake then runs inside TLS).
+    /// When present, mutual PSK authentication and per-frame integrity run
+    /// inside the mandatory production TLS channel.
     auth_secret: ?[]const u8 = null,
+    /// Explicit local-development transport: PSK authentication and frame
+    /// integrity without TLS, accepted only when the listener and every peer
+    /// use the numeric loopback address. This has no confidentiality or
+    /// per-node identity and must not be exposed beyond one machine.
+    allow_psk_only_loopback: bool = false,
     /// Optional mutual TLS 1.3 identity for every TCP connection: this
     /// node's certificate/key and the cluster CA. Peer certificates must
     /// chain to the CA and name `zaxon-node-<id>` matching their hello.
     tls: ?tls.Config = null,
+    /// Optional cluster CA private key used only to redeem one-time
+    /// enrollment tokens and sign node CSRs. When absent, the listener keeps
+    /// strict handshake-level mTLS and exposes no enrollment operation.
+    enrollment_ca_key: ?[]const u8 = null,
+    /// Optional operator-managed denylist. Each non-comment line is one
+    /// configured node ID. Reloads close live inbound and outbound links.
+    revocation_file: ?[]const u8 = null,
+    /// Explicit escape hatch for deterministic local test harnesses. It is
+    /// rejected unless failpoints are enabled and is never a production
+    /// transport mode.
+    allow_insecure_test_tcp: bool = false,
     /// Maximum concurrently served connections (peers, clients, and
     /// transfer streams together). 0 derives a small-cluster default from
     /// the member registry; admission never grows past the limit.
@@ -79,8 +99,21 @@ pub const ServeOptions = struct {
     /// authentication before the server closes it. 0 disables the
     /// deadline (tests with deterministic schedules use that).
     handshake_timeout_ms: u64 = 10_000,
+    /// Established connections that receive no frame for this long are
+    /// closed. Peer heartbeats keep healthy cluster links active. Zero
+    /// disables the bound for a deterministic test schedule.
+    idle_timeout_ms: u64 = 300_000,
+    /// Inbound connections concurrently authenticated as one configured
+    /// peer. Two permits a reconnect to overlap a dying old socket.
+    max_connections_per_peer: usize = 2,
     /// Upper bound for one declared snapshot or backup transfer.
     max_transfer_bytes: u64 = wire.max_transfer_bytes,
+    /// Remote query result caps. Embedded Node calls remain unlimited unless
+    /// their caller explicitly supplies QueryLimits.
+    max_query_rows: usize = 10_000,
+    max_query_bytes: usize = 16 * 1024 * 1024,
+    /// Approximate SQLite VM instruction budget; 0 explicitly disables it.
+    max_query_vm_steps: u64 = 10_000_000,
     /// Honor `failpoint` RPCs (test controllers only).
     enable_failpoints: bool = false,
     tick_ms: u64 = 25,
@@ -110,6 +143,7 @@ const held_per_hash = 8;
 const sender_queue_limit = 4096;
 const sender_queue_byte_limit: usize = 128 * 1024 * 1024;
 const snapshot_chunk_bytes: usize = 1024 * 1024;
+const max_revoked_nodes: usize = 4 * types.log_options.max_members;
 
 /// Derives a deterministic shared database identity from the member list.
 pub fn deriveDatabaseId(members: []const PeerAddress, cluster_id: ?[]const u8) u128 {
@@ -144,6 +178,18 @@ pub fn serve(
     if (options.test_faults.enabled() and !options.enable_failpoints) {
         return reportConfig(err_out, "test fault schedules require --enable-failpoints");
     }
+    if (options.allow_insecure_test_tcp and !options.enable_failpoints) {
+        return reportConfig(
+            err_out,
+            "insecure test TCP requires --enable-failpoints",
+        );
+    }
+    if (options.allow_psk_only_loopback and options.allow_insecure_test_tcp) {
+        return reportConfig(
+            err_out,
+            "choose either development PSK or insecure test TCP, not both",
+        );
+    }
     if (options.auth_secret) |secret| {
         if (secret.len < 32) {
             return reportConfig(
@@ -152,41 +198,96 @@ pub fn serve(
             );
         }
     }
+    if (options.allow_psk_only_loopback) {
+        if (options.auth_secret == null) {
+            return reportConfig(err_out, "--dev-psk requires --auth-file");
+        }
+        if (options.tls != null) {
+            return reportConfig(
+                err_out,
+                "--dev-psk is PSK-only; omit it when mTLS is configured",
+            );
+        }
+        if (options.listen_unix != null or
+            !isNumericLoopback(options.listen_host))
+        {
+            return reportConfig(
+                err_out,
+                "--dev-psk is loopback-only; use 127.0.0.1 or ::1",
+            );
+        }
+        for (options.members) |member| {
+            if (!isNumericLoopback(member.host)) {
+                return reportConfig(
+                    err_out,
+                    "--dev-psk accepts only loopback peer addresses",
+                );
+            }
+        }
+    }
+    if (options.tls) |config| {
+        configuration.validatePrivateFile(io, config.key_path) catch |err| {
+            try diagnostic.write(
+                err_out,
+                "unsafe TLS private key",
+                @errorName(err),
+                "Use a regular, non-symlink key file with mode 0600.",
+            );
+            try err_out.flush();
+            return 4;
+        };
+    }
+    if (options.enrollment_ca_key) |ca_key_path| {
+        if (options.tls == null or options.listen_unix != null) {
+            return reportConfig(
+                err_out,
+                "enrollment requires a TLS TCP listener",
+            );
+        }
+        configuration.validatePrivateFile(io, ca_key_path) catch |err| {
+            try diagnostic.write(
+                err_out,
+                "unsafe enrollment CA private key",
+                @errorName(err),
+                "Use a regular, non-symlink CA key file with mode 0600.",
+            );
+            try err_out.flush();
+            return 4;
+        };
+        tls.validateIssuer(options.tls.?.ca_path, ca_key_path) catch |err| {
+            try diagnostic.write(
+                err_out,
+                "enrollment issuer failed",
+                @errorName(err),
+                "Use the private key matching --tls-ca, or omit " ++
+                    "--enrollment-ca-key on nodes that do not issue tokens.",
+            );
+            try err_out.flush();
+            return 4;
+        };
+    }
     if (options.listen_unix != null and options.members.len > 1) {
         return reportConfig(
             err_out,
             "a unix socket serves one local node; peers require TCP",
         );
     }
-    const transport_authenticated = options.auth_secret != null or
-        options.tls != null;
     if (options.listen_unix == null) {
-        if (!transport_authenticated and !isLoopbackHost(options.listen_host)) {
+        if (options.tls == null and !options.allow_insecure_test_tcp and
+            !options.allow_psk_only_loopback)
+        {
             try diagnostic.write(
                 err_out,
-                "authentication required",
-                "A non-loopback listener cannot start without a transport " ++
-                    "secret or TLS identity.",
-                "Provide --auth-file or --tls-cert/--tls-key/--tls-ca, bind " ++
-                    "only to a loopback address, or serve locally through " ++
-                    "--listen unix:<path>.",
+                "mutual TLS required",
+                "Every production TCP listener requires a node certificate " ++
+                    "from the cluster CA. A PSK alone does not provide " ++
+                    "confidentiality or a unique node identity.",
+                "Provide --tls-cert/--tls-key/--tls-ca. For a local tutorial, " ++
+                    "pair an owner-only --auth-file with --dev-psk, or serve " ++
+                    "one local node through --listen unix:<path>.",
             );
             try err_out.flush();
             return 4;
-        }
-        for (options.members) |member| {
-            if (!transport_authenticated and !isLoopbackHost(member.host)) {
-                try diagnostic.write(
-                    err_out,
-                    "authentication required",
-                    "A non-loopback peer cannot be used without a transport " ++
-                        "secret or TLS identity.",
-                    "Give every node the same --auth-file provider or a " ++
-                        "certificate from the same cluster CA.",
-                );
-                try err_out.flush();
-                return 4;
-            }
         }
     }
 
@@ -260,9 +361,25 @@ pub fn serve(
         .held = std.AutoHashMap(command.HashBytes, Held).init(gpa),
     };
     defer server.deinit();
+    if (options.revocation_file != null) {
+        server.reloadRevocationsLocked() catch |err| {
+            try diagnostic.write(
+                err_out,
+                "revocation file invalid",
+                @errorName(err),
+                "Use one configured non-zero node ID per line; comments " ++
+                    "start with #.",
+            );
+            try err_out.flush();
+            return 4;
+        };
+    }
 
     if (options.tls) |tls_config| {
-        server.tls_server = tls.Context.initServer(tls_config) catch |err| {
+        server.tls_server = (if (options.enrollment_ca_key != null)
+            tls.Context.initEnrollmentServer(tls_config)
+        else
+            tls.Context.initServer(tls_config)) catch |err| {
             try diagnostic.write(
                 err_out,
                 "tls identity failed",
@@ -336,6 +453,8 @@ pub fn serve(
         Io.Dir.cwd().deleteFile(io, socket_path) catch {};
     };
 
+    try writeStartupSummary(&server, self_role, err_out);
+
     // One sender per peer.
     for (options.members) |member| {
         if (member.id == options.node_id) continue;
@@ -353,6 +472,10 @@ pub fn serve(
         sender.stored_payloads = std.AutoHashMap(command.HashBytes, void).init(gpa);
         try server.senders.append(gpa, sender);
     }
+    server.node.setPreDurableOutboxHook(.{
+        .context = &server,
+        .run = drainPreDurableOutbox,
+    });
     for (server.senders.items) |sender| {
         sender.thread = try std.Thread.spawn(.{}, PeerSender.run, .{sender});
     }
@@ -384,13 +507,76 @@ pub fn serve(
         handler.detach();
     }
 
+    std.log.info("node {d}: shutting down", .{options.node_id});
     server.shutdown();
     ticker.join();
     for (server.senders.items) |sender| {
         sender.thread.join();
     }
     server.waitForHandlers();
+    std.log.info("node {d}: stopped", .{options.node_id});
     return 0;
+}
+
+fn isNumericLoopback(host: []const u8) bool {
+    return std.mem.eql(u8, host, "127.0.0.1") or
+        std.mem.eql(u8, host, "::1");
+}
+
+fn writeStartupSummary(
+    server: *const Server,
+    role: roles.Role,
+    err_out: *Io.Writer,
+) !void {
+    const options = server.options;
+    const member_count = if (options.members.len == 0) 1 else options.members.len;
+    const transport = if (options.listen_unix != null)
+        "owner-only Unix socket"
+    else if (options.tls != null and options.auth_secret != null)
+        "mTLS 1.3 + PSK"
+    else if (options.tls != null)
+        "mTLS 1.3"
+    else if (options.allow_psk_only_loopback)
+        "development PSK (loopback only)"
+    else
+        "INSECURE TEST TCP";
+
+    try err_out.print(
+        "\n" ++
+            "zaxon node {d}\n" ++
+            "  state       starting; waiting for a leader\n" ++
+            "  role        {s}\n" ++
+            "  data        {s}\n",
+        .{ options.node_id, role.name(), options.directory },
+    );
+    if (options.listen_unix) |path| {
+        try err_out.print("  listen      unix:{s}\n", .{path});
+    } else {
+        try err_out.print(
+            "  listen      {s}:{d}\n",
+            .{ options.listen_host, options.listen_port },
+        );
+    }
+    try err_out.print(
+        "  transport   {s}\n" ++
+            "  cluster     {d} member(s), configuration {d}\n" ++
+            "  durability  {s} sync\n\n",
+        .{
+            transport,
+            member_count,
+            server.node.identity.configuration_id,
+            @tagName(durability.syncMode()),
+        },
+    );
+    try err_out.flush();
+}
+
+/// Runs from `Node.consumeEffects` while the caller already owns the server
+/// mutex. `drainOutbox` only takes per-sender queue locks, allowing sender
+/// threads to put the accept requests on the wire during the journal barrier.
+fn drainPreDurableOutbox(context: *anyopaque) anyerror!void {
+    const server: *Server = @ptrCast(@alignCast(context));
+    try server.drainOutbox();
 }
 
 /// Binds the local Unix-domain service socket. A pre-existing path is
@@ -434,11 +620,6 @@ fn reportConfig(err_out: *Io.Writer, message: []const u8) !u8 {
     return 2;
 }
 
-fn isLoopbackHost(host: []const u8) bool {
-    return std.mem.eql(u8, host, "::1") or
-        std.mem.startsWith(u8, host, "127.");
-}
-
 const Held = struct {
     envelopes: [held_per_hash]Log.Envelope = undefined,
     count: usize = 0,
@@ -476,6 +657,25 @@ const FenceWaiter = struct {
     }
 };
 
+const CheckpointProofWaiter = struct {
+    nonce: u64,
+    sealed_configuration_id: u64,
+    digest: [32]u8,
+    acked: [types.log_options.max_members]paxos.NodeId =
+        [_]paxos.NodeId{0} ** types.log_options.max_members,
+    ack_count: usize = 0,
+    needed: usize,
+
+    fn noteAck(self: *CheckpointProofWaiter, member: paxos.NodeId) void {
+        for (self.acked[0..self.ack_count]) |seen| {
+            if (seen == member) return;
+        }
+        if (self.ack_count >= self.acked.len) return;
+        self.acked[self.ack_count] = member;
+        self.ack_count += 1;
+    }
+};
+
 const WaitWaiter = struct {
     min_applied: paxos.Slot,
     need_leader: bool,
@@ -495,6 +695,11 @@ pub const Server = struct {
     node: *Node,
     options: ServeOptions,
     mutex: std.Io.Mutex = .init,
+    /// Kept separate from `mutex`: checkpoint replies must be recordable
+    /// while the snapshot receiver waits for its voter read quorum.
+    proof_mutex: std.Io.Mutex = .init,
+    proof_waiter: ?*CheckpointProofWaiter = null,
+    next_proof_nonce: u64 = 1,
     listener: ?std.Io.net.Server = null,
     senders: std.ArrayList(*PeerSender) = .empty,
     held: std.AutoHashMap(command.HashBytes, Held),
@@ -527,6 +732,14 @@ pub const Server = struct {
     /// connections and initiator identity for peer dialing.
     tls_server: ?tls.Context = null,
     tls_client: ?tls.Context = null,
+    revoked_nodes: [max_revoked_nodes]paxos.NodeId =
+        [_]paxos.NodeId{0} ** max_revoked_nodes,
+    revoked_count: usize = 0,
+    /// Last leadership state already reported to the operator. Startup
+    /// prints the initial waiting state; later transitions are concise.
+    reported_leader: ?paxos.NodeId = null,
+    leader_candidate: ?paxos.NodeId = null,
+    leader_candidate_ticks: u8 = 0,
 
     const TrackedConnection = struct {
         stream: std.Io.net.Stream,
@@ -534,6 +747,8 @@ pub const Server = struct {
         /// authentication must have completed; 0 once established (or
         /// when the deadline is disabled).
         handshake_deadline_ms: u64,
+        idle_deadline_ms: u64 = 0,
+        credential_node_id: ?paxos.NodeId = null,
     };
 
     fn deinit(self: *Server) void {
@@ -554,6 +769,72 @@ pub const Server = struct {
 
     fn isShutdown(self: *Server) bool {
         return self.shutdown_flag.load(.acquire);
+    }
+
+    fn peerRevokedLocked(self: *const Server, peer: paxos.NodeId) bool {
+        for (self.revoked_nodes[0..self.revoked_count]) |revoked| {
+            if (revoked == peer) return true;
+        }
+        return false;
+    }
+
+    fn peerRevoked(self: *Server, peer: paxos.NodeId) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.peerRevokedLocked(peer);
+    }
+
+    /// Replaces revocation state atomically from a small, deliberately
+    /// boring text file. Called with `mutex` held after startup.
+    fn reloadRevocationsLocked(self: *Server) !void {
+        const path = self.options.revocation_file orelse return;
+        const bytes = try Io.Dir.cwd().readFileAlloc(
+            self.io,
+            path,
+            self.gpa,
+            .limited(16 * 1024),
+        );
+        defer self.gpa.free(bytes);
+        var next = [_]paxos.NodeId{0} ** max_revoked_nodes;
+        var count: usize = 0;
+        var lines = std.mem.splitScalar(u8, bytes, '\n');
+        while (lines.next()) |raw_line| {
+            const before_comment = if (std.mem.indexOfScalar(u8, raw_line, '#')) |index|
+                raw_line[0..index]
+            else
+                raw_line;
+            const line = std.mem.trim(u8, before_comment, " \t\r");
+            if (line.len == 0) continue;
+            const id = std.fmt.parseInt(paxos.NodeId, line, 10) catch
+                return error.InvalidRevocationFile;
+            if (id == 0 or id == self.options.node_id) {
+                return error.InvalidRevocationFile;
+            }
+            if (self.addressOf(id) == null or count == next.len) {
+                return error.InvalidRevocationFile;
+            }
+            for (next[0..count]) |seen| {
+                if (seen == id) return error.InvalidRevocationFile;
+            }
+            next[count] = id;
+            count += 1;
+        }
+        self.revoked_nodes = next;
+        self.revoked_count = count;
+    }
+
+    /// Consensus membership remains static in this release; this transport
+    /// denylist is the immediate operational override for a compromised node.
+    fn evictRevokedLocked(self: *Server) void {
+        for (self.active_connections.items) |connection| {
+            const peer = connection.credential_node_id orelse continue;
+            if (self.peerRevokedLocked(peer)) {
+                connection.stream.shutdown(self.io, .both) catch {};
+            }
+        }
+        for (self.senders.items) |sender| {
+            if (self.peerRevokedLocked(sender.peer.id)) sender.disconnect();
+        }
     }
 
     /// Milliseconds elapsed since `start_tick`, measured in ticks.
@@ -625,12 +906,47 @@ pub const Server = struct {
 
     /// Marks a connection as established after hello and authentication,
     /// clearing its handshake deadline.
-    fn noteHandshakeComplete(self: *Server, stream: std.Io.net.Stream) void {
+    fn noteHandshakeComplete(
+        self: *Server,
+        stream: std.Io.net.Stream,
+        credential_node_id: ?paxos.NodeId,
+    ) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        if (credential_node_id) |id| {
+            var count: usize = 0;
+            for (self.active_connections.items) |connection| {
+                if (connection.credential_node_id == id) count += 1;
+            }
+            if (self.options.max_connections_per_peer != 0 and
+                count >= self.options.max_connections_per_peer)
+            {
+                return error.PeerConnectionLimit;
+            }
+        }
+        const now_ms = self.tick_count * self.options.tick_ms;
         for (self.active_connections.items) |*connection| {
             if (connection.stream.socket.handle == stream.socket.handle) {
                 connection.handshake_deadline_ms = 0;
+                connection.idle_deadline_ms = if (self.options.idle_timeout_ms == 0)
+                    0
+                else
+                    now_ms + self.options.idle_timeout_ms;
+                connection.credential_node_id = credential_node_id;
+                break;
+            }
+        }
+    }
+
+    fn noteConnectionActivity(self: *Server, stream: std.Io.net.Stream) void {
+        if (self.options.idle_timeout_ms == 0) return;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const deadline = self.tick_count * self.options.tick_ms +
+            self.options.idle_timeout_ms;
+        for (self.active_connections.items) |*connection| {
+            if (connection.stream.socket.handle == stream.socket.handle) {
+                connection.idle_deadline_ms = deadline;
                 break;
             }
         }
@@ -654,12 +970,17 @@ pub const Server = struct {
     /// authentication before their deadline; the blocked handler thread
     /// then fails its read and releases the connection. Runs once per
     /// tick with the mutex held.
-    fn closeExpiredHandshakes(self: *Server) void {
+    fn closeExpiredConnections(self: *Server) void {
         const now_ms = self.tick_count * self.options.tick_ms;
         for (self.active_connections.items) |connection| {
-            if (connection.handshake_deadline_ms == 0) continue;
-            if (now_ms < connection.handshake_deadline_ms) continue;
-            connection.stream.shutdown(self.io, .both) catch {};
+            const handshake_expired = connection.handshake_deadline_ms != 0 and
+                now_ms >= connection.handshake_deadline_ms;
+            const idle_expired = connection.handshake_deadline_ms == 0 and
+                connection.idle_deadline_ms != 0 and
+                now_ms >= connection.idle_deadline_ms;
+            if (handshake_expired or idle_expired) {
+                connection.stream.shutdown(self.io, .both) catch {};
+            }
         }
     }
 
@@ -823,15 +1144,20 @@ pub const Server = struct {
         self.waiters.clearRetainingCapacity();
     }
 
-    /// Moves every outbox envelope into its peer's sender. Value-bearing
-    /// envelopes remain in a bounded per-peer gate until `payload_stored` is
-    /// received for the referenced hash.
+    /// Moves every outbox envelope into its peer's sender. A missing payload
+    /// is queued immediately before its dependent envelope on the ordered TCP
+    /// stream, allowing follower storage work to overlap the leader barrier.
+    /// The receiver remains authoritative: a separately arriving or reordered
+    /// envelope stays in its bounded missing-payload gate until storage ends.
     fn drainOutbox(self: *Server) !void {
         const configuration_id = self.node.identity.configuration_id;
         for (self.node.outbox.items) |envelope| {
             const sender = self.senderFor(envelope.to) orelse continue;
+            var payload_precedes_envelope = false;
             if (wire.envelopePayloadHash(envelope)) |hash| {
-                if (!sender.hasPayloadAck(hash)) {
+                if (sender.hasPayloadAck(hash)) {
+                    payload_precedes_envelope = true;
+                } else {
                     if (self.node.store.load(self.gpa, hash)) |payload| {
                         defer self.gpa.free(payload);
                         const frame = try wire.frameAlloc(
@@ -840,6 +1166,7 @@ pub const Server = struct {
                             &.{ &hash, payload },
                         );
                         if (!sender.enqueueChecked(frame)) continue;
+                        payload_precedes_envelope = true;
                     } else |_| {
                         // Never send a descriptor whose bytes we cannot
                         // serve; the peer would stall. Skip the envelope;
@@ -858,7 +1185,11 @@ pub const Server = struct {
                 &.{ &config_bytes, encoded },
             );
             if (wire.envelopePayloadHash(envelope)) |hash| {
-                _ = sender.gatePayload(hash, frame);
+                if (payload_precedes_envelope) {
+                    sender.enqueue(frame);
+                } else {
+                    _ = sender.gatePayload(hash, frame);
+                }
             } else {
                 sender.enqueue(frame);
             }
@@ -971,6 +1302,17 @@ pub const Server = struct {
             defer self.mutex.unlock(self.io);
             if (self.failed) continue;
             self.tick_count += 1;
+            if (self.options.revocation_file != null and
+                self.tick_count % 40 == 0)
+            {
+                self.reloadRevocationsLocked() catch |err| {
+                    std.log.warn(
+                        "revocation reload retained prior state: {s}",
+                        .{@errorName(err)},
+                    );
+                };
+                self.evictRevokedLocked();
+            }
             self.node.tickProtocol() catch |err| {
                 std.log.err("tick failure: {s}", .{@errorName(err)});
                 self.failed = true;
@@ -978,8 +1320,9 @@ pub const Server = struct {
                 continue;
             };
             self.pump();
+            self.reportLeaderChangeLocked();
             self.wakeWaiters();
-            self.closeExpiredHandshakes();
+            self.closeExpiredConnections();
 
             // A member that observes a further-ahead leader asks for the
             // decided suffix it is missing.
@@ -996,6 +1339,40 @@ pub const Server = struct {
         }
     }
 
+    /// Called with the server mutex held after a protocol transition.
+    fn reportLeaderChangeLocked(self: *Server) void {
+        const leader = self.knownLeader();
+        if (leader != self.leader_candidate) {
+            self.leader_candidate = leader;
+            self.leader_candidate_ticks = 1;
+            return;
+        }
+        if (self.leader_candidate_ticks < 3) {
+            self.leader_candidate_ticks += 1;
+            if (self.leader_candidate_ticks < 3) return;
+        }
+        if (leader == self.reported_leader) return;
+        self.reported_leader = leader;
+        if (leader) |id| {
+            if (id == self.node.identity.node_id) {
+                std.log.info(
+                    "node {d}: became leader; writes are ready",
+                    .{self.node.identity.node_id},
+                );
+            } else {
+                std.log.info(
+                    "node {d}: leader is node {d}; follower is ready",
+                    .{ self.node.identity.node_id, id },
+                );
+            }
+        } else {
+            std.log.warn(
+                "node {d}: leader lost; waiting for voter quorum",
+                .{self.node.identity.node_id},
+            );
+        }
+    }
+
     // ------------------------------------------------------------------
     // Connection handling
     // ------------------------------------------------------------------
@@ -1007,18 +1384,29 @@ pub const Server = struct {
         var write_buffer: [64 * 1024]u8 = undefined;
 
         if (self.tls_server) |*context| {
-            var tls_stream = tls.Stream.accept(
-                context,
-                stream,
-                &read_buffer,
-                &write_buffer,
-            ) catch return;
+            var tls_stream = if (self.options.enrollment_ca_key != null)
+                tls.Stream.acceptOptionalPeer(
+                    context,
+                    stream,
+                    &read_buffer,
+                    &write_buffer,
+                ) catch return
+            else
+                tls.Stream.accept(
+                    context,
+                    stream,
+                    &read_buffer,
+                    &write_buffer,
+                ) catch return;
             defer tls_stream.deinit();
             self.serveConnection(
                 stream,
                 &tls_stream.reader,
                 &tls_stream.writer,
-                tls_stream.peerCommonName(),
+                if (tls_stream.hasPeerCertificate())
+                    tls_stream.peerCommonName()
+                else
+                    null,
             );
             return;
         }
@@ -1044,12 +1432,30 @@ pub const Server = struct {
         peer_certificate_name: ?[]const u8,
     ) void {
         const header = wire.readFrameHeader(reader) catch return;
-        if (header.kind != .hello) return;
+        if (header.kind != .hello or header.body_len != wire.Hello.encoded_size) return;
         const hello_body = wire.readFrameBody(self.gpa, reader, header) catch return;
         defer self.gpa.free(hello_body);
         const hello = wire.Hello.decode(hello_body) catch {
             return;
         };
+        if (self.tls_server != null and peer_certificate_name == null and
+            hello.kind != .enrollment)
+        {
+            return;
+        }
+        if (hello.kind == .enrollment and self.options.enrollment_ca_key == null) {
+            return;
+        }
+        const credential_node_id = if (peer_certificate_name) |certificate_name|
+            tls.parseNodeCommonName(certificate_name)
+        else
+            null;
+        if (hello.kind == .peer and self.peerRevoked(hello.node_id)) return;
+        if (hello.kind == .client and credential_node_id != null and
+            self.peerRevoked(credential_node_id.?))
+        {
+            return;
+        }
         if (peer_certificate_name) |certificate_name| {
             if (hello.kind == .peer) {
                 var expected_buffer: [tls.max_common_name]u8 = undefined;
@@ -1058,29 +1464,128 @@ pub const Server = struct {
             }
         }
 
-        var authenticated = if (self.options.auth_secret) |secret|
+        var authenticated = if (hello.kind != .enrollment and self.options.auth_secret != null)
             transport_auth.accept(
                 self.gpa,
                 self.io,
                 reader,
                 writer,
-                secret,
+                self.options.auth_secret.?,
                 hello_body,
             ) catch return
         else
             null;
-        self.noteHandshakeComplete(stream);
+        self.noteHandshakeComplete(
+            stream,
+            switch (hello.kind) {
+                .peer => hello.node_id,
+                .client => credential_node_id,
+                .enrollment => null,
+            },
+        ) catch return;
 
         switch (hello.kind) {
-            .peer => self.peerLoop(reader, hello, if (authenticated) |*session|
+            .peer => self.peerLoop(stream, reader, hello, if (authenticated) |*session|
                 session
             else
                 null) catch {},
-            .client => self.clientLoop(reader, writer, if (authenticated) |*session|
+            .client => self.clientLoop(stream, reader, writer, if (authenticated) |*session|
                 session
             else
                 null) catch {},
+            .enrollment => self.enrollmentExchange(stream, reader, writer, hello) catch {},
         }
+    }
+
+    /// A certificate-less connection can execute exactly this one exchange.
+    /// The CSR is verified before the token is consumed; consumption is an
+    /// atomic, directory-synced rename before signing or returning a cert.
+    fn enrollmentExchange(
+        self: *Server,
+        stream: std.Io.net.Stream,
+        reader: *Io.Reader,
+        writer: *Io.Writer,
+        hello: wire.Hello,
+    ) !void {
+        const header = wire.readFrameHeader(reader) catch {
+            return self.writeEnrollmentRefused(writer);
+        };
+        if (header.kind != .enrollment_request or
+            header.body_len > wire.EnrollmentRequest.max_encoded_size)
+        {
+            return self.writeEnrollmentRefused(writer);
+        }
+        const body = wire.readFrameBody(self.gpa, reader, header) catch {
+            return self.writeEnrollmentRefused(writer);
+        };
+        defer self.gpa.free(body);
+        self.noteConnectionActivity(stream);
+        const request = wire.EnrollmentRequest.decode(body) catch {
+            return self.writeEnrollmentRefused(writer);
+        };
+        if (hello.node_id != request.node_id or
+            hello.database_id != request.database_id or
+            request.database_id != self.node.identity.database_id or
+            !self.isConfiguredNode(request.node_id) or
+            self.peerRevoked(request.node_id))
+        {
+            return self.writeEnrollmentRefused(writer);
+        }
+        tls.validateNodeCsr(request.csr, request.node_id) catch {
+            return self.writeEnrollmentRefused(writer);
+        };
+        enrollment.consumeToken(
+            self.gpa,
+            self.io,
+            self.options.directory,
+            request.secret,
+            request.node_id,
+            self.node.identity.node_id,
+            self.node.identity.database_id,
+        ) catch return self.writeEnrollmentRefused(writer);
+
+        var serial_bytes: [8]u8 = undefined;
+        self.io.random(&serial_bytes);
+        const certificate = tls.issueNodeCertificate(
+            self.gpa,
+            request.csr,
+            request.node_id,
+            self.options.tls.?.ca_path,
+            self.options.enrollment_ca_key.?,
+            std.mem.readInt(u64, &serial_bytes, .little),
+            enrollment.certificate_validity_seconds,
+        ) catch return self.writeEnrollmentRefused(writer);
+        defer self.gpa.free(certificate);
+        var response_buffer: [wire.EnrollmentResponse.max_encoded_size]u8 = undefined;
+        const response = wire.EnrollmentResponse{
+            .status = .ok,
+            .certificate = certificate,
+        };
+        try wire.writeFrame(
+            writer,
+            .enrollment_response,
+            try response.encode(&response_buffer),
+        );
+        try writer.flush();
+    }
+
+    fn writeEnrollmentRefused(self: *Server, writer: *Io.Writer) !void {
+        _ = self;
+        var response_buffer: [wire.EnrollmentResponse.max_encoded_size]u8 = undefined;
+        const response = wire.EnrollmentResponse{ .status = .refused };
+        try wire.writeFrame(
+            writer,
+            .enrollment_response,
+            try response.encode(&response_buffer),
+        );
+        try writer.flush();
+    }
+
+    fn isConfiguredNode(self: *const Server, node_id: paxos.NodeId) bool {
+        for (self.options.members) |member| {
+            if (member.id == node_id and member.role != .gateway) return true;
+        }
+        return self.options.members.len == 0 and self.node.identity.node_id == node_id;
     }
 
     fn handleConnectionTracked(self: *Server, stream: std.Io.net.Stream) void {
@@ -1100,17 +1605,20 @@ pub const Server = struct {
         received: u64 = 0,
         name: [16]u8 = undefined,
         manifest: ?[]u8 = null,
+        proof: ?[]u8 = null,
 
         fn reset(self: *InstallState, io: Io, gpa: std.mem.Allocator) void {
             if (self.file) |file| file.close(io);
             if (self.dir) |*dir| dir.close(io);
             if (self.manifest) |manifest| gpa.free(manifest);
+            if (self.proof) |proof| gpa.free(proof);
             self.* = .{};
         }
     };
 
     fn peerLoop(
         self: *Server,
+        stream: std.Io.net.Stream,
         reader: *Io.Reader,
         hello: wire.Hello,
         authenticated: ?*transport_auth.Session,
@@ -1135,7 +1643,11 @@ pub const Server = struct {
         defer install.reset(self.io, self.gpa);
 
         while (!self.isShutdown()) {
-            const frame = try self.readConnectionFrame(reader, authenticated);
+            const frame = try self.readConnectionFrame(
+                stream,
+                reader,
+                authenticated,
+            );
             const body = frame.body;
             defer self.gpa.free(body);
             switch (frame.kind) {
@@ -1146,9 +1658,21 @@ pub const Server = struct {
                 .fence_request => self.onFenceRequest(body, hello.node_id),
                 .fence_ack => self.onFenceAck(body, hello.node_id),
                 .snapshot_request => self.onSnapshotRequest(hello.node_id),
-                .snapshot_begin => try self.onSnapshotBegin(body, &install),
+                .snapshot_begin => try self.onSnapshotBegin(
+                    body,
+                    &install,
+                    hello.node_id,
+                ),
                 .snapshot_chunk => try self.onSnapshotChunk(body, &install),
                 .snapshot_end => try self.onSnapshotEnd(&install, hello.node_id),
+                .checkpoint_proof_request => self.onCheckpointProofRequest(
+                    body,
+                    hello.node_id,
+                ),
+                .checkpoint_proof_reply => self.onCheckpointProofReply(
+                    body,
+                    hello.node_id,
+                ),
                 .learner_commit => try self.onLearnerCommit(body, hello.node_id),
                 .learner_heartbeat => try self.onLearnerHeartbeat(
                     body,
@@ -1400,6 +1924,7 @@ pub const Server = struct {
             .name = handle.name,
             .db_size = handle.db_size,
             .manifest = handle.manifest,
+            .proof = handle.proof,
         };
         var begin_buffer: [wire.SnapshotBegin.max_encoded_size]u8 = undefined;
         const begin_encoded = begin.encode(&begin_buffer);
@@ -1427,16 +1952,47 @@ pub const Server = struct {
         _ = sender.enqueueBackpressure(end_frame);
     }
 
-    fn onSnapshotBegin(self: *Server, body: []const u8, install: *InstallState) !void {
+    fn onSnapshotBegin(
+        self: *Server,
+        body: []const u8,
+        install: *InstallState,
+        from: paxos.NodeId,
+    ) !void {
         const begin = try wire.SnapshotBegin.decode(body);
         install.reset(self.io, self.gpa);
 
         self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        if (begin.configuration_id <= self.node.identity.configuration_id) return;
+        if (begin.configuration_id <= self.node.identity.configuration_id) {
+            self.mutex.unlock(self.io);
+            return;
+        }
         if (begin.db_size == 0 or begin.db_size > self.options.max_transfer_bytes) {
+            self.mutex.unlock(self.io);
             return error.InvalidFrame;
         }
+        const proof_digest = self.node.validateCheckpointProof(
+            begin.proof,
+            begin.configuration_id,
+            begin.name,
+            begin.manifest,
+        ) catch |err| {
+            self.mutex.unlock(self.io);
+            return err;
+        };
+        self.mutex.unlock(self.io);
+
+        const proof = try checkpoint_proof.decode(begin.proof);
+        try self.confirmCheckpointProof(
+            proof.sealed_configuration_id,
+            proof_digest,
+            from,
+        );
+
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        // Another handler may have advanced us while the quorum probe was
+        // in flight. Never let an older transfer replace newer local state.
+        if (begin.configuration_id <= self.node.identity.configuration_id) return;
         var dir = try self.node.beginSnapshotInstall();
         errdefer dir.close(self.io);
         const file = try dir.createFile(self.io, "db", .{ .read = true });
@@ -1447,6 +2003,11 @@ pub const Server = struct {
         install.received = 0;
         install.name = begin.name;
         install.manifest = try self.gpa.dupe(u8, begin.manifest);
+        errdefer {
+            self.gpa.free(install.manifest.?);
+            install.manifest = null;
+        }
+        install.proof = try self.gpa.dupe(u8, begin.proof);
     }
 
     fn onSnapshotChunk(self: *Server, body: []const u8, install: *InstallState) !void {
@@ -1474,9 +2035,12 @@ pub const Server = struct {
         if (install.dir) |*dir| dir.close(self.io);
         install.dir = null;
         const manifest = install.manifest orelse return;
+        const proof = install.proof orelse return;
         defer {
             self.gpa.free(manifest);
             install.manifest = null;
+            self.gpa.free(proof);
+            install.proof = null;
         }
 
         self.mutex.lockUncancelable(self.io);
@@ -1486,6 +2050,7 @@ pub const Server = struct {
             install.configuration_id,
             install.name,
             manifest,
+            proof,
         ) catch |err| {
             std.log.warn("snapshot install failed: {s}", .{@errorName(err)});
             return;
@@ -1495,18 +2060,140 @@ pub const Server = struct {
         self.pump();
     }
 
+    fn confirmCheckpointProof(
+        self: *Server,
+        sealed_configuration_id: u64,
+        digest: [32]u8,
+        source: paxos.NodeId,
+    ) !void {
+        var voter_count: usize = 0;
+        for (self.options.members) |member| {
+            if (member.role.capabilities().votes) voter_count += 1;
+        }
+        if (voter_count == 0) return error.CheckpointProofQuorum;
+
+        self.proof_mutex.lockUncancelable(self.io);
+        if (self.proof_waiter != null) {
+            self.proof_mutex.unlock(self.io);
+            return error.CheckpointProofBusy;
+        }
+        var nonce = self.next_proof_nonce;
+        self.next_proof_nonce +%= 1;
+        if (self.next_proof_nonce == 0) self.next_proof_nonce = 1;
+        if (nonce == 0) nonce = 1;
+        var waiter = CheckpointProofWaiter{
+            .nonce = nonce,
+            .sealed_configuration_id = sealed_configuration_id,
+            .digest = digest,
+            .needed = voter_count / 2 + 1,
+        };
+        // SnapshotBegin itself is a matching report from its authenticated
+        // source. Count it exactly once when that source is a configured
+        // voter, then probe the remaining voters independently.
+        if (self.addressOf(source)) |member| {
+            if (member.role.capabilities().votes) waiter.noteAck(source);
+        }
+        self.proof_waiter = &waiter;
+        self.proof_mutex.unlock(self.io);
+        defer {
+            self.proof_mutex.lockUncancelable(self.io);
+            if (self.proof_waiter == &waiter) self.proof_waiter = null;
+            self.proof_mutex.unlock(self.io);
+        }
+
+        var probe_buffer: [wire.CheckpointProofProbe.encoded_size]u8 = undefined;
+        const encoded = (wire.CheckpointProofProbe{
+            .nonce = nonce,
+            .sealed_configuration_id = sealed_configuration_id,
+            .digest = digest,
+        }).encode(&probe_buffer);
+        for (self.senders.items) |sender| {
+            if (!sender.peer.role.capabilities().votes) continue;
+            const frame = try wire.frameAlloc(
+                self.gpa,
+                .checkpoint_proof_request,
+                &.{encoded},
+            );
+            sender.enqueue(frame);
+        }
+
+        var elapsed_ms: u64 = 0;
+        while (elapsed_ms < 2_000) : (elapsed_ms += 1) {
+            self.proof_mutex.lockUncancelable(self.io);
+            const confirmed = waiter.ack_count >= waiter.needed;
+            self.proof_mutex.unlock(self.io);
+            if (confirmed) return;
+            if (self.isShutdown()) return error.Shutdown;
+            self.io.sleep(.fromMilliseconds(1), .awake) catch
+                return error.CheckpointProofQuorum;
+        }
+        return error.CheckpointProofQuorum;
+    }
+
+    fn onCheckpointProofRequest(
+        self: *Server,
+        body: []const u8,
+        from: paxos.NodeId,
+    ) void {
+        const probe = wire.CheckpointProofProbe.decode(body) catch return;
+        const sender = self.senderFor(from) orelse return;
+        self.mutex.lockUncancelable(self.io);
+        const local = self.node.currentCheckpointProofDigest(
+            probe.sealed_configuration_id,
+        ) catch {
+            self.mutex.unlock(self.io);
+            return;
+        };
+        self.mutex.unlock(self.io);
+        if (!std.mem.eql(u8, &local, &probe.digest)) return;
+
+        var reply_buffer: [wire.CheckpointProofProbe.encoded_size]u8 = undefined;
+        const encoded = probe.encode(&reply_buffer);
+        const frame = wire.frameAlloc(
+            self.gpa,
+            .checkpoint_proof_reply,
+            &.{encoded},
+        ) catch return;
+        sender.enqueue(frame);
+    }
+
+    fn onCheckpointProofReply(
+        self: *Server,
+        body: []const u8,
+        from: paxos.NodeId,
+    ) void {
+        const probe = wire.CheckpointProofProbe.decode(body) catch return;
+        const member = self.addressOf(from) orelse return;
+        if (!member.role.capabilities().votes) return;
+        self.proof_mutex.lockUncancelable(self.io);
+        defer self.proof_mutex.unlock(self.io);
+        const waiter = self.proof_waiter orelse return;
+        if (waiter.nonce != probe.nonce or
+            waiter.sealed_configuration_id != probe.sealed_configuration_id or
+            !std.mem.eql(u8, &waiter.digest, &probe.digest))
+        {
+            return;
+        }
+        waiter.noteAck(from);
+    }
+
     // ------------------------------------------------------------------
     // Client connections
     // ------------------------------------------------------------------
 
     fn clientLoop(
         self: *Server,
+        stream: std.Io.net.Stream,
         reader: *Io.Reader,
         writer: *Io.Writer,
         authenticated: ?*transport_auth.Session,
     ) !void {
         while (!self.isShutdown()) {
-            const frame = try self.readConnectionFrame(reader, authenticated);
+            const frame = try self.readConnectionFrame(
+                stream,
+                reader,
+                authenticated,
+            );
             if (frame.kind != .rpc_request) return error.InvalidFrame;
             const body = frame.body;
             defer self.gpa.free(body);
@@ -1517,7 +2204,10 @@ pub const Server = struct {
             }
 
             var response: std.Io.Writer.Allocating = .init(self.gpa);
-            defer response.deinit();
+            defer {
+                @memset(response.writer.buffer, 0);
+                response.deinit();
+            }
             self.dispatch(body, &response.writer) catch |err| {
                 response.clearRetainingCapacity();
                 writeErrorResponse(&response.writer, "internal", @errorName(err)) catch {};
@@ -1537,15 +2227,19 @@ pub const Server = struct {
 
     fn readConnectionFrame(
         self: *Server,
+        stream: std.Io.net.Stream,
         reader: *Io.Reader,
         authenticated: ?*transport_auth.Session,
     ) !transport_auth.Frame {
-        if (authenticated) |session| {
-            return session.readFrame(self.gpa, reader);
-        }
-        const header = try wire.readFrameHeader(reader);
-        const body = try wire.readFrameBody(self.gpa, reader, header);
-        return .{ .kind = header.kind, .body = body };
+        const frame = if (authenticated) |session|
+            try session.readFrame(self.gpa, reader)
+        else blk: {
+            const header = try wire.readFrameHeader(reader);
+            const body = try wire.readFrameBody(self.gpa, reader, header);
+            break :blk transport_auth.Frame{ .kind = header.kind, .body = body };
+        };
+        self.noteConnectionActivity(stream);
+        return frame;
     }
 
     fn writeConnectionFrame(
@@ -1642,6 +2336,8 @@ pub const Server = struct {
         freshness_ms: ?u64 = null,
         retain: ?u64 = null,
         name: ?[]const u8 = null,
+        node_id: ?u32 = null,
+        ttl_seconds: ?u64 = null,
     };
 
     fn dispatch(self: *Server, body: []const u8, out: *Io.Writer) !void {
@@ -1675,6 +2371,8 @@ pub const Server = struct {
             return self.opHash(out);
         } else if (std.mem.eql(u8, request.op, "expire-sessions")) {
             return self.opExpireSessions(request, out);
+        } else if (std.mem.eql(u8, request.op, "issue-enrollment-token")) {
+            return self.opIssueEnrollmentToken(request, out);
         } else if (std.mem.eql(u8, request.op, "failpoint")) {
             return self.opFailpoint(request, out);
         } else if (std.mem.eql(u8, request.op, "stop")) {
@@ -1686,6 +2384,61 @@ pub const Server = struct {
             return out.writeAll("{\"ok\":true}");
         }
         return writeErrorResponse(out, "bad_request", "unknown op");
+    }
+
+    fn opIssueEnrollmentToken(
+        self: *Server,
+        request: Request,
+        out: *Io.Writer,
+    ) !void {
+        if (self.options.enrollment_ca_key == null) {
+            return writeErrorResponse(
+                out,
+                "enrollment_disabled",
+                "this node is not an enrollment issuer",
+            );
+        }
+        const node_id = request.node_id orelse return writeErrorResponse(
+            out,
+            "bad_request",
+            "node_id is required",
+        );
+        const ttl_seconds = request.ttl_seconds orelse enrollment.default_ttl_seconds;
+        if (ttl_seconds == 0 or ttl_seconds > enrollment.maximum_ttl_seconds or
+            !self.isConfiguredNode(node_id) or node_id == self.node.identity.node_id or
+            self.peerRevoked(node_id))
+        {
+            return writeErrorResponse(
+                out,
+                "bad_request",
+                "target must be a non-revoked configured peer and TTL at most 24 hours",
+            );
+        }
+        const issued = enrollment.issueToken(
+            self.io,
+            self.options.directory,
+            node_id,
+            self.node.identity.node_id,
+            self.node.identity.database_id,
+            ttl_seconds,
+        ) catch |err| return writeErrorResponse(
+            out,
+            "enrollment_unavailable",
+            @errorName(err),
+        );
+        const token_hex = std.fmt.bytesToHex(issued.secret, .lower);
+        try out.print(
+            "{{\"ok\":true,\"node_id\":{d},\"issuer_node_id\":{d}," ++
+                "\"database_id\":\"{x:0>32}\",\"expires_unix_seconds\":{d}," ++
+                "\"token\":\"{s}\"}}",
+            .{
+                node_id,
+                self.node.identity.node_id,
+                self.node.identity.database_id,
+                issued.expires_unix_seconds,
+                &token_hex,
+            },
+        );
     }
 
     fn opStatus(self: *Server, out: *Io.Writer) !void {
@@ -2007,6 +2760,9 @@ pub const Server = struct {
     fn opQuery(self: *Server, request: Request, out: *Io.Writer) !void {
         const sql = request.sql orelse
             return writeErrorResponse(out, "bad_request", "query needs sql");
+        if (sql.len > 1024 * 1024) {
+            return writeErrorResponse(out, "too_large", "query SQL exceeds 1 MiB");
+        }
         const Level = enum { any, leader, linearizable };
         const level: Level = blk: {
             const text = request.level orelse break :blk .linearizable;
@@ -2065,7 +2821,11 @@ pub const Server = struct {
             };
         }
 
-        var result = self.node.query(self.gpa, sql) catch |err| {
+        var result = self.node.queryWithLimits(self.gpa, sql, .{
+            .max_rows = self.options.max_query_rows,
+            .max_bytes = self.options.max_query_bytes,
+            .max_vm_steps = self.options.max_query_vm_steps,
+        }) catch |err| {
             if (err == error.RoleCannotRead) {
                 return writeErrorResponse(
                     out,
@@ -2076,6 +2836,9 @@ pub const Server = struct {
             const message = switch (err) {
                 error.WriteInReadQuery => "statement is not read-only; use exec",
                 error.NoDatabaseImage => "no database image on this member yet",
+                error.QueryRowLimit => "query exceeded the remote row limit",
+                error.QueryResultTooLarge => "query exceeded the remote byte limit",
+                error.SqliteInterrupted => "query exceeded the SQLite VM budget",
                 else => self.node.lastSqliteMessage(),
             };
             return writeSqlError(out, message);
@@ -2322,6 +3085,7 @@ const PeerSender = struct {
     gated: std.ArrayList(GatedFrame) = .empty,
     gated_bytes: usize = 0,
     connected: bool = false,
+    active_stream: ?std.Io.net.Stream = null,
     stored_payloads: std.AutoHashMap(command.HashBytes, void) = undefined,
     /// Highest current-epoch chosen slot queued on this connection.
     learned_through: paxos.Slot = 0,
@@ -2470,9 +3234,29 @@ const PeerSender = struct {
         return self.stored_payloads.contains(hash);
     }
 
+    fn isConnected(self: *PeerSender) bool {
+        const io = self.server.io;
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return self.connected;
+    }
+
+    fn disconnect(self: *PeerSender) void {
+        const io = self.server.io;
+        self.mutex.lockUncancelable(io);
+        self.connected = false;
+        if (self.active_stream) |stream| stream.shutdown(io, .both) catch {};
+        self.cond.broadcast(io);
+        self.mutex.unlock(io);
+    }
+
     fn run(self: *PeerSender) void {
         const io = self.server.io;
         while (!self.server.isShutdown()) {
+            if (self.server.peerRevoked(self.peer.id)) {
+                io.sleep(.fromMilliseconds(200), .awake) catch {};
+                continue;
+            }
             const address = std.Io.net.IpAddress.parse(
                 self.peer.host,
                 self.peer.port,
@@ -2546,14 +3330,21 @@ const PeerSender = struct {
                     ) catch continue;
                 }
             }
+            if (self.server.peerRevoked(self.peer.id)) continue;
 
             self.mutex.lockUncancelable(io);
             self.connected = true;
+            self.active_stream = stream;
             self.stored_payloads.clearRetainingCapacity();
             for (self.gated.items) |item| self.server.gpa.free(item.frame);
             self.gated.clearRetainingCapacity();
             self.gated_bytes = 0;
             self.mutex.unlock(io);
+
+            std.log.info(
+                "node {d}: connected to peer {d}",
+                .{ self.server.node.identity.node_id, self.peer.id },
+            );
 
             {
                 self.server.mutex.lockUncancelable(self.server.io);
@@ -2573,12 +3364,16 @@ const PeerSender = struct {
 
             send_loop: while (!self.server.isShutdown()) {
                 self.mutex.lockUncancelable(io);
-                while (self.queue.items.len == 0) {
+                while (self.queue.items.len == 0 and self.connected) {
                     if (self.server.isShutdown()) {
                         self.mutex.unlock(io);
                         break :send_loop;
                     }
                     self.cond.waitUncancelable(io, &self.mutex);
+                }
+                if (!self.connected) {
+                    self.mutex.unlock(io);
+                    break :send_loop;
                 }
                 const frame = self.queue.orderedRemove(0);
                 self.queue_bytes -= frame.len;
@@ -2598,6 +3393,7 @@ const PeerSender = struct {
 
             self.mutex.lockUncancelable(io);
             self.connected = false;
+            self.active_stream = null;
             for (self.queue.items) |frame| self.server.gpa.free(frame);
             self.queue.clearRetainingCapacity();
             self.queue_bytes = 0;
@@ -2686,14 +3482,6 @@ test "derive database id is order independent" {
         deriveDatabaseId(&b, null),
     );
     try std.testing.expect(deriveDatabaseId(&a, "x") != deriveDatabaseId(&a, null));
-}
-
-test "unauthenticated transport is restricted to loopback" {
-    try std.testing.expect(isLoopbackHost("127.0.0.1"));
-    try std.testing.expect(isLoopbackHost("127.42.0.9"));
-    try std.testing.expect(isLoopbackHost("::1"));
-    try std.testing.expect(!isLoopbackHost("0.0.0.0"));
-    try std.testing.expect(!isLoopbackHost("192.0.2.1"));
 }
 
 test "connection admission is sized for a small cluster" {

@@ -15,7 +15,12 @@ pub const log_options = paxos.ReplicatedLogOptions{
     // slots. Nine voters tolerate four failures; larger deployments add an
     // arbitrary number of replicas or shard into independent voter groups.
     .max_members = 9,
-    .max_entries = 256,
+    // 2048 keeps a 100-operation warmup plus a normal 1000-operation run
+    // inside one epoch. At 256,
+    // four checkpoint/re-election pauses dominated sustained write latency
+    // even though the steady-state commit path was faster. The bound remains
+    // deliberately small compared with an unbounded database log.
+    .max_entries = 2048,
     .max_batch = 16,
     .max_metadata_bytes = 256,
 };

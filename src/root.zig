@@ -23,6 +23,9 @@ pub const journal = @import("journal.zig");
 pub const payload_store = @import("payload_store.zig");
 /// Store for transaction payload bytes, installed with write-temp/sync/rename.
 pub const PayloadStore = payload_store.PayloadStore;
+/// Canonical evidence that a transferable checkpoint is tied to the stop
+/// sign already chosen by Paxos; receivers confirm its digest with a quorum.
+pub const checkpoint_proof = @import("checkpoint_proof.zig");
 /// SQLite WAL frame capture and deterministic page-level apply.
 pub const wal = @import("wal.zig");
 /// Narrow SQLite C API bindings; the only module that touches the C header.
@@ -44,6 +47,10 @@ pub const transport_auth = @import("transport_auth.zig");
 /// Optional mutual TLS 1.3 transport (OpenSSL 3): per-node certificates
 /// verified against a cluster CA, beside the PSK mode.
 pub const tls = @import("tls.zig");
+/// Provider-file paths for one production TCP certificate identity.
+pub const TlsConfig = tls.Config;
+/// One-time token persistence, CSR exchange, and atomic identity installation.
+pub const enrollment = @import("enrollment.zig");
 /// Configuration loading with CLI > environment > file precedence.
 pub const configuration = @import("configuration.zig");
 /// Elm-style operator diagnostics: boundary header, explanation, and hint.
@@ -76,7 +83,7 @@ pub const embedded = @import("embedded.zig");
 pub const Embedded = embedded.Embedded;
 /// Static cluster membership entry for the embedded facade.
 pub const EmbeddedMember = embedded.Member;
-/// Options for `Embedded.open`: directory, identity, membership, and auth.
+/// Options for `Embedded.open`: directory, identity, membership, and mTLS.
 pub const EmbeddedOpenOptions = embedded.OpenOptions;
 
 test {
@@ -84,6 +91,7 @@ test {
     _ = @import("types.zig");
     _ = @import("journal.zig");
     _ = @import("payload_store.zig");
+    _ = @import("checkpoint_proof.zig");
     _ = @import("sqlite.zig");
     _ = @import("guard.zig");
     _ = @import("prepared.zig");
@@ -91,6 +99,7 @@ test {
     _ = @import("wire.zig");
     _ = @import("transport_auth.zig");
     _ = @import("tls.zig");
+    _ = @import("enrollment.zig");
     _ = @import("configuration.zig");
     _ = @import("durability.zig");
     _ = @import("node.zig");

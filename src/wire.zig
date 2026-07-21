@@ -8,14 +8,13 @@
 //! probes, and snapshot transfer streams. Client frames carry one JSON
 //! request/response pair per round trip.
 //!
-//! Ordering rule: a sender pushes `payload_data`, waits for the receiver's
-//! `payload_stored` acknowledgement, and only then releases any promise,
-//! accept, or commit that references the payload hash. The acknowledgement
-//! means the receiver has installed and drive-flushed the object; the
-//! receiver's journal barrier — which precedes every vote and recovered
-//! value it emits — then makes it power-loss durable. Thus every counted
-//! vote and every recovered value has durable payload bytes at its
-//! consumer, at one full flush per commit point.
+//! Ordering rule: a sender queues `payload_data` immediately before every
+//! dependent promise, accept, or commit on the same ordered TCP/TLS stream.
+//! The receiver installs and drive-flushes the object before reading the next
+//! frame; an independent bounded gate holds a reordered envelope whose object
+//! is absent. `payload_stored` records readiness for later sends, but is not a
+//! round-trip prerequisite for the adjacent envelope. The receiver's journal
+//! barrier then makes its vote or recovered value power-loss durable.
 
 const std = @import("std");
 const Io = std.Io;
@@ -23,11 +22,12 @@ const paxos = @import("paxos");
 const types = @import("types.zig");
 const command = @import("command.zig");
 
-/// Version 4 adds voter-certified chosen-entry delivery to non-voting
-/// learners. Version 3 peers are deliberately rejected:
+/// Version 6 adds the bounded one-time-token/CSR enrollment exchange.
+/// Version 5 added voter quorum confirmation for transferred checkpoint
+/// proofs. Older peers are deliberately rejected:
 /// silently falling back would turn a configuration error into a security
 /// downgrade.
-pub const protocol_version: u16 = 4;
+pub const protocol_version: u16 = 6;
 
 /// Upper bound for one frame body; larger frames are a protocol error.
 pub const max_frame_bytes: u32 = 64 * 1024 * 1024;
@@ -62,6 +62,99 @@ pub const FrameKind = enum(u8) {
     backup_end = 18,
     learner_commit = 19,
     learner_heartbeat = 20,
+    checkpoint_proof_request = 21,
+    checkpoint_proof_reply = 22,
+    enrollment_request = 23,
+    enrollment_response = 24,
+};
+
+pub const EnrollmentRequest = struct {
+    secret: [32]u8,
+    node_id: paxos.NodeId,
+    database_id: u128,
+    csr: []const u8,
+
+    pub const max_csr_bytes: usize = 16 * 1024;
+    pub const fixed_size: usize = 32 + 4 + 16 + 4;
+    pub const max_encoded_size: usize = fixed_size + max_csr_bytes;
+
+    pub fn encode(
+        self: EnrollmentRequest,
+        buffer: *[max_encoded_size]u8,
+    ) WireError![]const u8 {
+        if (self.node_id == 0 or self.database_id == 0 or self.csr.len == 0 or
+            self.csr.len > max_csr_bytes)
+        {
+            return error.InvalidFrame;
+        }
+        @memcpy(buffer[0..32], &self.secret);
+        std.mem.writeInt(u32, buffer[32..36], self.node_id, .little);
+        std.mem.writeInt(u128, buffer[36..52], self.database_id, .little);
+        std.mem.writeInt(u32, buffer[52..56], @intCast(self.csr.len), .little);
+        @memcpy(buffer[56..][0..self.csr.len], self.csr);
+        return buffer[0 .. fixed_size + self.csr.len];
+    }
+
+    pub fn decode(body: []const u8) WireError!EnrollmentRequest {
+        if (body.len < fixed_size) return error.InvalidFrame;
+        const csr_len = std.mem.readInt(u32, body[52..56], .little);
+        if (csr_len == 0 or csr_len > max_csr_bytes or
+            body.len != fixed_size + csr_len)
+        {
+            return error.InvalidFrame;
+        }
+        const node_id = std.mem.readInt(u32, body[32..36], .little);
+        const database_id = std.mem.readInt(u128, body[36..52], .little);
+        if (node_id == 0 or database_id == 0) return error.InvalidFrame;
+        return .{
+            .secret = body[0..32].*,
+            .node_id = node_id,
+            .database_id = database_id,
+            .csr = body[56..],
+        };
+    }
+};
+
+pub const EnrollmentResponse = struct {
+    status: Status,
+    certificate: []const u8 = &.{},
+
+    pub const Status = enum(u8) {
+        ok = 0,
+        refused = 1,
+    };
+    pub const max_certificate_bytes: usize = 64 * 1024;
+    pub const max_encoded_size: usize = 1 + max_certificate_bytes;
+
+    pub fn encode(
+        self: EnrollmentResponse,
+        buffer: *[max_encoded_size]u8,
+    ) WireError![]const u8 {
+        if (self.status == .ok and (self.certificate.len == 0 or
+            self.certificate.len > max_certificate_bytes))
+        {
+            return error.InvalidFrame;
+        }
+        if (self.status == .refused and self.certificate.len != 0) {
+            return error.InvalidFrame;
+        }
+        buffer[0] = @intFromEnum(self.status);
+        @memcpy(buffer[1..][0..self.certificate.len], self.certificate);
+        return buffer[0 .. 1 + self.certificate.len];
+    }
+
+    pub fn decode(body: []const u8) WireError!EnrollmentResponse {
+        if (body.len == 0 or body.len > max_encoded_size) return error.InvalidFrame;
+        const status = std.enums.fromInt(Status, body[0]) orelse
+            return error.InvalidFrame;
+        const certificate = body[1..];
+        if ((status == .ok and certificate.len == 0) or
+            (status == .refused and certificate.len != 0))
+        {
+            return error.InvalidFrame;
+        }
+        return .{ .status = status, .certificate = certificate };
+    }
 };
 
 pub const LearnerHeartbeat = struct {
@@ -146,7 +239,7 @@ pub const WireError = error{
     UnsupportedProtocolVersion,
 } || types.DecodeError;
 
-pub const ConnectionKind = enum(u8) { peer = 0, client = 1 };
+pub const ConnectionKind = enum(u8) { peer = 0, client = 1, enrollment = 2 };
 
 pub const Hello = struct {
     version: u16,
@@ -406,22 +499,28 @@ pub const SnapshotBegin = struct {
     name: [16]u8,
     db_size: u64,
     manifest: []const u8,
+    proof: []const u8,
 
     pub const max_manifest_bytes = 4096;
-    pub const max_encoded_size = 8 + 16 + 8 + 4 + max_manifest_bytes;
+    pub const max_proof_bytes = 512;
+    pub const max_encoded_size = 8 + 16 + 8 + 4 + max_manifest_bytes +
+        2 + max_proof_bytes;
 
     pub fn encode(self: SnapshotBegin, buffer: *[max_encoded_size]u8) []const u8 {
         std.debug.assert(self.manifest.len <= max_manifest_bytes);
+        std.debug.assert(self.proof.len <= max_proof_bytes);
         var cursor = types.Cursor{ .buffer = buffer };
         cursor.int(u64, self.configuration_id);
         cursor.bytes(&self.name);
         cursor.int(u64, self.db_size);
         cursor.int(u32, @intCast(self.manifest.len));
         cursor.bytes(self.manifest);
+        cursor.int(u16, @intCast(self.proof.len));
+        cursor.bytes(self.proof);
         return buffer[0..cursor.offset];
     }
 
-    /// The returned manifest slice aliases `body`.
+    /// The returned manifest and proof slices alias `body`.
     pub fn decode(body: []const u8) WireError!SnapshotBegin {
         var reader = types.ReadCursor{ .buffer = body };
         const configuration_id = try reader.int(u64);
@@ -430,12 +529,56 @@ pub const SnapshotBegin = struct {
         const manifest_len = try reader.int(u32);
         if (manifest_len > max_manifest_bytes) return error.InvalidFrame;
         const manifest = try reader.take(manifest_len);
+        const proof_len = try reader.int(u16);
+        if (proof_len == 0 or proof_len > max_proof_bytes) {
+            return error.InvalidFrame;
+        }
+        const proof = try reader.take(proof_len);
         if (reader.offset != body.len) return error.InvalidFrame;
         return .{
             .configuration_id = configuration_id,
             .name = name[0..16].*,
             .db_size = db_size,
             .manifest = manifest,
+            .proof = proof,
+        };
+    }
+};
+
+/// A receiver asks configured voters whether they retain the same proof for
+/// the sealed epoch. Matching replies are read-quorum evidence about a stop
+/// sign Paxos already chose; they do not constitute a new consensus phase.
+pub const CheckpointProofProbe = struct {
+    nonce: u64,
+    sealed_configuration_id: u64,
+    digest: [32]u8,
+
+    pub const encoded_size = 8 + 8 + 32;
+
+    pub fn encode(
+        self: CheckpointProofProbe,
+        buffer: *[encoded_size]u8,
+    ) []const u8 {
+        std.mem.writeInt(u64, buffer[0..8], self.nonce, .little);
+        std.mem.writeInt(
+            u64,
+            buffer[8..16],
+            self.sealed_configuration_id,
+            .little,
+        );
+        @memcpy(buffer[16..48], &self.digest);
+        return buffer;
+    }
+
+    pub fn decode(body: []const u8) WireError!CheckpointProofProbe {
+        if (body.len != encoded_size) return error.InvalidFrame;
+        const nonce = std.mem.readInt(u64, body[0..8], .little);
+        const sealed = std.mem.readInt(u64, body[8..16], .little);
+        if (nonce == 0 or sealed == 0) return error.InvalidFrame;
+        return .{
+            .nonce = nonce,
+            .sealed_configuration_id = sealed,
+            .digest = body[16..48].*,
         };
     }
 };
@@ -740,12 +883,54 @@ test "snapshot begin round trips and bounds the manifest" {
         .name = "0000000000000006".*,
         .db_size = 8192,
         .manifest = "format=1\nchain=00\n",
+        .proof = "proof",
     };
     var buffer: [SnapshotBegin.max_encoded_size]u8 = undefined;
     const encoded = begin.encode(&buffer);
     const decoded = try SnapshotBegin.decode(encoded);
     try testing.expectEqual(begin.configuration_id, decoded.configuration_id);
     try testing.expectEqualStrings(begin.manifest, decoded.manifest);
+    try testing.expectEqualStrings(begin.proof, decoded.proof);
+}
+
+test "checkpoint proof probe round trips" {
+    const probe = CheckpointProofProbe{
+        .nonce = 19,
+        .sealed_configuration_id = 6,
+        .digest = [_]u8{0xab} ** 32,
+    };
+    var buffer: [CheckpointProofProbe.encoded_size]u8 = undefined;
+    try testing.expectEqualDeep(
+        probe,
+        try CheckpointProofProbe.decode(probe.encode(&buffer)),
+    );
+}
+
+test "enrollment request and response are bounded" {
+    const request = EnrollmentRequest{
+        .secret = [_]u8{0xa5} ** 32,
+        .node_id = 3,
+        .database_id = 91,
+        .csr = "-----BEGIN CERTIFICATE REQUEST-----\ncsr\n",
+    };
+    var request_buffer: [EnrollmentRequest.max_encoded_size]u8 = undefined;
+    const decoded = try EnrollmentRequest.decode(try request.encode(&request_buffer));
+    try testing.expectEqual(request.secret, decoded.secret);
+    try testing.expectEqual(request.node_id, decoded.node_id);
+    try testing.expectEqual(request.database_id, decoded.database_id);
+    try testing.expectEqualStrings(request.csr, decoded.csr);
+
+    var response_buffer: [EnrollmentResponse.max_encoded_size]u8 = undefined;
+    const response = EnrollmentResponse{ .status = .ok, .certificate = "cert" };
+    const decoded_response = try EnrollmentResponse.decode(
+        try response.encode(&response_buffer),
+    );
+    try testing.expectEqual(EnrollmentResponse.Status.ok, decoded_response.status);
+    try testing.expectEqualStrings("cert", decoded_response.certificate);
+    try testing.expectError(
+        error.InvalidFrame,
+        EnrollmentResponse.decode(&.{@intFromEnum(EnrollmentResponse.Status.ok)}),
+    );
 }
 
 test "frame alloc produces a parseable frame" {

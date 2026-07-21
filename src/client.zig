@@ -11,7 +11,7 @@ const durability = @import("durability.zig");
 
 /// How a client authenticates its connections: the PSK secret, a mutual
 /// TLS identity, both (the PSK handshake then runs inside TLS), or
-/// neither for loopback/unix development use.
+/// neither for a local Unix-domain socket or failpoint-gated tests.
 pub const Transport = struct {
     secret: ?[]const u8 = null,
     tls: ?*const tls.Context = null,
@@ -23,6 +23,10 @@ pub const Endpoint = struct {
     /// When set, `host`/`port` are unused and the connection dials this
     /// Unix-domain socket path instead of TCP.
     unix_path: ?[]const u8 = null,
+    /// When a mutually authenticated follower advertises a leader that was
+    /// not one of the caller's seeds, pin the new connection to this node ID.
+    /// Parsed/configured endpoints leave it null.
+    expected_node_id: ?u32 = null,
 
     /// Parses `host:port` or `unix:<path>`.
     pub fn parse(text: []const u8) !Endpoint {
@@ -110,6 +114,18 @@ pub const Connection = struct {
                 read_buffer,
                 write_buffer,
             );
+            const peer_node_id = tls.parseNodeCommonName(
+                tls_stream.peerCommonName(),
+            ) orelse {
+                tls_stream.deinit();
+                return error.TlsPeerUnverified;
+            };
+            if (endpoint.expected_node_id) |expected| {
+                if (peer_node_id != expected) {
+                    tls_stream.deinit();
+                    return error.TlsPeerUnverified;
+                }
+            }
             self.tls_stream = tls_stream;
         } else {
             self.reader = self.stream.reader(io, self.read_buffer);
@@ -278,9 +294,27 @@ pub const Connection = struct {
 pub const CallResult = struct {
     /// Owned JSON response body.
     body: []u8,
-    /// The endpoint that answered (after redirects). Always one of the
-    /// caller's configured endpoints, borrowing its memory.
+    /// The endpoint that answered after redirects. Configured endpoint storage
+    /// remains borrowed for backward compatibility; an authenticated target
+    /// outside the seed list is owned in `owned_endpoint_host`.
     endpoint: Endpoint,
+    owned_endpoint_host: ?[]u8 = null,
+
+    pub fn deinit(self: *CallResult, gpa: std.mem.Allocator) void {
+        if (self.body.len > 0) gpa.free(self.body);
+        if (self.owned_endpoint_host) |host| gpa.free(host);
+        self.* = undefined;
+    }
+
+    /// Transfers only the response body while releasing endpoint storage.
+    pub fn takeBody(self: *CallResult, gpa: std.mem.Allocator) []u8 {
+        const body = self.body;
+        self.body = &.{};
+        if (self.owned_endpoint_host) |host| gpa.free(host);
+        self.endpoint = undefined;
+        self.owned_endpoint_host = null;
+        return body;
+    }
 };
 
 /// Calls `request` against the first reachable endpoint, following
@@ -329,81 +363,262 @@ pub fn callClusterWithTransport(
     require_leader: bool,
     transport: Transport,
 ) !CallResult {
-    var redirect: ?Endpoint = null;
-    var attempt: usize = 0;
-    const max_attempts = 12;
+    var cluster = ClusterConnection.init(gpa, io, endpoints, transport);
+    defer cluster.deinit();
+    return cluster.call(request, require_leader);
+}
 
-    while (attempt < max_attempts) : (attempt += 1) {
-        const endpoint = redirect orelse
-            endpoints[attempt % endpoints.len];
-        redirect = null;
+/// Reusable cluster client for interactive shells and embedded facades. It
+/// keeps the last successful connection open, follows seed-confined redirects
+/// without mTLS and node-ID-pinned advertised redirects with mTLS, and
+/// reconnects on transport failure. One-shot helpers above use the same
+/// implementation but immediately deinitialize it.
+pub const ClusterConnection = struct {
+    gpa: std.mem.Allocator,
+    io: Io,
+    endpoints: []const Endpoint,
+    transport: Transport,
+    connection: ?*Connection = null,
+    endpoint: ?Endpoint = null,
+    next_endpoint: usize = 0,
+    redirect_host_buffer: [64]u8 = undefined,
 
-        const connection = Connection.openWithTransport(
-            gpa,
-            io,
-            endpoint,
-            transport,
-        ) catch {
-            io.sleep(.fromMilliseconds(150), .awake) catch {};
-            continue;
+    pub fn init(
+        gpa: std.mem.Allocator,
+        io: Io,
+        endpoints: []const Endpoint,
+        transport: Transport,
+    ) ClusterConnection {
+        return .{
+            .gpa = gpa,
+            .io = io,
+            .endpoints = endpoints,
+            .transport = transport,
         };
-        defer connection.close();
-        const body = connection.call(request) catch {
-            io.sleep(.fromMilliseconds(150), .awake) catch {};
-            continue;
-        };
-
-        if (!require_leader) return .{ .body = body, .endpoint = endpoint };
-
-        // Follow a leader hint when the answering node declines.
-        const parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch {
-            return .{ .body = body, .endpoint = endpoint };
-        };
-        defer parsed.deinit();
-        const object = switch (parsed.value) {
-            .object => |*obj| obj,
-            else => return .{ .body = body, .endpoint = endpoint },
-        };
-        const ok = object.get("ok") orelse
-            return .{ .body = body, .endpoint = endpoint };
-        if (ok == .bool and ok.bool) return .{ .body = body, .endpoint = endpoint };
-        const code = object.get("error") orelse
-            return .{ .body = body, .endpoint = endpoint };
-        if (code != .string or !std.mem.eql(u8, code.string, "not_leader")) {
-            return .{ .body = body, .endpoint = endpoint };
-        }
-        // A leader hint is followed only when it names one of the
-        // caller's configured endpoints: a redirect must not send the
-        // client outside its known cluster. An unmatched hint falls back
-        // to round-robin over the configured list.
-        if (object.get("leader")) |leader|
-            switch (leader) {
-                .object => |leader_object| {
-                    const host = leader_object.get("host");
-                    const port = leader_object.get("port");
-                    if (host != null and port != null and
-                        host.? == .string and port.? == .integer and
-                        port.?.integer >= 0 and
-                        port.?.integer <= std.math.maxInt(u16))
-                    {
-                        const hinted_port: u16 = @intCast(port.?.integer);
-                        for (endpoints) |candidate| {
-                            if (candidate.unix_path != null) continue;
-                            if (candidate.port == hinted_port and
-                                std.mem.eql(u8, candidate.host, host.?.string))
-                            {
-                                redirect = candidate;
-                                break;
-                            }
-                        }
-                    }
-                },
-                else => {},
-            };
-        gpa.free(body);
-        io.sleep(.fromMilliseconds(150), .awake) catch {};
     }
-    return error.NoLeaderReachable;
+
+    pub fn deinit(self: *ClusterConnection) void {
+        self.disconnect();
+        self.* = undefined;
+    }
+
+    fn disconnect(self: *ClusterConnection) void {
+        if (self.connection) |connection| connection.close();
+        self.connection = null;
+        self.endpoint = null;
+    }
+
+    fn connect(self: *ClusterConnection, endpoint: Endpoint) !void {
+        std.debug.assert(self.connection == null);
+        self.connection = try Connection.openWithTransport(
+            self.gpa,
+            self.io,
+            endpoint,
+            self.transport,
+        );
+        self.endpoint = endpoint;
+    }
+
+    pub fn call(
+        self: *ClusterConnection,
+        request: []const u8,
+        require_leader: bool,
+    ) !CallResult {
+        if (self.endpoints.len == 0) return error.NoEndpoints;
+        var redirect: ?Endpoint = null;
+        var attempt: usize = 0;
+        const max_attempts = 12;
+
+        while (attempt < max_attempts) : (attempt += 1) {
+            if (self.connection == null) {
+                const endpoint = redirect orelse blk: {
+                    const selected = self.endpoints[self.next_endpoint % self.endpoints.len];
+                    self.next_endpoint +%= 1;
+                    break :blk selected;
+                };
+                redirect = null;
+                self.connect(endpoint) catch {
+                    self.io.sleep(.fromMilliseconds(150), .awake) catch {};
+                    continue;
+                };
+            }
+
+            const endpoint = self.endpoint.?;
+            const body = self.connection.?.call(request) catch {
+                self.disconnect();
+                self.io.sleep(.fromMilliseconds(150), .awake) catch {};
+                continue;
+            };
+            if (!require_leader) return self.result(body, endpoint);
+
+            const leader = leaderRedirect(
+                self.gpa,
+                self.endpoints,
+                body,
+                self.transport.tls != null,
+                &self.redirect_host_buffer,
+            ) catch return self.result(body, endpoint);
+            switch (leader) {
+                .not_redirect => return self.result(body, endpoint),
+                .rotate => {
+                    self.gpa.free(body);
+                    self.disconnect();
+                    self.io.sleep(.fromMilliseconds(25), .awake) catch {};
+                },
+                .redirect => |target| {
+                    self.gpa.free(body);
+                    self.disconnect();
+                    redirect = target;
+                    self.io.sleep(.fromMilliseconds(25), .awake) catch {};
+                },
+            }
+        }
+        return error.NoLeaderReachable;
+    }
+
+    fn result(
+        self: *ClusterConnection,
+        body: []u8,
+        endpoint: Endpoint,
+    ) !CallResult {
+        errdefer self.gpa.free(body);
+        for (self.endpoints) |candidate| {
+            const same = if (endpoint.unix_path) |path|
+                candidate.unix_path != null and
+                    std.mem.eql(u8, candidate.unix_path.?, path)
+            else
+                candidate.unix_path == null and candidate.port == endpoint.port and
+                    std.mem.eql(u8, candidate.host, endpoint.host);
+            if (!same) continue;
+            var stable = candidate;
+            stable.expected_node_id = endpoint.expected_node_id;
+            return .{ .body = body, .endpoint = stable };
+        }
+        const host = try self.gpa.dupe(u8, endpoint.host);
+        return .{
+            .body = body,
+            .endpoint = .{
+                .host = host,
+                .port = endpoint.port,
+                .unix_path = if (endpoint.unix_path != null) host else null,
+                .expected_node_id = endpoint.expected_node_id,
+            },
+            .owned_endpoint_host = host,
+        };
+    }
+};
+
+const Redirect = union(enum) {
+    not_redirect,
+    rotate,
+    redirect: Endpoint,
+};
+
+/// Parses a `not_leader` response. Unauthenticated and PSK-only clients only
+/// follow configured targets: a shared PSK cannot bind a node identity.
+/// With mTLS, an advertised numeric address may leave the seed list because
+/// `Connection.openWithTransport` pins its certificate to the advertised
+/// node ID before sending the request.
+fn leaderRedirect(
+    gpa: std.mem.Allocator,
+    endpoints: []const Endpoint,
+    body: []const u8,
+    allow_authenticated_advertisement: bool,
+    redirect_host_buffer: *[64]u8,
+) !Redirect {
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch
+        return .not_redirect;
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |*obj| obj,
+        else => return .not_redirect,
+    };
+    const ok = object.get("ok") orelse return .not_redirect;
+    if (ok == .bool and ok.bool) return .not_redirect;
+    const code = object.get("error") orelse return .not_redirect;
+    if (code != .string or !std.mem.eql(u8, code.string, "not_leader")) {
+        return .not_redirect;
+    }
+    if (object.get("leader")) |leader| switch (leader) {
+        .object => |leader_object| {
+            const id = leader_object.get("id");
+            const host = leader_object.get("host");
+            const port = leader_object.get("port");
+            if (id != null and host != null and port != null and
+                id.? == .integer and id.?.integer > 0 and
+                id.?.integer <= std.math.maxInt(u32) and
+                host.? == .string and port.? == .integer and
+                port.?.integer >= 0 and
+                port.?.integer <= std.math.maxInt(u16))
+            {
+                const hinted_id: u32 = @intCast(id.?.integer);
+                const hinted_port: u16 = @intCast(port.?.integer);
+                for (endpoints) |candidate| {
+                    if (candidate.unix_path != null) continue;
+                    if (candidate.port == hinted_port and
+                        std.mem.eql(u8, candidate.host, host.?.string))
+                    {
+                        var target = candidate;
+                        if (allow_authenticated_advertisement) {
+                            target.expected_node_id = hinted_id;
+                        }
+                        return .{ .redirect = target };
+                    }
+                }
+                if (allow_authenticated_advertisement) {
+                    const copied_host = std.fmt.bufPrint(
+                        redirect_host_buffer,
+                        "{s}",
+                        .{host.?.string},
+                    ) catch return .rotate;
+                    // Server registries and the dialer accept numeric IP
+                    // addresses only. Reject malformed hints before retrying.
+                    _ = std.Io.net.IpAddress.parse(
+                        copied_host,
+                        hinted_port,
+                    ) catch return .rotate;
+                    return .{ .redirect = .{
+                        .host = copied_host,
+                        .port = hinted_port,
+                        .expected_node_id = hinted_id,
+                    } };
+                }
+            }
+        },
+        else => {},
+    };
+    // It is a genuine redirect response but did not name a configured target.
+    // Rotate through the caller's configured set instead of returning it.
+    return .rotate;
+}
+
+test "leader redirects leave the seed list only with mTLS identity pinning" {
+    const seeds = [_]Endpoint{.{ .host = "127.0.0.1", .port = 7001 }};
+    const body =
+        "{\"ok\":false,\"error\":\"not_leader\"," ++
+        "\"leader\":{\"id\":3,\"host\":\"127.0.0.1\",\"port\":7003}}";
+    var host_buffer: [64]u8 = undefined;
+
+    const psk = try leaderRedirect(
+        std.testing.allocator,
+        &seeds,
+        body,
+        false,
+        &host_buffer,
+    );
+    try std.testing.expect(psk == .rotate);
+
+    const mtls = try leaderRedirect(
+        std.testing.allocator,
+        &seeds,
+        body,
+        true,
+        &host_buffer,
+    );
+    try std.testing.expect(mtls == .redirect);
+    try std.testing.expectEqual(@as(u16, 7003), mtls.redirect.port);
+    try std.testing.expectEqual(@as(?u32, 3), mtls.redirect.expected_node_id);
+    try std.testing.expectEqualStrings("127.0.0.1", mtls.redirect.host);
 }
 
 test "endpoint parsing" {

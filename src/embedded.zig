@@ -10,6 +10,7 @@ const Io = std.Io;
 const client = @import("client.zig");
 const node_mod = @import("node.zig");
 const server = @import("server.zig");
+const tls = @import("tls.zig");
 const roles = @import("roles.zig");
 const types = @import("types.zig");
 const gateway = @import("gateway.zig");
@@ -46,15 +47,23 @@ pub const OpenOptions = struct {
     /// Optional salt for the derived database identity, letting two
     /// clusters with identical member lists refuse each other's peers.
     cluster_id: ?[]const u8 = null,
-    /// Shared transport secret. When set, peers and clients mutually
-    /// authenticate and every frame is HMAC-protected (integrity, not
-    /// confidentiality — use an encrypted tunnel for secret SQL).
+    /// Optional provider-file secret layered inside TLS for an additional
+    /// sequenced HMAC. It is not a substitute for `tls` in production.
     auth_secret: ?[]const u8 = null,
+    /// Mutual TLS identity for every TCP connection made or accepted by
+    /// this member. Production TCP requires all three provider paths.
+    tls: ?tls.Config = null,
+    /// Optional CA private-key provider for this member to act as the
+    /// one-time-token/CSR enrollment issuer. Most members leave it null.
+    enrollment_ca_key: ?[]const u8 = null,
     /// How long `open` waits for the spawned server to accept connections
     /// before failing with `error.ServerStartupTimeout`.
     startup_timeout_ms: u64 = 10_000,
     /// Test-only crash and delay injection; never enable in production.
     enable_test_faults: bool = false,
+    /// Test harness escape hatch for plaintext/PSK TCP. Production callers
+    /// must use the CLI mTLS host or a local Unix-domain socket.
+    allow_insecure_test_tcp: bool = false,
     test_faults: server.TestFaults = .{},
 };
 
@@ -78,6 +87,9 @@ pub const Embedded = struct {
     endpoints: []client.Endpoint,
     self_endpoint: client.Endpoint,
     auth_secret: ?[]const u8,
+    tls_client: ?tls.Context,
+    client_mutex: std.Io.Mutex = .init,
+    cluster: client.ClusterConnection,
     thread: std.Thread,
     finished: std.atomic.Value(bool) = .init(false),
     exit_code: std.atomic.Value(u8) = .init(255),
@@ -165,6 +177,15 @@ pub const Embedded = struct {
             try allocator.dupe(u8, text)
         else
             null;
+        const tls_config: ?tls.Config = if (options.tls) |config| .{
+            .cert_path = try allocator.dupe(u8, config.cert_path),
+            .key_path = try allocator.dupe(u8, config.key_path),
+            .ca_path = try allocator.dupe(u8, config.ca_path),
+        } else null;
+        const enrollment_ca_key = if (options.enrollment_ca_key) |path|
+            try allocator.dupe(u8, path)
+        else
+            null;
 
         self.serve_options = .{
             .directory = directory,
@@ -174,7 +195,11 @@ pub const Embedded = struct {
             .members = peers,
             .database_id = server.deriveDatabaseId(peers, cluster_id),
             .auth_secret = secret,
-            .enable_failpoints = options.enable_test_faults,
+            .tls = tls_config,
+            .enrollment_ca_key = enrollment_ca_key,
+            .enable_failpoints = options.enable_test_faults or
+                options.allow_insecure_test_tcp,
+            .allow_insecure_test_tcp = options.allow_insecure_test_tcp,
             .test_faults = options.test_faults,
         };
         self.gateway_shutdown = .init(false);
@@ -182,13 +207,25 @@ pub const Embedded = struct {
             .listen_host = own.host,
             .listen_port = own.port,
             .backends = backends[0..backend_count],
-            .authenticated = secret != null,
             .shutdown_flag = &self.gateway_shutdown,
         };
         self.gateway_mode = own_role == .gateway;
         self.endpoints = endpoints;
         self.self_endpoint = own;
         self.auth_secret = secret;
+        self.tls_client = null;
+        if (tls_config) |config| {
+            self.tls_client = try tls.Context.initClient(config);
+        }
+        errdefer if (self.tls_client) |*context| context.deinit();
+        self.client_mutex = .init;
+        self.cluster = client.ClusterConnection.init(
+            gpa,
+            io,
+            endpoints,
+            self.transport(),
+        );
+        errdefer self.cluster.deinit();
         self.finished = .init(false);
         self.exit_code = .init(255);
         self.thread = try std.Thread.spawn(.{}, runServer, .{self});
@@ -213,11 +250,11 @@ pub const Embedded = struct {
                 stream.close(self.io);
                 return;
             }
-            const connection = client.Connection.openWithSecret(
+            const connection = client.Connection.openWithTransport(
                 self.gpa,
                 self.io,
                 self.self_endpoint,
-                self.auth_secret,
+                self.transport(),
             ) catch {
                 self.io.sleep(.fromMilliseconds(25), .awake) catch {};
                 continue;
@@ -254,6 +291,13 @@ pub const Embedded = struct {
         self.finished.store(true, .release);
     }
 
+    fn transport(self: *Embedded) client.Transport {
+        return .{
+            .secret = self.auth_secret,
+            .tls = if (self.tls_client) |*context| context else null,
+        };
+    }
+
     /// Requests a server stop, joins the background thread, and frees the
     /// facade and everything it copied; `self` is invalid afterwards. There
     /// is nothing to flush here: every acknowledged write was already synced
@@ -274,16 +318,18 @@ pub const Embedded = struct {
                     if (stream) |*open_stream| open_stream.close(self.io);
                 }
                 self.thread.join();
+                self.cluster.deinit();
+                if (self.tls_client) |*context| context.deinit();
                 self.arena.deinit();
                 const gpa = self.gpa;
                 gpa.destroy(self);
                 return;
             }
-            if (client.Connection.openWithSecret(
+            if (client.Connection.openWithTransport(
                 self.gpa,
                 self.io,
                 self.self_endpoint,
-                self.auth_secret,
+                self.transport(),
             )) |connection| {
                 if (connection.call("{\"op\":\"stop\"}")) |body| {
                     self.gpa.free(body);
@@ -292,6 +338,8 @@ pub const Embedded = struct {
             } else |_| {}
         }
         self.thread.join();
+        self.cluster.deinit();
+        if (self.tls_client) |*context| context.deinit();
         self.arena.deinit();
         const gpa = self.gpa;
         gpa.destroy(self);
@@ -306,14 +354,9 @@ pub const Embedded = struct {
     /// `open`; the caller must free it with that same allocator. The body is
     /// returned as-is — including `{"ok":false,...}` error responses.
     pub fn call(self: *Embedded, request: []const u8, leader: bool) ![]u8 {
-        const result = try client.callClusterWithSecret(
-            self.gpa,
-            self.io,
-            self.endpoints,
-            request,
-            leader,
-            self.auth_secret,
-        );
+        self.client_mutex.lockUncancelable(self.io);
+        defer self.client_mutex.unlock(self.io);
+        const result = try self.cluster.call(request, leader);
         return result.body;
     }
 
