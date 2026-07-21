@@ -46,6 +46,7 @@ pub fn main(init: std.process.Init) !u8 {
             .members = &members,
             .cluster_id = "fault-cluster",
             .enable_test_faults = true,
+            .allow_insecure_test_tcp = true,
             .test_faults = schedule,
         });
     }

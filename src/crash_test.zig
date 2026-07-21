@@ -3,8 +3,9 @@
 //! Every case starts from a committed baseline, spawns the real CLI with one
 //! exact failpoint, observes `_exit` without cleanup, then reopens through the
 //! library and checks integrity. Unknown client fate permits either absence or
-//! durable completion at the early boundaries; once the accept/commit prefix is
-//! synced in a one-voter configuration, recovery must complete the value.
+//! durable completion at the early boundaries; once the accept prefix is synced
+//! in a one-voter configuration, recovery must complete the value. The legacy
+//! commit-named failpoint now denotes chosen-before-materialized-apply.
 
 const std = @import("std");
 const zaxonlite = @import("zaxonlite");

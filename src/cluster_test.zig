@@ -76,6 +76,7 @@ const Cluster = struct {
             try argv.appendSlice(self.gpa, &.{ "--peer", peer_text });
         }
         try argv.append(self.gpa, "--enable-failpoints");
+        try argv.append(self.gpa, "--dev-psk");
         try argv.appendSlice(self.gpa, &.{ "--auth-file", self.auth_file });
         // The scenario exercises process crashes, which lose nothing under
         // either sync policy; skip the full-flush latency.
@@ -220,7 +221,7 @@ fn mustCall(
 ) []u8 {
     var elapsed: u64 = 0;
     while (elapsed <= deadline_ms) {
-        const result = client.callClusterWithSecret(
+        var result = client.callClusterWithSecret(
             cluster.gpa,
             cluster.io,
             cluster.endpointList(),
@@ -234,7 +235,7 @@ fn mustCall(
         };
         const parsed = parse(cluster, result.body);
         defer parsed.deinit();
-        if (isOk(&parsed)) return result.body;
+        if (isOk(&parsed)) return result.takeBody(cluster.gpa);
         // Retryable outcomes during elections and rollovers.
         const code = fieldString(cluster, &parsed, "error");
         if (std.mem.eql(u8, code, "retry") or
@@ -243,7 +244,7 @@ fn mustCall(
             std.mem.eql(u8, code, "unavailable") or
             std.mem.eql(u8, code, "ambiguous"))
         {
-            cluster.gpa.free(result.body);
+            result.deinit(cluster.gpa);
             elapsed += 250;
             cluster.io.sleep(.fromMilliseconds(250), .awake) catch {};
             continue;
@@ -494,6 +495,7 @@ fn runScenario(
     try Io.Dir.cwd().writeFile(io, .{
         .sub_path = auth_file,
         .data = cluster_secret,
+        .flags = .{ .permissions = @enumFromInt(0o600) },
     });
 
     var cluster = Cluster{

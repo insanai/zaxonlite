@@ -23,6 +23,8 @@ pub const File = struct {
     tls_cert: ?[]const u8 = null,
     tls_key: ?[]const u8 = null,
     tls_ca: ?[]const u8 = null,
+    enrollment_ca_key: ?[]const u8 = null,
+    revocation_file: ?[]const u8 = null,
     sync: ?[]const u8 = null,
 };
 
@@ -75,6 +77,7 @@ pub fn loadSecret(
     io: Io,
     path: []const u8,
 ) !Secret {
+    try validatePrivateFile(io, path);
     const allocation = try Io.Dir.cwd().readFileAlloc(
         io,
         path,
@@ -92,12 +95,32 @@ pub fn loadSecret(
     return .{ .allocation = allocation, .bytes = allocation[0..length] };
 }
 
+/// Private transport material must be a regular file reached without
+/// following a symlink and must grant no group/world permissions. The data
+/// directory has the same owner-only boundary, so checking mode here is the
+/// practical portable policy; deployments should run under a dedicated UID.
+pub fn validatePrivateFile(io: Io, path: []const u8) !void {
+    const stat = try Io.Dir.cwd().statFile(io, path, .{
+        .follow_symlinks = false,
+    });
+    if (stat.kind != .file) return error.UnsafePrivateFile;
+    if (@intFromEnum(stat.permissions) & 0o077 != 0) {
+        return error.UnsafePrivateFile;
+    }
+}
+
 test "secret provider removes only its final line ending" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = std.testing.io;
     const value = "0123456789abcdef0123456789abcdef space\r\n";
     try tmp.dir.writeFile(io, .{ .sub_path = "secret", .data = value });
+    try tmp.dir.setFilePermissions(
+        io,
+        "secret",
+        @enumFromInt(0o600),
+        .{},
+    );
     var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path_length = try tmp.dir.realPath(io, &path_buffer);
     const path = try std.fmt.allocPrint(
@@ -112,6 +135,28 @@ test "secret provider removes only its final line ending" {
         "0123456789abcdef0123456789abcdef space",
         secret.bytes,
     );
+}
+
+test "private provider refuses broad permissions and symlinks" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.writeFile(io, .{ .sub_path = "secret", .data = "x" ** 32 });
+    try tmp.dir.setFilePermissions(
+        io,
+        "secret",
+        @enumFromInt(0o644),
+        .{},
+    );
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_length = try tmp.dir.realPath(io, &path_buffer);
+    const path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/secret",
+        .{path_buffer[0..path_length]},
+    );
+    defer std.testing.allocator.free(path);
+    try std.testing.expectError(error.UnsafePrivateFile, validatePrivateFile(io, path));
 }
 
 test "configuration file owns parsed values" {

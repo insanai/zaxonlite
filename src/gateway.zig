@@ -13,7 +13,9 @@ pub const Options = struct {
     listen_host: []const u8 = "127.0.0.1",
     listen_port: u16,
     backends: []const client.Endpoint,
-    authenticated: bool = false,
+    /// Hard cap for raw passthrough connections. Backend servers enforce
+    /// their own stricter global/per-peer admission after the TLS handshake.
+    max_connections: usize = 128,
     /// Optional embedding-owned graceful shutdown signal. Setting it and
     /// connecting once to the listener wakes the accept loop.
     shutdown_flag: ?*std.atomic.Value(bool) = null,
@@ -28,8 +30,8 @@ pub fn serve(
     if (options.backends.len == 0) {
         return report(err_out, "at least one storage backend is required");
     }
-    if (!options.authenticated and !isLoopback(options.listen_host)) {
-        return report(err_out, "non-loopback gateway requires authenticated transport");
+    if (options.max_connections == 0) {
+        return report(err_out, "gateway connection limit must be non-zero");
     }
     const address = std.Io.net.IpAddress.parse(
         options.listen_host,
@@ -69,11 +71,11 @@ pub fn serve(
             inbound.close(io);
             continue;
         };
-        runtime.started(inbound) catch {
+        if (!runtime.tryStarted(inbound, options.max_connections)) {
             gpa.destroy(context);
             inbound.close(io);
             continue;
-        };
+        }
         context.* = .{
             .gpa = gpa,
             .io = io,
@@ -105,10 +107,6 @@ fn report(err_out: *Io.Writer, message: []const u8) !u8 {
     );
     try err_out.flush();
     return 2;
-}
-
-fn isLoopback(host: []const u8) bool {
-    return std.mem.eql(u8, host, "::1") or std.mem.startsWith(u8, host, "127.");
 }
 
 const Proxy = struct {
@@ -166,10 +164,16 @@ const Runtime = struct {
         self.active.deinit(self.gpa);
     }
 
-    fn started(self: *Runtime, stream: std.Io.net.Stream) !void {
+    fn tryStarted(
+        self: *Runtime,
+        stream: std.Io.net.Stream,
+        limit: usize,
+    ) bool {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        try self.active.append(self.gpa, stream);
+        if (self.active.items.len >= limit) return false;
+        self.active.append(self.gpa, stream) catch return false;
+        return true;
     }
 
     fn finished(self: *Runtime, stream: std.Io.net.Stream) void {
@@ -227,8 +231,9 @@ const Copy = struct {
     }
 };
 
-test "loopback recognition is deliberately narrow" {
-    try std.testing.expect(isLoopback("127.0.0.1"));
-    try std.testing.expect(isLoopback("::1"));
-    try std.testing.expect(!isLoopback("localhost"));
+test "gateway defaults to bounded admission" {
+    try std.testing.expectEqual(@as(usize, 128), (Options{
+        .listen_port = 1,
+        .backends = &.{},
+    }).max_connections);
 }

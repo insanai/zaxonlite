@@ -123,6 +123,47 @@ test "prepared explicit transaction is one durable replicated transition" {
     try testing.expect(report.ok());
 }
 
+test "remote-style query budgets bound rows bytes and SQLite work" {
+    const gpa = testing.allocator;
+    var test_dir = try TestDir.init(gpa);
+    defer test_dir.deinit(gpa);
+    const dir = try test_dir.nodeDir(gpa);
+    defer gpa.free(dir);
+    const node = try openNode(dir);
+    defer node.close();
+
+    try testing.expectError(
+        error.QueryRowLimit,
+        node.queryWithLimits(
+            gpa,
+            "with recursive n(x) as (values(1) union all " ++
+                "select x+1 from n where x<10) select x from n",
+            .{ .max_rows = 3 },
+        ),
+    );
+    try testing.expectError(
+        error.QueryResultTooLarge,
+        node.queryWithLimits(gpa, "select printf('%100s', 'x')", .{
+            .max_bytes = 16,
+        }),
+    );
+    try testing.expectError(
+        error.SqliteInterrupted,
+        node.queryWithLimits(
+            gpa,
+            "with recursive n(x) as (values(1) union all " ++
+                "select x+1 from n where x<1000000) select sum(x) from n",
+            .{ .max_vm_steps = 1_000 },
+        ),
+    );
+
+    // Clearing the progress handler after interruption is part of the
+    // contract: subsequent ordinary embedded reads remain unlimited.
+    var result = try node.query(gpa, "select 42");
+    defer result.deinit();
+    try testing.expectEqualStrings("42", result.rows[0][0].?);
+}
+
 test "one MiB payload survives journal-only image recovery" {
     const gpa = testing.allocator;
     var test_dir = try TestDir.init(gpa);
@@ -562,9 +603,9 @@ test "epoch capacity triggers automatic snapshot rollover" {
     defer node.close();
     _ = try node.exec("create table items(id integer primary key, v text)");
 
-    // Push well past one epoch's capacity (256 slots).
+    // Push past one bounded 2048-slot epoch.
     var buffer: [96]u8 = undefined;
-    for (0..300) |index| {
+    for (0..2075) |index| {
         const sql = try std.fmt.bufPrintZ(
             &buffer,
             "insert into items(v) values ('row-{d}')",
@@ -572,7 +613,7 @@ test "epoch capacity triggers automatic snapshot rollover" {
         );
         _ = try node.exec(sql);
     }
-    try testing.expectEqual(@as(i64, 300), try countItems(node));
+    try testing.expectEqual(@as(i64, 2075), try countItems(node));
     try testing.expect(node.identity.configuration_id > 1);
     const report = try node.integrityCheck();
     try testing.expect(report.ok());

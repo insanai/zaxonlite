@@ -20,6 +20,7 @@ const gateway = zaxonlite.gateway;
 const configuration = zaxonlite.configuration;
 const diagnostic = zaxonlite.diagnostic;
 const tls = zaxonlite.tls;
+const enrollment = zaxonlite.enrollment;
 const Role = zaxonlite.Role;
 
 const exit_ok: u8 = 0;
@@ -37,7 +38,7 @@ const usage_text =
     \\  zaxon serve --data <dir> --node <id> --listen <endpoint>
     \\        [--role <role>] [--peer <id>@host:port[/role] ...]
     \\        [--cluster-id <text>]
-    \\        [--auth-file <path>] [--enable-failpoints]
+    \\        [--auth-file <path>] [--dev-psk] [--enable-failpoints]
     \\
     \\Commands:
     \\  sql               Interactive SQL shell (embedded or client mode).
@@ -53,6 +54,8 @@ const usage_text =
     \\  integrity-check   Verify SQLite image, descriptor chain, and payloads.
     \\  recover           Rebuild from authoritative state and verify it.
     \\  expire-sessions   Delete idle sessions; --retain <n> newest activity.
+    \\  enroll-token      Create a short-lived token bundle for --node (client mode).
+    \\  enroll            Redeem --token-file into an atomic --identity-dir.
     \\  serve             Host this node behind a TCP endpoint.
     \\  stop              Ask a served node to shut down (client mode).
     \\  version           Print the zaxonlite version.
@@ -66,21 +69,29 @@ const usage_text =
     \\  --sequence <n>      Monotonic per-session sequence for exec.
     \\  --level <level>     Read level for query (default linearizable).
     \\  --freshness-ms <n>  Maximum age for a local learner read.
-    \\  --to <path>         Backup destination path.
+    \\  --to <path>         Backup or enrollment-token destination path.
     \\  --retain <n>        Activity window for expire-sessions.
     \\  --applied <slot>    Slot to wait for (wait).
     \\  --leader            Also wait for a known leader (wait).
     \\  --timeout-ms <n>    Wait deadline in milliseconds.
-    \\  --node <id>         This node's ID (serve).
+    \\  --node <id>         This node's ID (serve) or enrollment target.
     \\  --listen <endpoint> host:port, or unix:<path> for owner-only local
     \\                      service over a Unix-domain socket (serve).
-    \\  --role <role>       data-voter|witness|standby|read-replica.
+    \\  --role <role>       data-voter|witness|standby|read-replica|gateway.
     \\  --peer <spec>       id@host:port[/role] (repeat; serve).
     \\  --cluster-id <text> Extra entropy for the derived database identity.
     \\  --auth-file <path>  PSK provider; or ZAXON_AUTH_FILE. Never a literal key.
+    \\  --dev-psk           Loopback-only PSK transport for local development.
     \\  --tls-cert <path>   Node certificate PEM (mutual TLS; needs all three).
     \\  --tls-key <path>    Node private key PEM.
     \\  --tls-ca <path>     Cluster CA PEM that peer certificates chain to.
+    \\  --enrollment-ca-key <path>
+    \\                      CA private key PEM; enables token/CSR issuance on serve.
+    \\  --token-file <path> Opaque owner-only enrollment bundle (enroll).
+    \\  --identity-dir <dir> New directory receiving node.key/node.crt/ca.crt.
+    \\  --ttl-seconds <n>   Enrollment token lifetime (default 600, maximum 86400).
+    \\  --revocation-file <path>
+    \\                      Reloaded node-ID denylist (serve).
     \\  --sync <mode>       full (default; F_FULLFSYNC on macOS, survives power
     \\                      loss) or os (plain fsync; faster, development only).
     \\  --enable-failpoints Honor failpoint RPCs (test controllers only).
@@ -116,8 +127,15 @@ const Options = struct {
     tls_cert: ?[]const u8 = null,
     tls_key: ?[]const u8 = null,
     tls_ca: ?[]const u8 = null,
+    enrollment_ca_key: ?[]const u8 = null,
+    token_file: ?[]const u8 = null,
+    identity_dir: ?[]const u8 = null,
+    ttl_seconds: ?u64 = null,
+    revocation_file: ?[]const u8 = null,
     sync: ?[]const u8 = null,
     enable_failpoints: bool = false,
+    dev_psk: bool = false,
+    insecure_test_tcp: bool = false,
     json: bool = false,
 };
 
@@ -242,11 +260,32 @@ fn run(
         } else if (std.mem.eql(u8, arg, "--tls-ca")) {
             options.tls_ca = iterator.next() orelse
                 return usageError(err_out, "--tls-ca needs a value");
+        } else if (std.mem.eql(u8, arg, "--enrollment-ca-key")) {
+            options.enrollment_ca_key = iterator.next() orelse
+                return usageError(err_out, "--enrollment-ca-key needs a value");
+        } else if (std.mem.eql(u8, arg, "--token-file")) {
+            options.token_file = iterator.next() orelse
+                return usageError(err_out, "--token-file needs a value");
+        } else if (std.mem.eql(u8, arg, "--identity-dir")) {
+            options.identity_dir = iterator.next() orelse
+                return usageError(err_out, "--identity-dir needs a value");
+        } else if (std.mem.eql(u8, arg, "--ttl-seconds")) {
+            const text = iterator.next() orelse
+                return usageError(err_out, "--ttl-seconds needs a value");
+            options.ttl_seconds = std.fmt.parseInt(u64, text, 10) catch
+                return usageError(err_out, "--ttl-seconds must be an integer");
+        } else if (std.mem.eql(u8, arg, "--revocation-file")) {
+            options.revocation_file = iterator.next() orelse
+                return usageError(err_out, "--revocation-file needs a value");
         } else if (std.mem.eql(u8, arg, "--sync")) {
             options.sync = iterator.next() orelse
                 return usageError(err_out, "--sync needs a value");
         } else if (std.mem.eql(u8, arg, "--enable-failpoints")) {
             options.enable_failpoints = true;
+        } else if (std.mem.eql(u8, arg, "--dev-psk")) {
+            options.dev_psk = true;
+        } else if (std.mem.eql(u8, arg, "--insecure-test-tcp")) {
+            options.insecure_test_tcp = true;
         } else if (std.mem.eql(u8, arg, "--json")) {
             options.json = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -295,6 +334,9 @@ fn run(
         ) orelse return usageError(err_out, "--sync must be os or full");
         zaxonlite.durability.setSyncMode(mode);
     }
+    if (std.mem.eql(u8, command, "enroll")) {
+        return enrollCommand(gpa, io, &options, out, err_out);
+    }
     var secret: ?configuration.Secret = if (options.auth_file) |path|
         configuration.loadSecret(gpa, io, path) catch |err| {
             try diagnostic.write(
@@ -336,6 +378,15 @@ fn run(
         var tls_context: ?tls.Context = null;
         defer if (tls_context) |*context| context.deinit();
         if (tls_config) |config| {
+            configuration.validatePrivateFile(io, config.key_path) catch |err| {
+                try diagnostic.write(
+                    err_out,
+                    "unsafe TLS private key",
+                    @errorName(err),
+                    "Use a regular, non-symlink key file with mode 0600.",
+                );
+                return exit_usage;
+            };
             tls_context = tls.Context.initClient(config) catch |err| {
                 try diagnostic.write(
                     err_out,
@@ -523,6 +574,14 @@ fn applyConfiguration(
         options.tls_ca = environ.get("ZAXON_TLS_CA") orelse
             if (file) |value| value.tls_ca else null;
     }
+    if (options.enrollment_ca_key == null) {
+        options.enrollment_ca_key = environ.get("ZAXON_ENROLLMENT_CA_KEY") orelse
+            if (file) |value| value.enrollment_ca_key else null;
+    }
+    if (options.revocation_file == null) {
+        options.revocation_file = environ.get("ZAXON_REVOCATION_FILE") orelse
+            if (file) |value| value.revocation_file else null;
+    }
     if (options.sync == null) {
         options.sync = environ.get("ZAXON_SYNC") orelse
             if (file) |value| value.sync else null;
@@ -571,8 +630,10 @@ fn noLeaderDiagnostic(err_out: *std.Io.Writer) !void {
     try diagnostic.write(
         err_out,
         "no reachable leader",
-        "No configured endpoint could complete a leader-only request.",
-        "Restore a voter quorum or verify --connect addresses and credentials.",
+        "No seed endpoint or authenticated leader redirect could complete " ++
+            "this leader-only request.",
+        "Restore a voter quorum and verify credentials. With --dev-psk, " ++
+            "include every cluster member in --connect.",
     );
 }
 
@@ -617,6 +678,17 @@ fn serveCommand(
     tls_config: ?tls.Config,
     err_out: *std.Io.Writer,
 ) !u8 {
+    if (tls_config) |config| {
+        configuration.validatePrivateFile(io, config.key_path) catch |err| {
+            try diagnostic.write(
+                err_out,
+                "unsafe TLS private key",
+                @errorName(err),
+                "Use a regular, non-symlink key file with mode 0600.",
+            );
+            return exit_usage;
+        };
+    }
     const data = options.data orelse
         return usageError(err_out, "serve needs --data");
     const node_id = options.node_id orelse
@@ -675,11 +747,20 @@ fn serveCommand(
         null;
 
     if (options.role == .gateway) {
+        if (options.dev_psk) {
+            return usageError(err_out, "gateway mode does not terminate --dev-psk");
+        }
         if (tls_config != null) {
             return usageError(
                 err_out,
-                "gateway mode does not support --tls yet; front it with TLS " ++
-                    "termination or use PSK",
+                "gateway mode passes TLS through; put --tls-* on clients " ++
+                    "and storage nodes, not the gateway",
+            );
+        }
+        if (options.enrollment_ca_key != null) {
+            return usageError(
+                err_out,
+                "gateway mode cannot issue enrollment certificates",
             );
         }
         var backends: std.ArrayList(client.Endpoint) = .empty;
@@ -697,7 +778,6 @@ fn serveCommand(
             .listen_host = listen.host,
             .listen_port = listen.port,
             .backends = backends.items,
-            .authenticated = auth_secret != null,
         }, err_out);
     }
 
@@ -710,8 +790,12 @@ fn serveCommand(
         .members = members.items,
         .database_id = database_id,
         .auth_secret = auth_secret,
+        .allow_psk_only_loopback = options.dev_psk,
         .tls = tls_config,
+        .enrollment_ca_key = options.enrollment_ca_key,
+        .revocation_file = options.revocation_file,
         .enable_failpoints = options.enable_failpoints,
+        .allow_insecure_test_tcp = options.insecure_test_tcp,
     }, err_out);
 }
 
@@ -752,7 +836,7 @@ fn remote(
     if (std.mem.eql(u8, command, "backup")) {
         const destination = options.to orelse
             return usageError(err_out, "backup needs --to");
-        const probe = client.callClusterWithTransport(
+        var probe = client.callClusterWithTransport(
             gpa,
             io,
             endpoints.items,
@@ -763,7 +847,7 @@ fn remote(
             try noLeaderDiagnostic(err_out);
             return exit_unavailable;
         };
-        defer gpa.free(probe.body);
+        defer probe.deinit(gpa);
         const connection = client.Connection.openWithTransport(
             gpa,
             io,
@@ -856,6 +940,25 @@ fn remote(
         const retain = options.retain orelse
             return usageError(err_out, "expire-sessions needs --retain");
         try writer.print("{{\"op\":\"expire-sessions\",\"retain\":{d}}}", .{retain});
+    } else if (std.mem.eql(u8, command, "enroll-token")) {
+        require_leader = false;
+        const node_id = options.node_id orelse
+            return usageError(err_out, "enroll-token needs --node");
+        const ttl_seconds = options.ttl_seconds orelse enrollment.default_ttl_seconds;
+        if (ttl_seconds == 0 or ttl_seconds > enrollment.maximum_ttl_seconds) {
+            return usageError(err_out, "--ttl-seconds must be between 1 and 86400");
+        }
+        if (options.to == null) {
+            return usageError(err_out, "enroll-token needs --to");
+        }
+        if (options.tls_ca == null) {
+            return usageError(err_out, "enroll-token requires --tls-ca");
+        }
+        try writer.print(
+            "{{\"op\":\"issue-enrollment-token\",\"node_id\":{d}," ++
+                "\"ttl_seconds\":{d}}}",
+            .{ node_id, ttl_seconds },
+        );
     } else if (std.mem.eql(u8, command, "stop")) {
         require_leader = false;
         try writer.writeAll("{\"op\":\"stop\"}");
@@ -869,7 +972,7 @@ fn remote(
         return exit_usage;
     }
 
-    const result = client.callClusterWithTransport(
+    var result = client.callClusterWithTransport(
         gpa,
         io,
         endpoints.items,
@@ -880,8 +983,206 @@ fn remote(
         try noLeaderDiagnostic(err_out);
         return exit_unavailable;
     };
-    defer gpa.free(result.body);
+    defer {
+        if (std.mem.eql(u8, command, "enroll-token")) @memset(result.body, 0);
+        result.deinit(gpa);
+    }
+    if (std.mem.eql(u8, command, "enroll-token")) {
+        return saveEnrollmentBundle(
+            gpa,
+            io,
+            options,
+            result,
+            out,
+            err_out,
+        );
+    }
     return renderRemote(gpa, options, result.body, out, err_out);
+}
+
+fn saveEnrollmentBundle(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    options: *const Options,
+    result: client.CallResult,
+    out: *std.Io.Writer,
+    err_out: *std.Io.Writer,
+) !u8 {
+    const Response = struct {
+        ok: bool = false,
+        node_id: u32 = 0,
+        issuer_node_id: u32 = 0,
+        database_id: []const u8 = "",
+        expires_unix_seconds: u64 = 0,
+        token: []const u8 = "",
+        @"error": ?[]const u8 = null,
+        message: ?[]const u8 = null,
+    };
+    const parsed = std.json.parseFromSlice(Response, gpa, result.body, .{
+        .ignore_unknown_fields = true,
+    }) catch {
+        try malformedResponseDiagnostic(err_out);
+        return exit_unavailable;
+    };
+    defer parsed.deinit();
+    const response = parsed.value;
+    if (!response.ok) {
+        try diagnostic.write(
+            err_out,
+            response.@"error" orelse "enrollment_unavailable",
+            response.message orelse "token issuance failed",
+            "Connect with an existing mTLS identity to a configured issuer node.",
+        );
+        return exit_unavailable;
+    }
+    if (response.node_id == 0 or response.issuer_node_id == 0 or
+        response.database_id.len != 32 or response.token.len != 64 or
+        response.expires_unix_seconds == 0 or result.endpoint.unix_path != null)
+    {
+        try malformedResponseDiagnostic(err_out);
+        return exit_unavailable;
+    }
+    var secret: [enrollment.token_bytes]u8 = undefined;
+    _ = std.fmt.hexToBytes(&secret, response.token) catch {
+        try malformedResponseDiagnostic(err_out);
+        return exit_unavailable;
+    };
+    const database_id = std.fmt.parseInt(u128, response.database_id, 16) catch {
+        try malformedResponseDiagnostic(err_out);
+        return exit_unavailable;
+    };
+    const ca_pem = std.Io.Dir.cwd().readFileAlloc(
+        io,
+        options.tls_ca.?,
+        gpa,
+        .limited(enrollment.maximum_ca_bytes + 1),
+    ) catch |err| {
+        try diagnostic.write(
+            err_out,
+            "cluster CA unreadable",
+            @errorName(err),
+            "Keep the CA certificate used by the authenticated issuer available.",
+        );
+        return exit_usage;
+    };
+    defer gpa.free(ca_pem);
+    const endpoint = try std.fmt.allocPrint(
+        gpa,
+        "{s}:{d}",
+        .{ result.endpoint.host, result.endpoint.port },
+    );
+    defer gpa.free(endpoint);
+    const bundle = enrollment.Bundle{
+        .node_id = response.node_id,
+        .issuer_node_id = response.issuer_node_id,
+        .database_id = database_id,
+        .expires_unix_seconds = response.expires_unix_seconds,
+        .secret = secret,
+        .endpoint = endpoint,
+        .ca_pem = ca_pem,
+    };
+    const encoded = bundle.encodeAlloc(gpa) catch |err| {
+        try diagnostic.write(
+            err_out,
+            "invalid enrollment response",
+            @errorName(err),
+            "Preserve the issuer log and retry with a new token.",
+        );
+        return exit_unavailable;
+    };
+    defer {
+        @memset(encoded, 0);
+        gpa.free(encoded);
+    }
+    enrollment.writeBundleFile(io, options.to.?, encoded) catch |err| {
+        try diagnostic.write(
+            err_out,
+            "token bundle not written",
+            @errorName(err),
+            "Choose a new path whose parent exists; existing files are never overwritten.",
+        );
+        return exit_unavailable;
+    };
+    if (options.json) {
+        try out.print(
+            "{{\"ok\":true,\"path\":\"{s}\",\"node_id\":{d}," ++
+                "\"expires_unix_seconds\":{d}}}\n",
+            .{ options.to.?, response.node_id, response.expires_unix_seconds },
+        );
+    } else {
+        try out.print(
+            "enrollment token for node {d} written to {s}; expires at Unix second {d}\n",
+            .{ response.node_id, options.to.?, response.expires_unix_seconds },
+        );
+    }
+    return exit_ok;
+}
+
+fn enrollCommand(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    options: *const Options,
+    out: *std.Io.Writer,
+    err_out: *std.Io.Writer,
+) !u8 {
+    const token_path = options.token_file orelse
+        return usageError(err_out, "enroll needs --token-file");
+    const identity_dir = options.identity_dir orelse
+        return usageError(err_out, "enroll needs --identity-dir");
+    const bundle_bytes = enrollment.readBundleFile(gpa, io, token_path) catch |err| {
+        try diagnostic.write(
+            err_out,
+            "enrollment token unreadable",
+            @errorName(err),
+            "Use the owner-only opaque bundle produced by enroll-token.",
+        );
+        return exit_usage;
+    };
+    defer {
+        @memset(bundle_bytes, 0);
+        gpa.free(bundle_bytes);
+    }
+    const bundle = enrollment.Bundle.decode(bundle_bytes) catch |err| {
+        try diagnostic.write(
+            err_out,
+            "enrollment token invalid",
+            @errorName(err),
+            "Request a new enrollment token from a configured issuer.",
+        );
+        return exit_usage;
+    };
+    var identity = enrollment.requestCertificate(gpa, io, bundle) catch |err| {
+        try diagnostic.write(
+            err_out,
+            "enrollment refused",
+            @errorName(err),
+            "Check expiry, target node ID, issuer reachability, and request a new token after any ambiguous failure.",
+        );
+        return exit_unavailable;
+    };
+    defer identity.deinit(gpa);
+    enrollment.installIdentity(io, identity_dir, &identity, bundle.ca_pem) catch |err| {
+        try diagnostic.write(
+            err_out,
+            "identity installation failed",
+            @errorName(err),
+            "The token is already consumed. Preserve the error, remove no existing identity, and issue a replacement token.",
+        );
+        return exit_unavailable;
+    };
+    enrollment.removeBundleFile(io, token_path) catch {};
+    if (options.json) {
+        try out.print(
+            "{{\"ok\":true,\"node_id\":{d},\"identity_dir\":\"{s}\"}}\n",
+            .{ bundle.node_id, identity_dir },
+        );
+    } else {
+        try out.print(
+            "node {d} enrolled; identity installed in {s}\n",
+            .{ bundle.node_id, identity_dir },
+        );
+    }
+    return exit_ok;
 }
 
 /// Prints a response body. `--json` passes the raw response through;
@@ -1063,6 +1364,8 @@ fn remoteShell(
     var stdin_buffer: [64 * 1024]u8 = undefined;
     var stdin_reader = std.Io.File.stdin().readerStreaming(io, &stdin_buffer);
     const in = &stdin_reader.interface;
+    var cluster = client.ClusterConnection.init(gpa, io, endpoints, transport);
+    defer cluster.deinit();
 
     while (true) {
         try out.writeAll("zaxon> ");
@@ -1114,19 +1417,12 @@ fn remoteShell(
             try request.writer.writeAll("}");
         }
 
-        const result = client.callClusterWithTransport(
-            gpa,
-            io,
-            endpoints,
-            request.written(),
-            true,
-            transport,
-        ) catch {
+        var result = cluster.call(request.written(), true) catch {
             try noLeaderDiagnostic(err_out);
             try err_out.flush();
             continue;
         };
-        defer gpa.free(result.body);
+        defer result.deinit(gpa);
         _ = try renderRemote(gpa, &pseudo, result.body, out, err_out);
         try out.flush();
         try err_out.flush();

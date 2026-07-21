@@ -7,7 +7,8 @@
 //! (transport, consensus round trip, payload + journal fsync on a quorum)
 //! rather than client-side pipelining.
 //!
-//! Usage: cluster-bench <path-to-zaxon> [--record <json>] [--sync <os|full>]
+//! Usage: cluster-bench <path-to-zaxon> [--record <json>] [--keep]
+//!        [--sync <os|full>]
 //!        [plaintext|psk|tls] [writes] [reads]
 //!
 //! With `--record`, the run's results replace the matching mode+sync entry
@@ -206,6 +207,7 @@ pub fn main(init: std.process.Init) !u8 {
         return 2;
     };
     var record_path: ?[]const u8 = null;
+    var keep_artifacts = false;
     var sync_text: []const u8 = "full";
     var positionals: [3]?[]const u8 = .{ null, null, null };
     var positional_count: usize = 0;
@@ -215,6 +217,8 @@ pub fn main(init: std.process.Init) !u8 {
                 std.debug.print("--record needs a path\n", .{});
                 return 2;
             };
+        } else if (std.mem.eql(u8, argument, "--keep")) {
+            keep_artifacts = true;
         } else if (std.mem.eql(u8, argument, "--sync")) {
             sync_text = iterator.next() orelse {
                 std.debug.print("--sync needs os or full\n", .{});
@@ -253,7 +257,10 @@ pub fn main(init: std.process.Init) !u8 {
     );
     defer gpa.free(root);
     try Io.Dir.cwd().createDirPath(io, root);
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer if (!keep_artifacts) Io.Dir.cwd().deleteTree(io, root) catch {};
+    if (keep_artifacts) {
+        std.debug.print("benchmark artifacts: {s}\n", .{root});
+    }
 
     // Transport material.
     const auth_file = try std.fmt.allocPrint(gpa, "{s}/secret", .{root});
@@ -344,7 +351,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     // Wait for a leader by creating the schema through the redirecting
     // cluster call (it retries until a leader answers).
-    const create = client.callClusterWithTransport(
+    var create = client.callClusterWithTransport(
         gpa,
         io,
         &endpoints,
@@ -356,8 +363,10 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("cluster never elected a reachable leader\n", .{});
         return 1;
     };
+    defer create.deinit(gpa);
     const leader_endpoint = create.endpoint;
     gpa.free(create.body);
+    create.body = &.{};
 
     const before = try sampleAll(gpa, io, &nodes);
 
@@ -388,7 +397,7 @@ pub fn main(init: std.process.Init) !u8 {
                 return;
             }
             allocator.free(body);
-            const retry = try client.callClusterWithTransport(
+            var retry = try client.callClusterWithTransport(
                 allocator,
                 io_,
                 endpoint_list,
@@ -396,7 +405,7 @@ pub fn main(init: std.process.Init) !u8 {
                 true,
                 transport_,
             );
-            defer allocator.free(retry.body);
+            defer retry.deinit(allocator);
             if (!std.mem.startsWith(u8, retry.body, "{\"ok\":true")) {
                 return error.RequestFailed;
             }
@@ -413,14 +422,15 @@ pub fn main(init: std.process.Init) !u8 {
     // Write path.
     const write_samples = try gpa.alloc(u64, write_count);
     defer gpa.free(write_samples);
-    var request_buffer: [256]u8 = undefined;
+    const write_payload = [_]u8{'x'} ** 256;
+    var request_buffer: [640]u8 = undefined;
     const write_start = nowNs(io);
     for (0..write_count) |index| {
         const request = std.fmt.bufPrint(
             &request_buffer,
             "{{\"op\":\"exec\",\"sql\":\"insert into b(k, v) values " ++
-                "({d}, 'value-{d}')\"}}",
-            .{ index % 997, index },
+                "({d}, '{s}')\"}}",
+            .{ index % 997, &write_payload },
         ) catch unreachable;
         const op_start = nowNs(io);
         try leader_call(gpa, io, &endpoints, &connection, transport, request);
@@ -486,9 +496,12 @@ pub fn main(init: std.process.Init) !u8 {
             .mode = @tagName(mode),
             .sync = sync_text,
             .writes = write_count,
+            .payload_bytes = write_payload.len,
             .write_ops_s = opsPerSecond(write_count, write_elapsed),
             .write_p50_us = write_stats.p50 / 1000,
+            .write_p95_us = write_stats.p95 / 1000,
             .write_p99_us = write_stats.p99 / 1000,
+            .write_max_us = write_stats.max / 1000,
             .reads = read_count,
             .read_leader_ops_s = read_ops[0],
             .read_leader_p50_us = read_stats[0].p50 / 1000,
@@ -509,7 +522,10 @@ pub fn main(init: std.process.Init) !u8 {
         false,
         transport,
     ) catch null;
-    if (stop) |result| gpa.free(result.body);
+    if (stop) |value| {
+        var result = value;
+        result.deinit(gpa);
+    }
     return 0;
 }
 
@@ -521,9 +537,12 @@ const RunRecord = struct {
     mode: []const u8,
     sync: []const u8,
     writes: usize,
+    payload_bytes: usize = 0,
     write_ops_s: u64,
     write_p50_us: u64,
+    write_p95_us: u64 = 0,
     write_p99_us: u64,
+    write_max_us: u64 = 0,
     reads: usize,
     read_leader_ops_s: u64,
     read_leader_p50_us: u64,
@@ -647,11 +666,15 @@ fn spawnNode(
         try argv.appendSlice(gpa, &.{ "--peer", peer_text });
     }
     switch (mode) {
-        .plaintext => {},
+        .plaintext => try argv.appendSlice(gpa, &.{
+            "--enable-failpoints",
+            "--insecure-test-tcp",
+        }),
         .psk => {
             const secret_path = try std.fmt.allocPrint(gpa, "{s}/secret", .{root});
             try scratch.append(gpa, secret_path);
             try argv.appendSlice(gpa, &.{ "--auth-file", secret_path });
+            try argv.append(gpa, "--dev-psk");
         },
         .tls => {
             const cert = try std.fmt.allocPrint(

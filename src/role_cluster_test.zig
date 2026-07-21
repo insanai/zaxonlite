@@ -57,6 +57,7 @@ pub fn main(init: std.process.Init) !u8 {
             .members = &members,
             .cluster_id = "role-cluster",
             .auth_secret = secret,
+            .allow_insecure_test_tcp = true,
         });
     }
 

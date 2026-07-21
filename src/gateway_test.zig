@@ -26,7 +26,11 @@ pub fn main(init: std.process.Init) !u8 {
     defer Io.Dir.cwd().deleteTree(io, root) catch {};
     const auth = try std.fmt.allocPrint(gpa, "{s}/auth", .{root});
     defer gpa.free(auth);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = auth, .data = secret });
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = auth,
+        .data = secret,
+        .flags = .{ .permissions = @enumFromInt(0o600) },
+    });
     const backend_port = try freePort(io);
     const gateway_port = try freePort(io);
 
@@ -87,8 +91,9 @@ fn spawnBackend(
     defer gpa.free(listen);
     return std.process.spawn(io, .{
         .argv = &.{
-            zaxon,      "serve", "--data",      directory, "--node", "1",
-            "--listen", listen,  "--auth-file", auth,      "--sync", "os",
+            zaxon,                 "serve",               "--data",      directory, "--node", "1",
+            "--listen",            listen,                "--auth-file", auth,      "--sync", "os",
+            "--enable-failpoints", "--insecure-test-tcp",
         },
         .stdin = .ignore,
         .stdout = .ignore,

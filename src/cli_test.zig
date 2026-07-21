@@ -602,6 +602,139 @@ pub fn main(init: std.process.Init) !u8 {
         }
     }
 
+    // --- loopback-only development PSK service --------------------------
+    {
+        const psk_data = try std.fmt.allocPrint(gpa, "{s}/psk-node", .{root});
+        defer gpa.free(psk_data);
+        const psk_file = try std.fmt.allocPrint(gpa, "{s}/demo.psk", .{root});
+        defer gpa.free(psk_file);
+        try Io.Dir.cwd().writeFile(io, .{
+            .sub_path = psk_file,
+            .data = "cli-test-development-psk-32-bytes",
+            .flags = .{ .permissions = @enumFromInt(0o600) },
+        });
+        const psk_port: u16 = @intCast(12000 + nonce % 5000);
+        const psk_listen = try std.fmt.allocPrint(
+            gpa,
+            "127.0.0.1:{d}",
+            .{psk_port},
+        );
+        defer gpa.free(psk_listen);
+        const public_listen = try std.fmt.allocPrint(
+            gpa,
+            "0.0.0.0:{d}",
+            .{psk_port},
+        );
+        defer gpa.free(public_listen);
+
+        try expect(
+            gpa,
+            io,
+            "development PSK requires an auth provider",
+            &.{
+                "serve",    "--data",    psk_data,
+                "--node",   "1",         "--listen",
+                psk_listen, "--dev-psk",
+            },
+            null,
+            2,
+            null,
+            "--dev-psk requires --auth-file",
+        );
+        try expect(
+            gpa,
+            io,
+            "development PSK refuses a non-loopback listener",
+            &.{
+                "serve",       "--data",      psk_data,
+                "--node",      "1",           "--listen",
+                public_listen, "--auth-file", psk_file,
+                "--dev-psk",
+            },
+            null,
+            2,
+            null,
+            "loopback",
+        );
+
+        var serve_child = try std.process.spawn(io, .{
+            .argv = &.{
+                zaxon_path,    "serve",
+                "--data",      psk_data,
+                "--node",      "1",
+                "--listen",    psk_listen,
+                "--auth-file", psk_file,
+                "--dev-psk",
+            },
+            .stdin = .ignore,
+            .stdout = .ignore,
+            .stderr = .pipe,
+        });
+        var psk_ready = false;
+        for (0..80) |_| {
+            var result = try runCli(
+                gpa,
+                io,
+                &.{
+                    "status",      "--connect", psk_listen,
+                    "--auth-file", psk_file,    "--json",
+                },
+                null,
+            );
+            if (result.code == 0) psk_ready = true;
+            result.deinit(gpa);
+            if (psk_ready) break;
+            io.sleep(.fromMilliseconds(25), .awake) catch {};
+        }
+        if (!psk_ready) {
+            failures += 1;
+            std.debug.print("FAIL development PSK server never became ready\n", .{});
+        }
+        try expect(
+            gpa,
+            io,
+            "exec over development PSK",
+            &.{
+                "exec",                                      "--connect", psk_listen,
+                "--auth-file",                               psk_file,    "--sql",
+                "create table psk_t(a integer primary key)",
+            },
+            null,
+            0,
+            "0 row(s) changed",
+            null,
+        );
+        try expect(
+            gpa,
+            io,
+            "stop development PSK server",
+            &.{
+                "stop",        "--connect", psk_listen,
+                "--auth-file", psk_file,
+            },
+            null,
+            0,
+            null,
+            null,
+        );
+        var log_buffer: [4096]u8 = undefined;
+        var log_reader = serve_child.stderr.?.readerStreaming(io, &log_buffer);
+        const serve_log = try log_reader.interface.allocRemaining(
+            gpa,
+            .limited(64 * 1024),
+        );
+        defer gpa.free(serve_log);
+        _ = try serve_child.wait(io);
+        if (std.mem.indexOf(u8, serve_log, "development PSK (loopback only)") == null or
+            std.mem.indexOf(u8, serve_log, "writes are ready") == null)
+        {
+            failures += 1;
+            std.debug.print("FAIL serve startup/leader log missing: {s}\n", .{serve_log});
+        } else {
+            std.debug.print("ok   serve logs transport and leader readiness\n", .{});
+        }
+    }
+
     // --- mutual TLS service ----------------------------------------------
     {
         const tls_root = try std.fmt.allocPrint(gpa, "{s}/tls", .{root});
@@ -609,6 +742,8 @@ pub fn main(init: std.process.Init) !u8 {
         try Io.Dir.cwd().createDirPath(io, tls_root);
         try generateTlsIdentity(gpa, io, tls_root, "ca", null, "zaxon-test-ca");
         try generateTlsIdentity(gpa, io, tls_root, "n1", "ca", "zaxon-node-1");
+        try generateTlsIdentity(gpa, io, tls_root, "r2", "ca", "zaxon-node-2");
+        try generateTlsIdentity(gpa, io, tls_root, "r3", "ca", "zaxon-node-3");
         try generateTlsIdentity(gpa, io, tls_root, "client", "ca", "zaxon-client");
         // A second CA whose certificates the cluster must refuse.
         try generateTlsIdentity(gpa, io, tls_root, "ca2", null, "other-ca");
@@ -621,6 +756,8 @@ pub fn main(init: std.process.Init) !u8 {
         defer gpa.free(listen);
         const ca = try std.fmt.allocPrint(gpa, "{s}/ca.crt", .{tls_root});
         defer gpa.free(ca);
+        const ca_key = try std.fmt.allocPrint(gpa, "{s}/ca.key", .{tls_root});
+        defer gpa.free(ca_key);
         const n1_cert = try std.fmt.allocPrint(gpa, "{s}/n1.crt", .{tls_root});
         defer gpa.free(n1_cert);
         const n1_key = try std.fmt.allocPrint(gpa, "{s}/n1.key", .{tls_root});
@@ -635,6 +772,34 @@ pub fn main(init: std.process.Init) !u8 {
         defer gpa.free(rogue_key);
         const ca2 = try std.fmt.allocPrint(gpa, "{s}/ca2.crt", .{tls_root});
         defer gpa.free(ca2);
+        const token_path = try std.fmt.allocPrint(gpa, "{s}/node2.token", .{tls_root});
+        defer gpa.free(token_path);
+        const replay_token_path = try std.fmt.allocPrint(
+            gpa,
+            "{s}/node2-replay.token",
+            .{tls_root},
+        );
+        defer gpa.free(replay_token_path);
+        const enrolled_dir = try std.fmt.allocPrint(gpa, "{s}/node2-identity", .{tls_root});
+        defer gpa.free(enrolled_dir);
+        const replay_dir = try std.fmt.allocPrint(gpa, "{s}/node2-replay", .{tls_root});
+        defer gpa.free(replay_dir);
+        const revocation_path = try std.fmt.allocPrint(
+            gpa,
+            "{s}/revoked-nodes",
+            .{tls_root},
+        );
+        defer gpa.free(revocation_path);
+        try Io.Dir.cwd().writeFile(io, .{
+            .sub_path = revocation_path,
+            .data = "# initially empty\n",
+        });
+        const node2_address = try std.fmt.allocPrint(
+            gpa,
+            "2@127.0.0.1:{d}/standby",
+            .{port + 1},
+        );
+        defer gpa.free(node2_address);
 
         try expect(
             gpa,
@@ -646,16 +811,33 @@ pub fn main(init: std.process.Init) !u8 {
             null,
             "given together",
         );
+        try expect(
+            gpa,
+            io,
+            "loopback TCP refuses plaintext production mode",
+            &.{
+                "serve",  "--data", tls_data,
+                "--node", "1",      "--listen",
+                listen,
+            },
+            null,
+            4,
+            null,
+            "MUTUAL TLS REQUIRED",
+        );
 
         var serve_child = try std.process.spawn(io, .{
             .argv = &.{
-                zaxon_path,   "serve",
-                "--data",     tls_data,
-                "--node",     "1",
-                "--listen",   listen,
-                "--tls-cert", n1_cert,
-                "--tls-key",  n1_key,
-                "--tls-ca",   ca,
+                zaxon_path,            "serve",
+                "--data",              tls_data,
+                "--node",              "1",
+                "--listen",            listen,
+                "--peer",              node2_address,
+                "--tls-cert",          n1_cert,
+                "--tls-key",           n1_key,
+                "--tls-ca",            ca,
+                "--enrollment-ca-key", ca_key,
+                "--revocation-file",   revocation_path,
             },
             .stdin = .ignore,
             .stdout = .ignore,
@@ -677,6 +859,96 @@ pub fn main(init: std.process.Init) !u8 {
             0,
             "\"node_id\":1",
             null,
+        );
+
+        try expect(
+            gpa,
+            io,
+            "mTLS operator issues one-time enrollment token",
+            &.{
+                "enroll-token", "--connect",     listen,
+                "--node",       "2",             "--to",
+                token_path,     "--ttl-seconds", "60",
+                "--tls-cert",   client_cert,     "--tls-key",
+                client_key,     "--tls-ca",      ca,
+            },
+            null,
+            0,
+            "enrollment token for node 2 written",
+            null,
+        );
+        const token_copy = try Io.Dir.cwd().readFileAlloc(
+            io,
+            token_path,
+            gpa,
+            .limited(128 * 1024 + 1),
+        );
+        defer gpa.free(token_copy);
+        try Io.Dir.cwd().writeFile(io, .{
+            .sub_path = replay_token_path,
+            .data = token_copy,
+            .flags = .{ .permissions = @enumFromInt(0o600) },
+        });
+        try expect(
+            gpa,
+            io,
+            "joining node generates CSR and installs identity",
+            &.{
+                "enroll",         "--token-file", token_path,
+                "--identity-dir", enrolled_dir,
+            },
+            null,
+            0,
+            "node 2 enrolled",
+            null,
+        );
+        const node2_cert = try std.fmt.allocPrint(gpa, "{s}/node.crt", .{enrolled_dir});
+        defer gpa.free(node2_cert);
+        const node2_key = try std.fmt.allocPrint(gpa, "{s}/node.key", .{enrolled_dir});
+        defer gpa.free(node2_key);
+        const node2_ca = try std.fmt.allocPrint(gpa, "{s}/ca.crt", .{enrolled_dir});
+        defer gpa.free(node2_ca);
+        const identity_stat = try Io.Dir.cwd().statFile(io, enrolled_dir, .{
+            .follow_symlinks = false,
+        });
+        const key_stat = try Io.Dir.cwd().statFile(io, node2_key, .{
+            .follow_symlinks = false,
+        });
+        if (@intFromEnum(identity_stat.permissions) & 0o077 != 0 or
+            @intFromEnum(key_stat.permissions) & 0o077 != 0)
+        {
+            std.debug.print("FAIL enrolled identity permissions are not owner-only\n", .{});
+            failures += 1;
+        } else {
+            std.debug.print("ok   enrolled identity directory and key are owner-only\n", .{});
+        }
+        try expect(
+            gpa,
+            io,
+            "enrolled identity authenticates over mTLS",
+            &.{
+                "status",     "--connect", listen,
+                "--tls-cert", node2_cert,  "--tls-key",
+                node2_key,    "--tls-ca",  node2_ca,
+                "--json",
+            },
+            null,
+            0,
+            "\"node_id\":1",
+            null,
+        );
+        try expect(
+            gpa,
+            io,
+            "consumed enrollment token cannot be replayed",
+            &.{
+                "enroll",         "--token-file", replay_token_path,
+                "--identity-dir", replay_dir,
+            },
+            null,
+            4,
+            null,
+            "ENROLLMENT REFUSED",
         );
         try expect(
             gpa,
@@ -720,6 +992,26 @@ pub fn main(init: std.process.Init) !u8 {
             null,
             "-- NO REACHABLE LEADER --",
         );
+        try Io.Dir.cwd().writeFile(io, .{
+            .sub_path = revocation_path,
+            .data = "2\n",
+        });
+        io.sleep(.fromMilliseconds(1500), .awake) catch {};
+        try expect(
+            gpa,
+            io,
+            "revoked node credential is refused as a client",
+            &.{
+                "status",     "--connect", listen,
+                "--tls-cert", node2_cert,  "--tls-key",
+                node2_key,    "--tls-ca",  node2_ca,
+                "--json",
+            },
+            null,
+            4,
+            null,
+            "-- NO REACHABLE LEADER --",
+        );
 
         try expect(
             gpa,
@@ -736,6 +1028,190 @@ pub fn main(init: std.process.Init) !u8 {
             null,
         );
         _ = try serve_child.wait(io);
+
+        // Regression for the quickstart: one mTLS seed may redirect a
+        // leader-only command to a different configured node. The new
+        // connection is accepted only when its certificate CN matches the
+        // advertised node ID.
+        var redirect_data: [3][]u8 = undefined;
+        var redirect_listen: [3][]u8 = undefined;
+        defer for (redirect_data) |path| gpa.free(path);
+        defer for (redirect_listen) |endpoint| gpa.free(endpoint);
+        var redirect_children = [_]?std.process.Child{null} ** 3;
+        defer for (&redirect_children) |*child| {
+            if (child.*) |*running| {
+                running.kill(io);
+                child.* = null;
+            }
+        };
+        for (0..3) |index| {
+            const id = index + 1;
+            redirect_data[index] = try std.fmt.allocPrint(
+                gpa,
+                "{s}/redirect-n{d}",
+                .{ tls_root, id },
+            );
+            redirect_listen[index] = try std.fmt.allocPrint(
+                gpa,
+                "127.0.0.1:{d}",
+                .{port + 10 + @as(u16, @intCast(index))},
+            );
+
+            var argv: std.ArrayList([]const u8) = .empty;
+            defer argv.deinit(gpa);
+            var scratch: std.ArrayList([]u8) = .empty;
+            defer {
+                for (scratch.items) |item| gpa.free(item);
+                scratch.deinit(gpa);
+            }
+            const id_text = try std.fmt.allocPrint(gpa, "{d}", .{id});
+            try scratch.append(gpa, id_text);
+            try argv.appendSlice(gpa, &.{
+                zaxon_path,
+                "serve",
+                "--data",
+                redirect_data[index],
+                "--node",
+                id_text,
+                "--listen",
+                redirect_listen[index],
+            });
+            for (0..3) |peer_index| {
+                if (peer_index == index) continue;
+                const peer = try std.fmt.allocPrint(
+                    gpa,
+                    "{d}@127.0.0.1:{d}",
+                    .{
+                        peer_index + 1,
+                        port + 10 + @as(u16, @intCast(peer_index)),
+                    },
+                );
+                try scratch.append(gpa, peer);
+                try argv.appendSlice(gpa, &.{ "--peer", peer });
+            }
+            const identity_name = switch (index) {
+                0 => "n1",
+                1 => "r2",
+                else => "r3",
+            };
+            const redirect_cert = try std.fmt.allocPrint(
+                gpa,
+                "{s}/{s}.crt",
+                .{ tls_root, identity_name },
+            );
+            try scratch.append(gpa, redirect_cert);
+            const redirect_key = try std.fmt.allocPrint(
+                gpa,
+                "{s}/{s}.key",
+                .{ tls_root, identity_name },
+            );
+            try scratch.append(gpa, redirect_key);
+            try argv.appendSlice(gpa, &.{
+                "--tls-cert", redirect_cert,
+                "--tls-key",  redirect_key,
+                "--tls-ca",   ca,
+                "--sync",     "os",
+            });
+            redirect_children[index] = try std.process.spawn(io, .{
+                .argv = argv.items,
+                .stdin = .ignore,
+                .stdout = .ignore,
+                .stderr = .ignore,
+            });
+        }
+
+        const redirect_seeds = try std.fmt.allocPrint(
+            gpa,
+            "{s},{s},{s}",
+            .{ redirect_listen[0], redirect_listen[1], redirect_listen[2] },
+        );
+        defer gpa.free(redirect_seeds);
+        var leader_id: u32 = 0;
+        for (0..120) |_| {
+            var result = try runCli(
+                gpa,
+                io,
+                &.{
+                    "leader",     "--connect", redirect_seeds,
+                    "--tls-cert", client_cert, "--tls-key",
+                    client_key,   "--tls-ca",  ca,
+                    "--json",
+                },
+                null,
+            );
+            defer result.deinit(gpa);
+            if (result.code == 0) {
+                const parsed = std.json.parseFromSlice(
+                    std.json.Value,
+                    gpa,
+                    result.stdout,
+                    .{},
+                ) catch null;
+                if (parsed) |value| {
+                    defer value.deinit();
+                    switch (value.value) {
+                        .object => |object| if (object.get("leader")) |leader| {
+                            switch (leader) {
+                                .object => |leader_object| {
+                                    if (leader_object.get("id")) |id_value| {
+                                        if (id_value == .integer and
+                                            id_value.integer > 0 and
+                                            id_value.integer <= 3)
+                                        {
+                                            leader_id = @intCast(id_value.integer);
+                                        }
+                                    }
+                                },
+                                else => {},
+                            }
+                        },
+                        else => {},
+                    }
+                }
+            }
+            if (leader_id != 0) break;
+            io.sleep(.fromMilliseconds(25), .awake) catch {};
+        }
+        if (leader_id == 0) {
+            failures += 1;
+            std.debug.print("FAIL mTLS redirect cluster never elected a leader\n", .{});
+        } else {
+            const follower_index: usize = if (leader_id == 1) 1 else 0;
+            try expect(
+                gpa,
+                io,
+                "mTLS single seed follows authenticated leader redirect",
+                &.{
+                    "exec",      "--connect",                                      redirect_listen[follower_index],
+                    "--sql",     "create table redirected(a integer primary key)", "--tls-cert",
+                    client_cert, "--tls-key",                                      client_key,
+                    "--tls-ca",  ca,
+                },
+                null,
+                0,
+                "0 row(s) changed",
+                null,
+            );
+        }
+        for (0..3) |index| {
+            var stopped = try runCli(
+                gpa,
+                io,
+                &.{
+                    "stop",       "--connect", redirect_listen[index],
+                    "--tls-cert", client_cert, "--tls-key",
+                    client_key,   "--tls-ca",  ca,
+                },
+                null,
+            );
+            stopped.deinit(gpa);
+        }
+        for (&redirect_children) |*child| {
+            if (child.*) |*running| {
+                _ = running.wait(io) catch {};
+                child.* = null;
+            }
+        }
     }
 
     // --- offline client mode ---------------------------------------------
