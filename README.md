@@ -227,6 +227,15 @@ zaxon recover --data ./d1
 See [`../docs/zds/records/0004-zaxonlite-format.typ`](../docs/zds/records/0004-zaxonlite-format.typ) for the
 wire/disk compatibility policy and upgrade procedure.
 
+`zaxon sql` opens the interactive shell (embedded or client mode). On a
+terminal it is a rich REPL — readline-style editing, arrow-key history with
+`ctrl+r` search, SQL keyword highlighting, aligned tables with an expanded
+mode and a pager, `.help` for the command list — built on the
+[libvaxis](https://github.com/rockorager/libvaxis) terminal layer per
+[ZDS 0005](../docs/zds/records/0005-zaxon-interactive-shell.typ). Piped or
+scripted invocations keep the historical plain line-reader output
+byte-for-byte.
+
 Exit codes: `0` ok, `1` SQL/session error, `2` usage, `3` integrity
 failure, `4` unavailable (locked, corrupt, or no reachable leader).
 
