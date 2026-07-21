@@ -1,0 +1,496 @@
+//! Shared CLI result rendering (ZDS 0005, M1).
+//!
+//! One renderer serves the one-shot commands and both shells, replacing the
+//! duplicated table writers that previously lived in `main.zig`. The plain
+//! writers here are the byte-exact legacy formats used by scripts and the
+//! CLI contract test; the rich formats live in `table.zig`.
+
+const std = @import("std");
+const zaxonlite = @import("zaxonlite");
+
+const client = zaxonlite.client;
+const diagnostic = zaxonlite.diagnostic;
+
+pub const exit_ok: u8 = 0;
+pub const exit_sql: u8 = 1;
+pub const exit_usage: u8 = 2;
+pub const exit_integrity: u8 = 3;
+pub const exit_unavailable: u8 = 4;
+
+/// A borrowed view of a query result: what both backends produce. Embedded
+/// results borrow from `zaxonlite.QueryResult`; remote results are built
+/// from the response JSON into an arena.
+pub const View = struct {
+    columns: []const []const u8,
+    rows: []const []const ?[]const u8,
+};
+
+pub fn viewOf(result: *const zaxonlite.QueryResult) View {
+    return .{ .columns = result.columns, .rows = result.rows };
+}
+
+/// The legacy `zaxon query` table: header-width rules, no alignment. Kept
+/// byte-identical for scripts and the non-TTY shell fallback.
+pub fn writePlainTable(view: View, out: *std.Io.Writer) !void {
+    for (view.columns, 0..) |column, index| {
+        if (index > 0) try out.writeAll(" | ");
+        try out.writeAll(column);
+    }
+    try out.writeAll("\n");
+    for (view.columns, 0..) |column, index| {
+        if (index > 0) try out.writeAll("-+-");
+        for (0..column.len) |_| try out.writeAll("-");
+    }
+    try out.writeAll("\n");
+    for (view.rows) |row| {
+        for (row, 0..) |cell, index| {
+            if (index > 0) try out.writeAll(" | ");
+            try out.writeAll(cell orelse "NULL");
+        }
+        try out.writeAll("\n");
+    }
+}
+
+pub fn writeJsonResult(view: View, out: *std.Io.Writer) !void {
+    try out.writeAll("{\"columns\":[");
+    for (view.columns, 0..) |column, index| {
+        if (index > 0) try out.writeAll(",");
+        try writeJsonString(out, column);
+    }
+    try out.writeAll("],\"rows\":[");
+    for (view.rows, 0..) |row, row_index| {
+        if (row_index > 0) try out.writeAll(",");
+        try out.writeAll("[");
+        for (row, 0..) |cell, index| {
+            if (index > 0) try out.writeAll(",");
+            if (cell) |text| {
+                try writeJsonString(out, text);
+            } else {
+                try out.writeAll("null");
+            }
+        }
+        try out.writeAll("]");
+    }
+    try out.writeAll("]}\n");
+}
+
+pub fn writeJsonString(out: *std.Io.Writer, text: []const u8) !void {
+    try out.writeAll("\"");
+    for (text) |byte| {
+        switch (byte) {
+            '"' => try out.writeAll("\\\""),
+            '\\' => try out.writeAll("\\\\"),
+            '\n' => try out.writeAll("\\n"),
+            '\r' => try out.writeAll("\\r"),
+            '\t' => try out.writeAll("\\t"),
+            else => {
+                if (byte < 0x20) {
+                    try out.print("\\u{x:0>4}", .{byte});
+                } else {
+                    try out.writeAll(&.{byte});
+                }
+            },
+        }
+    }
+    try out.writeAll("\"");
+}
+
+pub fn printStatus(node: *zaxonlite.Node, json: bool, out: *std.Io.Writer) !void {
+    const status = node.status();
+    const chain_hex = std.fmt.bytesToHex(status.chain, .lower);
+    if (json) {
+        try out.print(
+            "{{\"node_id\":{d},\"database_id\":\"{x:0>32}\"," ++
+                "\"configuration_id\":{d},\"role\":\"{s}\"," ++
+                "\"node_type\":\"{s}\"," ++
+                "\"leader\":{?d}," ++
+                "\"decided_slot\":{d},\"applied_slot\":{d}," ++
+                "\"journal_records\":{d},\"epoch_capacity\":{d}," ++
+                "\"chain\":\"{s}\",\"page_size\":{d},\"snapshot\":",
+            .{
+                status.node_id,          status.database_id,
+                status.configuration_id, status.role,
+                status.node_type,        status.leader,
+                status.decided_slot,     status.applied_slot,
+                status.journal_records,  status.epoch_capacity,
+                &chain_hex,              status.page_size,
+            },
+        );
+        if (status.snapshot) |name| {
+            try out.print("\"{s}\"}}\n", .{&name});
+        } else {
+            try out.writeAll("null}\n");
+        }
+    } else {
+        try out.print(
+            \\node id:          {d}
+            \\database id:      {x:0>32}
+            \\configuration id: {d}
+            \\role:             {s}
+            \\node type:        {s}
+            \\decided slot:     {d}
+            \\applied slot:     {d}
+            \\journal records:  {d}
+            \\epoch capacity:   {d}
+            \\chain:            {s}
+            \\page size:        {d}
+            \\snapshot:         {s}
+            \\
+        , .{
+            status.node_id,
+            status.database_id,
+            status.configuration_id,
+            status.role,
+            status.node_type,
+            status.decided_slot,
+            status.applied_slot,
+            status.journal_records,
+            status.epoch_capacity,
+            &chain_hex,
+            status.page_size,
+            if (status.snapshot) |name| &name else "(none)",
+        });
+    }
+}
+
+pub fn remoteHint(code: []const u8) []const u8 {
+    if (std.mem.eql(u8, code, "not_leader")) {
+        return "Retry the advertised leader or restore a voter quorum.";
+    }
+    if (std.mem.eql(u8, code, "stale")) {
+        return "Wait for learner catch-up, relax freshness, or query the leader.";
+    }
+    if (std.mem.eql(u8, code, "sql")) {
+        return "Correct the SQL statement; use exec for statements that write.";
+    }
+    if (std.mem.eql(u8, code, "session")) {
+        return "Retry only the latest sequence in the same unexpired session.";
+    }
+    return "Inspect node status and retry only when the reported condition is resolved.";
+}
+
+pub fn noLeaderDiagnostic(
+    err_out: *std.Io.Writer,
+    refused: ?client.RefusedLeaderHint,
+) !void {
+    if (refused) |hint| {
+        var message_buffer: [320]u8 = undefined;
+        var hint_buffer: [320]u8 = undefined;
+        const message = std.fmt.bufPrint(
+            &message_buffer,
+            "The cluster advertised leader node {d} at {s}:{d}, but " ++
+                "without mTLS the client cannot verify a redirect " ++
+                "target's identity and only contacts --connect endpoints.",
+            .{ hint.node_id, hint.host(), hint.port },
+        ) catch unreachable;
+        const advice = std.fmt.bufPrint(
+            &hint_buffer,
+            "Add {s}:{d} to --connect (list every member), or use mTLS " ++
+                "so redirects are followed with identity pinning.",
+            .{ hint.host(), hint.port },
+        ) catch unreachable;
+        return diagnostic.write(
+            err_out,
+            "leader redirect refused",
+            message,
+            advice,
+        );
+    }
+    try diagnostic.write(
+        err_out,
+        "no reachable leader",
+        "No seed endpoint or authenticated leader redirect could complete " ++
+            "this leader-only request.",
+        "Restore a voter quorum and verify credentials. With --dev-psk, " ++
+            "include every cluster member in --connect.",
+    );
+}
+
+pub fn malformedResponseDiagnostic(err_out: *std.Io.Writer) !void {
+    try diagnostic.write(
+        err_out,
+        "malformed response",
+        "The peer returned a body outside the Zaxonlite JSON contract.",
+        "Check protocol versions and preserve the peer log for diagnosis.",
+    );
+}
+
+/// Prints a remote response body for `command`. `json` passes the raw
+/// response through; otherwise a human summary is rendered per command.
+pub fn renderRemote(
+    gpa: std.mem.Allocator,
+    command: []const u8,
+    json: bool,
+    body: []const u8,
+    out: *std.Io.Writer,
+    err_out: *std.Io.Writer,
+) !u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch {
+        try malformedResponseDiagnostic(err_out);
+        return exit_unavailable;
+    };
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |*obj| obj,
+        else => {
+            try malformedResponseDiagnostic(err_out);
+            return exit_unavailable;
+        },
+    };
+
+    const ok = blk: {
+        const value = object.get("ok") orelse break :blk false;
+        break :blk value == .bool and value.bool;
+    };
+    if (!ok) {
+        const code = blk: {
+            const value = object.get("error") orelse break :blk "unknown";
+            break :blk if (value == .string) value.string else "unknown";
+        };
+        const message = blk: {
+            const value = object.get("message") orelse break :blk "";
+            break :blk if (value == .string) value.string else "";
+        };
+        // Integrity reports carry ok=false with detail fields.
+        if (std.mem.eql(u8, command, "integrity-check") and
+            object.get("sqlite_ok") != null)
+        {
+            if (json) {
+                try out.print("{s}\n", .{body});
+            } else {
+                try out.writeAll("integrity: FAIL\n");
+            }
+            return exit_integrity;
+        }
+        if (json) {
+            try out.print("{s}\n", .{body});
+        } else {
+            try diagnostic.write(err_out, code, message, remoteHint(code));
+        }
+        if (std.mem.eql(u8, code, "sql") or std.mem.eql(u8, code, "session")) {
+            return exit_sql;
+        }
+        if (std.mem.eql(u8, code, "bad_request")) return exit_usage;
+        return exit_unavailable;
+    }
+
+    if (json) {
+        try out.print("{s}\n", .{body});
+        return exit_ok;
+    }
+
+    if (std.mem.eql(u8, command, "exec")) {
+        const changes = jsonInt(object.get("changes")) orelse 0;
+        const replayed = blk: {
+            const value = object.get("replayed") orelse break :blk false;
+            break :blk value == .bool and value.bool;
+        };
+        if (replayed) {
+            try out.print("replayed: {d} row(s) changed (recorded result)\n", .{changes});
+        } else {
+            try out.print("{d} row(s) changed\n", .{changes});
+        }
+    } else if (std.mem.eql(u8, command, "query")) {
+        try renderRemoteTable(object, out);
+    } else if (std.mem.eql(u8, command, "session")) {
+        try out.print("session {d}\n", .{jsonInt(object.get("session_id")) orelse 0});
+    } else if (std.mem.eql(u8, command, "leader")) {
+        if (object.get("leader")) |leader| switch (leader) {
+            .object => |leader_object| {
+                const id = jsonInt(leader_object.get("id")) orelse 0;
+                if (leader_object.get("host")) |host| {
+                    if (host == .string) {
+                        try out.print("leader: node {d} at {s}:{d}\n", .{
+                            id,
+                            host.string,
+                            jsonInt(leader_object.get("port")) orelse 0,
+                        });
+                        return exit_ok;
+                    }
+                }
+                try out.print("leader: node {d}\n", .{id});
+            },
+            else => try out.writeAll("leader: none\n"),
+        };
+    } else if (std.mem.eql(u8, command, "wait")) {
+        try out.print("applied {d}, leader {?d}\n", .{
+            jsonInt(object.get("applied_slot")) orelse 0,
+            jsonInt(object.get("leader")),
+        });
+    } else if (std.mem.eql(u8, command, "snapshot")) {
+        try out.print(
+            "snapshot installed; now at configuration {d}\n",
+            .{jsonInt(object.get("configuration_id")) orelse 0},
+        );
+    } else if (std.mem.eql(u8, command, "integrity-check")) {
+        try out.writeAll("integrity: pass\n");
+    } else if (std.mem.eql(u8, command, "expire-sessions")) {
+        try out.print("{d} session(s) expired\n", .{jsonInt(object.get("expired")) orelse 0});
+    } else {
+        try out.print("{s}\n", .{body});
+    }
+    return exit_ok;
+}
+
+pub fn jsonInt(value: ?std.json.Value) ?i64 {
+    const v = value orelse return null;
+    return switch (v) {
+        .integer => |n| n,
+        else => null,
+    };
+}
+
+pub fn renderRemoteTable(
+    object: *const std.json.ObjectMap,
+    out: *std.Io.Writer,
+) !void {
+    const columns = object.get("columns") orelse return;
+    const rows = object.get("rows") orelse return;
+    if (columns != .array or rows != .array) return;
+    for (columns.array.items, 0..) |column, index| {
+        if (index > 0) try out.writeAll(" | ");
+        if (column == .string) try out.writeAll(column.string);
+    }
+    try out.writeAll("\n");
+    for (columns.array.items, 0..) |column, index| {
+        if (index > 0) try out.writeAll("-+-");
+        const len = if (column == .string) column.string.len else 4;
+        for (0..len) |_| try out.writeAll("-");
+    }
+    try out.writeAll("\n");
+    for (rows.array.items) |row| {
+        if (row != .array) continue;
+        for (row.array.items, 0..) |cell, index| {
+            if (index > 0) try out.writeAll(" | ");
+            switch (cell) {
+                .string => |text| try out.writeAll(text),
+                .null => try out.writeAll("NULL"),
+                .integer => |n| try out.print("{d}", .{n}),
+                .float => |f| try out.print("{d}", .{f}),
+                else => try out.writeAll("?"),
+            }
+        }
+        try out.writeAll("\n");
+    }
+}
+
+/// Runs one embedded write and prints its outcome: the shared body of the
+/// `exec` command and the plain shell.
+pub fn execEmbedded(
+    node: *zaxonlite.Node,
+    sql: [:0]const u8,
+    session: ?u64,
+    sequence: ?u64,
+    json: bool,
+    out: *std.Io.Writer,
+    err_out: *std.Io.Writer,
+) !u8 {
+    const result = blk: {
+        if (session) |value| {
+            break :blk node.execIdempotent(value, sequence.?, sql);
+        }
+        break :blk node.exec(sql);
+    } catch |err| switch (err) {
+        error.SqliteError, error.SqliteBusy => {
+            try diagnostic.write(
+                err_out,
+                "sql error",
+                node.lastSqliteMessage(),
+                "Correct the statement and retry it as a new request.",
+            );
+            return exit_sql;
+        },
+        error.UnknownSession, error.SequenceGap, error.ResultExpired => {
+            try diagnostic.write(
+                err_out,
+                "session error",
+                @errorName(err),
+                "Use the same live session and its next monotonic sequence.",
+            );
+            return exit_sql;
+        },
+        else => return err,
+    };
+    if (json) {
+        try out.print(
+            "{{\"changes\":{d},\"slot\":{d},\"replayed\":{}}}\n",
+            .{ result.changes, result.slot, result.replayed },
+        );
+    } else if (result.replayed) {
+        try out.print("replayed: {d} row(s) changed (recorded result)\n", .{result.changes});
+    } else {
+        try out.print("{d} row(s) changed\n", .{result.changes});
+    }
+    return exit_ok;
+}
+
+/// Runs one embedded read and prints the legacy table or JSON shape: the
+/// shared body of the `query` command and the plain shell.
+pub fn queryEmbedded(
+    gpa: std.mem.Allocator,
+    node: *zaxonlite.Node,
+    sql: []const u8,
+    json: bool,
+    out: *std.Io.Writer,
+    err_out: *std.Io.Writer,
+) !u8 {
+    var result = node.query(gpa, sql) catch |err| switch (err) {
+        error.SqliteError, error.SqliteBusy, error.WriteInReadQuery => {
+            const message = if (err == error.WriteInReadQuery)
+                "statement is not read-only; use exec"
+            else
+                node.lastSqliteMessage();
+            try diagnostic.write(
+                err_out,
+                "query error",
+                message,
+                "Use query only for read-only SQL; use exec for writes.",
+            );
+            return exit_sql;
+        },
+        else => return err,
+    };
+    defer result.deinit();
+
+    if (json) {
+        try writeJsonResult(viewOf(&result), out);
+    } else {
+        try writePlainTable(viewOf(&result), out);
+    }
+    return exit_ok;
+}
+
+/// Builds a borrowed `View` from a remote query response object. Integer and
+/// float cells are formatted into the arena; string and null cells borrow
+/// from the parsed JSON, so the parsed value must outlive the view.
+pub fn remoteView(
+    arena: std.mem.Allocator,
+    object: *const std.json.ObjectMap,
+) !?View {
+    const columns_value = object.get("columns") orelse return null;
+    const rows_value = object.get("rows") orelse return null;
+    if (columns_value != .array or rows_value != .array) return null;
+
+    const columns = try arena.alloc([]const u8, columns_value.array.items.len);
+    for (columns_value.array.items, 0..) |column, index| {
+        columns[index] = if (column == .string) column.string else "?";
+    }
+    const rows = try arena.alloc([]const ?[]const u8, rows_value.array.items.len);
+    var row_count: usize = 0;
+    for (rows_value.array.items) |row_value| {
+        if (row_value != .array) continue;
+        const row = try arena.alloc(?[]const u8, row_value.array.items.len);
+        for (row_value.array.items, 0..) |cell, index| {
+            row[index] = switch (cell) {
+                .string => |text| text,
+                .null => null,
+                .integer => |n| try std.fmt.allocPrint(arena, "{d}", .{n}),
+                .float => |f| try std.fmt.allocPrint(arena, "{d}", .{f}),
+                else => "?",
+            };
+        }
+        rows[row_count] = row;
+        row_count += 1;
+    }
+    return .{ .columns = columns, .rows = rows[0..row_count] };
+}

@@ -455,6 +455,63 @@ pub fn main(init: std.process.Init) !u8 {
         "count(*)",
         null,
     );
+    // The non-TTY fallback is a contract (ZDS 0005): the legacy unaligned
+    // table shape, byte for byte, so piped automation never changes.
+    try expect(
+        gpa,
+        io,
+        "piped shell keeps the legacy table format",
+        &.{ "sql", "--data", data },
+        "select 1 as a, 'x' as b;\n.quit\n",
+        0,
+        "a | b\n--+--\n1 | x\n",
+        null,
+    );
+    try expect(
+        gpa,
+        io,
+        "piped shell keeps legacy dot commands",
+        &.{ "sql", "--data", data },
+        ".tables\n.quit\n",
+        0,
+        "name\n----\nt\n",
+        null,
+    );
+    try expect(
+        gpa,
+        io,
+        "piped shell rejects unknown dot commands",
+        &.{ "sql", "--data", data },
+        ".bogus\n.quit\n",
+        0,
+        null,
+        "-- UNKNOWN SHELL COMMAND --",
+    );
+    try expect(
+        gpa,
+        io,
+        "shell flags are accepted outside a TTY",
+        &.{ "sql", "--data", data, "--no-color", "--no-history" },
+        "select count(*) from t;\n.quit\n",
+        0,
+        "count(*)",
+        null,
+    );
+    {
+        // The piped fallback must never create a history file.
+        const history_file = try std.fmt.allocPrint(
+            gpa,
+            "{s}/.zaxon_history",
+            .{data},
+        );
+        defer gpa.free(history_file);
+        if (Io.Dir.cwd().access(io, history_file, .{})) |_| {
+            failures += 1;
+            std.debug.print("FAIL piped shell wrote a history file\n", .{});
+        } else |_| {
+            std.debug.print("ok   piped shell writes no history file\n", .{});
+        }
+    }
 
     // --- locking --------------------------------------------------------
     {

@@ -12,6 +12,13 @@
 
 const std = @import("std");
 const zaxonlite = @import("zaxonlite");
+const cli_shell = @import("cli/shell.zig");
+const cli_render = @import("cli/render.zig");
+const cli_term = @import("cli/term.zig");
+
+/// The terminal layer's panic handler restores the operator's terminal
+/// before the default panic runs; a no-op unless the rich shell is active.
+pub const panic = cli_term.Panic;
 
 const Node = zaxonlite.Node;
 const server = zaxonlite.server;
@@ -96,6 +103,8 @@ const usage_text =
     \\                      loss) or os (plain fsync; faster, development only).
     \\  --enable-failpoints Honor failpoint RPCs (test controllers only).
     \\  --json              Machine-readable output on stdout.
+    \\  --no-color          Plain shell output even on a color terminal.
+    \\  --no-history        Never write the interactive shell history file.
     \\
     \\Exit codes: 0 ok, 1 SQL/session error, 2 usage, 3 integrity failure,
     \\4 node unavailable (locked, corrupt, or no leader).
@@ -137,6 +146,8 @@ const Options = struct {
     dev_psk: bool = false,
     insecure_test_tcp: bool = false,
     json: bool = false,
+    no_color: bool = false,
+    no_history: bool = false,
 };
 
 pub fn main(init: std.process.Init) !u8 {
@@ -288,6 +299,10 @@ fn run(
             options.insecure_test_tcp = true;
         } else if (std.mem.eql(u8, arg, "--json")) {
             options.json = true;
+        } else if (std.mem.eql(u8, arg, "--no-color")) {
+            options.no_color = true;
+        } else if (std.mem.eql(u8, arg, "--no-history")) {
+            options.no_history = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             try out.writeAll(usage_text);
             return exit_ok;
@@ -402,7 +417,7 @@ fn run(
             .secret = secret_bytes,
             .tls = if (tls_context) |*context| context else null,
         };
-        return remote(gpa, io, &options, transport, out, err_out);
+        return remote(gpa, io, environ, &options, transport, out, err_out);
     }
 
     const data = options.data orelse
@@ -431,13 +446,34 @@ fn run(
     defer node.close();
 
     if (std.mem.eql(u8, command, "sql")) {
-        return shell(gpa, io, node, out, err_out);
+        const history_path = try std.fmt.allocPrint(
+            gpa,
+            "{s}/.zaxon_history",
+            .{data},
+        );
+        defer gpa.free(history_path);
+        return cli_shell.run(gpa, io, environ, .{ .embedded = node }, .{
+            .no_color = options.no_color,
+            .no_history = options.no_history,
+            .history_path = history_path,
+        }, out, err_out);
     } else if (std.mem.eql(u8, command, "exec")) {
         const sql = options.sql orelse return usageError(err_out, "exec needs --sql");
-        return execCommand(node, sql, options, out, err_out);
+        if ((options.session == null) != (options.sequence == null)) {
+            return usageError(err_out, "--session and --sequence go together");
+        }
+        return cli_render.execEmbedded(
+            node,
+            sql,
+            options.session,
+            options.sequence,
+            options.json,
+            out,
+            err_out,
+        );
     } else if (std.mem.eql(u8, command, "query")) {
         const sql = options.sql orelse return usageError(err_out, "query needs --sql");
-        return queryCommand(gpa, node, sql, options.json, out, err_out);
+        return cli_render.queryEmbedded(gpa, node, sql, options.json, out, err_out);
     } else if (std.mem.eql(u8, command, "session")) {
         const session = try node.openSession();
         if (options.json) {
@@ -447,7 +483,7 @@ fn run(
         }
         return exit_ok;
     } else if (std.mem.eql(u8, command, "status")) {
-        try printStatus(node, options.json, out);
+        try cli_render.printStatus(node, options.json, out);
         return exit_ok;
     } else if (std.mem.eql(u8, command, "members")) {
         const status = node.status();
@@ -626,68 +662,6 @@ fn usageError(err_out: *std.Io.Writer, message: []const u8) !u8 {
     return exit_usage;
 }
 
-fn noLeaderDiagnostic(
-    err_out: *std.Io.Writer,
-    refused: ?client.RefusedLeaderHint,
-) !void {
-    if (refused) |hint| {
-        var message_buffer: [320]u8 = undefined;
-        var hint_buffer: [320]u8 = undefined;
-        const message = std.fmt.bufPrint(
-            &message_buffer,
-            "The cluster advertised leader node {d} at {s}:{d}, but " ++
-                "without mTLS the client cannot verify a redirect " ++
-                "target's identity and only contacts --connect endpoints.",
-            .{ hint.node_id, hint.host(), hint.port },
-        ) catch unreachable;
-        const advice = std.fmt.bufPrint(
-            &hint_buffer,
-            "Add {s}:{d} to --connect (list every member), or use mTLS " ++
-                "so redirects are followed with identity pinning.",
-            .{ hint.host(), hint.port },
-        ) catch unreachable;
-        return diagnostic.write(
-            err_out,
-            "leader redirect refused",
-            message,
-            advice,
-        );
-    }
-    try diagnostic.write(
-        err_out,
-        "no reachable leader",
-        "No seed endpoint or authenticated leader redirect could complete " ++
-            "this leader-only request.",
-        "Restore a voter quorum and verify credentials. With --dev-psk, " ++
-            "include every cluster member in --connect.",
-    );
-}
-
-fn malformedResponseDiagnostic(err_out: *std.Io.Writer) !void {
-    try diagnostic.write(
-        err_out,
-        "malformed response",
-        "The peer returned a body outside the Zaxonlite JSON contract.",
-        "Check protocol versions and preserve the peer log for diagnosis.",
-    );
-}
-
-fn remoteHint(code: []const u8) []const u8 {
-    if (std.mem.eql(u8, code, "not_leader")) {
-        return "Retry the advertised leader or restore a voter quorum.";
-    }
-    if (std.mem.eql(u8, code, "stale")) {
-        return "Wait for learner catch-up, relax freshness, or query the leader.";
-    }
-    if (std.mem.eql(u8, code, "sql")) {
-        return "Correct the SQL statement; use exec for statements that write.";
-    }
-    if (std.mem.eql(u8, code, "session")) {
-        return "Retry only the latest sequence in the same unexpired session.";
-    }
-    return "Inspect node status and retry only when the reported condition is resolved.";
-}
-
 fn passFail(ok: bool) []const u8 {
     return if (ok) "pass" else "FAIL";
 }
@@ -846,6 +820,7 @@ fn parseEndpoints(
 fn remote(
     gpa: std.mem.Allocator,
     io: std.Io,
+    environ: *std.process.Environ.Map,
     options: *Options,
     transport: client.Transport,
     out: *std.Io.Writer,
@@ -857,7 +832,18 @@ fn remote(
 
     const command = options.command;
     if (std.mem.eql(u8, command, "sql")) {
-        return remoteShell(gpa, io, endpoints.items, transport, out, err_out);
+        var cluster = client.ClusterConnection.init(
+            gpa,
+            io,
+            endpoints.items,
+            transport,
+        );
+        defer cluster.deinit();
+        return cli_shell.run(gpa, io, environ, .{ .remote = &cluster }, .{
+            .no_color = options.no_color,
+            .no_history = options.no_history,
+            .history_path = environ.get("ZAXON_HISTORY"),
+        }, out, err_out);
     }
     if (std.mem.eql(u8, command, "backup")) {
         const destination = options.to orelse
@@ -873,7 +859,7 @@ fn remote(
             "{\"op\":\"query\",\"sql\":\"select 1\"}",
             true,
         ) catch {
-            try noLeaderDiagnostic(err_out, probe_cluster.refused_leader_hint);
+            try cli_render.noLeaderDiagnostic(err_out, probe_cluster.refused_leader_hint);
             return exit_unavailable;
         };
         defer probe.deinit(gpa);
@@ -920,7 +906,7 @@ fn remote(
             return usageError(err_out, "--session and --sequence go together");
         }
         try writer.writeAll("{\"op\":\"exec\",\"sql\":");
-        try writeJsonString(writer, sql);
+        try cli_render.writeJsonString(writer, sql);
         if (options.session) |session| {
             try writer.print(
                 ",\"session\":{d},\"sequence\":{d}",
@@ -933,7 +919,7 @@ fn remote(
         const level = options.level orelse "linearizable";
         require_leader = !std.mem.eql(u8, level, "any");
         try writer.writeAll("{\"op\":\"query\",\"sql\":");
-        try writeJsonString(writer, sql);
+        try cli_render.writeJsonString(writer, sql);
         try writer.print(",\"level\":\"{s}\"", .{level});
         if (options.freshness_ms) |freshness| {
             try writer.print(",\"freshness_ms\":{d}", .{freshness});
@@ -1009,7 +995,7 @@ fn remote(
     );
     defer cluster.deinit();
     var result = cluster.call(request.written(), require_leader) catch {
-        try noLeaderDiagnostic(err_out, cluster.refused_leader_hint);
+        try cli_render.noLeaderDiagnostic(err_out, cluster.refused_leader_hint);
         return exit_unavailable;
     };
     defer {
@@ -1026,7 +1012,14 @@ fn remote(
             err_out,
         );
     }
-    return renderRemote(gpa, options, result.body, out, err_out);
+    return cli_render.renderRemote(
+        gpa,
+        options.command,
+        options.json,
+        result.body,
+        out,
+        err_out,
+    );
 }
 
 fn saveEnrollmentBundle(
@@ -1050,7 +1043,7 @@ fn saveEnrollmentBundle(
     const parsed = std.json.parseFromSlice(Response, gpa, result.body, .{
         .ignore_unknown_fields = true,
     }) catch {
-        try malformedResponseDiagnostic(err_out);
+        try cli_render.malformedResponseDiagnostic(err_out);
         return exit_unavailable;
     };
     defer parsed.deinit();
@@ -1068,16 +1061,16 @@ fn saveEnrollmentBundle(
         response.database_id.len != 32 or response.token.len != 64 or
         response.expires_unix_seconds == 0 or result.endpoint.unix_path != null)
     {
-        try malformedResponseDiagnostic(err_out);
+        try cli_render.malformedResponseDiagnostic(err_out);
         return exit_unavailable;
     }
     var secret: [enrollment.token_bytes]u8 = undefined;
     _ = std.fmt.hexToBytes(&secret, response.token) catch {
-        try malformedResponseDiagnostic(err_out);
+        try cli_render.malformedResponseDiagnostic(err_out);
         return exit_unavailable;
     };
     const database_id = std.fmt.parseInt(u128, response.database_id, 16) catch {
-        try malformedResponseDiagnostic(err_out);
+        try cli_render.malformedResponseDiagnostic(err_out);
         return exit_unavailable;
     };
     const ca_pem = std.Io.Dir.cwd().readFileAlloc(
@@ -1212,548 +1205,4 @@ fn enrollCommand(
         );
     }
     return exit_ok;
-}
-
-/// Prints a response body. `--json` passes the raw response through;
-/// otherwise a human summary is rendered per command.
-fn renderRemote(
-    gpa: std.mem.Allocator,
-    options: *Options,
-    body: []const u8,
-    out: *std.Io.Writer,
-    err_out: *std.Io.Writer,
-) !u8 {
-    const parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch {
-        try malformedResponseDiagnostic(err_out);
-        return exit_unavailable;
-    };
-    defer parsed.deinit();
-    const object = switch (parsed.value) {
-        .object => |*obj| obj,
-        else => {
-            try malformedResponseDiagnostic(err_out);
-            return exit_unavailable;
-        },
-    };
-
-    const ok = blk: {
-        const value = object.get("ok") orelse break :blk false;
-        break :blk value == .bool and value.bool;
-    };
-    if (!ok) {
-        const code = blk: {
-            const value = object.get("error") orelse break :blk "unknown";
-            break :blk if (value == .string) value.string else "unknown";
-        };
-        const message = blk: {
-            const value = object.get("message") orelse break :blk "";
-            break :blk if (value == .string) value.string else "";
-        };
-        // Integrity reports carry ok=false with detail fields.
-        if (std.mem.eql(u8, options.command, "integrity-check") and
-            object.get("sqlite_ok") != null)
-        {
-            if (options.json) {
-                try out.print("{s}\n", .{body});
-            } else {
-                try out.writeAll("integrity: FAIL\n");
-            }
-            return exit_integrity;
-        }
-        if (options.json) {
-            try out.print("{s}\n", .{body});
-        } else {
-            try diagnostic.write(err_out, code, message, remoteHint(code));
-        }
-        if (std.mem.eql(u8, code, "sql") or std.mem.eql(u8, code, "session")) {
-            return exit_sql;
-        }
-        if (std.mem.eql(u8, code, "bad_request")) return exit_usage;
-        return exit_unavailable;
-    }
-
-    if (options.json) {
-        try out.print("{s}\n", .{body});
-        return exit_ok;
-    }
-
-    const command = options.command;
-    if (std.mem.eql(u8, command, "exec")) {
-        const changes = jsonInt(object.get("changes")) orelse 0;
-        const replayed = blk: {
-            const value = object.get("replayed") orelse break :blk false;
-            break :blk value == .bool and value.bool;
-        };
-        if (replayed) {
-            try out.print("replayed: {d} row(s) changed (recorded result)\n", .{changes});
-        } else {
-            try out.print("{d} row(s) changed\n", .{changes});
-        }
-    } else if (std.mem.eql(u8, command, "query")) {
-        try renderRemoteTable(object, out);
-    } else if (std.mem.eql(u8, command, "session")) {
-        try out.print("session {d}\n", .{jsonInt(object.get("session_id")) orelse 0});
-    } else if (std.mem.eql(u8, command, "leader")) {
-        if (object.get("leader")) |leader| switch (leader) {
-            .object => |leader_object| {
-                const id = jsonInt(leader_object.get("id")) orelse 0;
-                if (leader_object.get("host")) |host| {
-                    if (host == .string) {
-                        try out.print("leader: node {d} at {s}:{d}\n", .{
-                            id,
-                            host.string,
-                            jsonInt(leader_object.get("port")) orelse 0,
-                        });
-                        return exit_ok;
-                    }
-                }
-                try out.print("leader: node {d}\n", .{id});
-            },
-            else => try out.writeAll("leader: none\n"),
-        };
-    } else if (std.mem.eql(u8, command, "wait")) {
-        try out.print("applied {d}, leader {?d}\n", .{
-            jsonInt(object.get("applied_slot")) orelse 0,
-            jsonInt(object.get("leader")),
-        });
-    } else if (std.mem.eql(u8, command, "snapshot")) {
-        try out.print(
-            "snapshot installed; now at configuration {d}\n",
-            .{jsonInt(object.get("configuration_id")) orelse 0},
-        );
-    } else if (std.mem.eql(u8, command, "integrity-check")) {
-        try out.writeAll("integrity: pass\n");
-    } else if (std.mem.eql(u8, command, "expire-sessions")) {
-        try out.print("{d} session(s) expired\n", .{jsonInt(object.get("expired")) orelse 0});
-    } else if (std.mem.eql(u8, command, "status")) {
-        try out.print("{s}\n", .{body});
-    } else if (std.mem.eql(u8, command, "members")) {
-        try out.print("{s}\n", .{body});
-    } else {
-        try out.print("{s}\n", .{body});
-    }
-    return exit_ok;
-}
-
-fn jsonInt(value: ?std.json.Value) ?i64 {
-    const v = value orelse return null;
-    return switch (v) {
-        .integer => |n| n,
-        else => null,
-    };
-}
-
-fn renderRemoteTable(
-    object: *const std.json.ObjectMap,
-    out: *std.Io.Writer,
-) !void {
-    const columns = object.get("columns") orelse return;
-    const rows = object.get("rows") orelse return;
-    if (columns != .array or rows != .array) return;
-    for (columns.array.items, 0..) |column, index| {
-        if (index > 0) try out.writeAll(" | ");
-        if (column == .string) try out.writeAll(column.string);
-    }
-    try out.writeAll("\n");
-    for (columns.array.items, 0..) |column, index| {
-        if (index > 0) try out.writeAll("-+-");
-        const len = if (column == .string) column.string.len else 4;
-        for (0..len) |_| try out.writeAll("-");
-    }
-    try out.writeAll("\n");
-    for (rows.array.items) |row| {
-        if (row != .array) continue;
-        for (row.array.items, 0..) |cell, index| {
-            if (index > 0) try out.writeAll(" | ");
-            switch (cell) {
-                .string => |text| try out.writeAll(text),
-                .null => try out.writeAll("NULL"),
-                .integer => |n| try out.print("{d}", .{n}),
-                .float => |f| try out.print("{d}", .{f}),
-                else => try out.writeAll("?"),
-            }
-        }
-        try out.writeAll("\n");
-    }
-}
-
-fn remoteShell(
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    endpoints: []const client.Endpoint,
-    transport: client.Transport,
-    out: *std.Io.Writer,
-    err_out: *std.Io.Writer,
-) !u8 {
-    try out.print(
-        "zaxonlite {s} — connected shell\n" ++
-            "SQL statements end my line; dot commands: .status .quit\n",
-        .{zaxonlite.version},
-    );
-    var stdin_buffer: [64 * 1024]u8 = undefined;
-    var stdin_reader = std.Io.File.stdin().readerStreaming(io, &stdin_buffer);
-    const in = &stdin_reader.interface;
-    var cluster = client.ClusterConnection.init(gpa, io, endpoints, transport);
-    defer cluster.deinit();
-
-    while (true) {
-        try out.writeAll("zaxon> ");
-        try out.flush();
-        const raw_line = in.takeDelimiter('\n') catch |err| switch (err) {
-            error.StreamTooLong => {
-                try diagnostic.write(
-                    err_out,
-                    "input line too long",
-                    "The shell statement exceeds its bounded input buffer.",
-                    "Split the statement or run a smaller --sql request.",
-                );
-                try err_out.flush();
-                continue;
-            },
-            else => return err,
-        };
-        const line_bytes = raw_line orelse break;
-        const line = std.mem.trim(u8, line_bytes, " \t\r");
-        if (line.len == 0) continue;
-
-        var request: std.Io.Writer.Allocating = .init(gpa);
-        defer request.deinit();
-        var pseudo = Options{ .command = "query" };
-        if (line[0] == '.') {
-            if (std.mem.eql(u8, line, ".quit") or std.mem.eql(u8, line, ".exit")) break;
-            if (std.mem.eql(u8, line, ".status")) {
-                try request.writer.writeAll("{\"op\":\"status\"}");
-                pseudo.command = "status";
-                pseudo.json = true;
-            } else {
-                try diagnostic.write(
-                    err_out,
-                    "unknown shell command",
-                    line,
-                    "Use .status or .quit, or enter a SQL statement.",
-                );
-                try err_out.flush();
-                continue;
-            }
-        } else if (isReadStatement(line)) {
-            try request.writer.writeAll("{\"op\":\"query\",\"sql\":");
-            try writeJsonString(&request.writer, line);
-            try request.writer.writeAll(",\"level\":\"linearizable\"}");
-        } else {
-            pseudo.command = "exec";
-            try request.writer.writeAll("{\"op\":\"exec\",\"sql\":");
-            try writeJsonString(&request.writer, line);
-            try request.writer.writeAll("}");
-        }
-
-        var result = cluster.call(request.written(), true) catch {
-            try noLeaderDiagnostic(err_out, cluster.refused_leader_hint);
-            try err_out.flush();
-            continue;
-        };
-        defer result.deinit(gpa);
-        _ = try renderRemote(gpa, &pseudo, result.body, out, err_out);
-        try out.flush();
-        try err_out.flush();
-    }
-    return exit_ok;
-}
-
-// ----------------------------------------------------------------------
-// exec / query (embedded)
-// ----------------------------------------------------------------------
-
-fn execCommand(
-    node: *Node,
-    sql: [:0]const u8,
-    options: Options,
-    out: *std.Io.Writer,
-    err_out: *std.Io.Writer,
-) !u8 {
-    if ((options.session == null) != (options.sequence == null)) {
-        return usageError(err_out, "--session and --sequence go together");
-    }
-    const result = blk: {
-        if (options.session) |session| {
-            break :blk node.execIdempotent(session, options.sequence.?, sql);
-        }
-        break :blk node.exec(sql);
-    } catch |err| switch (err) {
-        error.SqliteError, error.SqliteBusy => {
-            try diagnostic.write(
-                err_out,
-                "sql error",
-                node.lastSqliteMessage(),
-                "Correct the statement and retry it as a new request.",
-            );
-            return exit_sql;
-        },
-        error.UnknownSession, error.SequenceGap, error.ResultExpired => {
-            try diagnostic.write(
-                err_out,
-                "session error",
-                @errorName(err),
-                "Use the same live session and its next monotonic sequence.",
-            );
-            return exit_sql;
-        },
-        else => return err,
-    };
-    if (options.json) {
-        try out.print(
-            "{{\"changes\":{d},\"slot\":{d},\"replayed\":{}}}\n",
-            .{ result.changes, result.slot, result.replayed },
-        );
-    } else if (result.replayed) {
-        try out.print("replayed: {d} row(s) changed (recorded result)\n", .{result.changes});
-    } else {
-        try out.print("{d} row(s) changed\n", .{result.changes});
-    }
-    return exit_ok;
-}
-
-fn queryCommand(
-    gpa: std.mem.Allocator,
-    node: *Node,
-    sql: []const u8,
-    json: bool,
-    out: *std.Io.Writer,
-    err_out: *std.Io.Writer,
-) !u8 {
-    var result = node.query(gpa, sql) catch |err| switch (err) {
-        error.SqliteError, error.SqliteBusy, error.WriteInReadQuery => {
-            const message = if (err == error.WriteInReadQuery)
-                "statement is not read-only; use exec"
-            else
-                node.lastSqliteMessage();
-            try diagnostic.write(
-                err_out,
-                "query error",
-                message,
-                "Use query only for read-only SQL; use exec for writes.",
-            );
-            return exit_sql;
-        },
-        else => return err,
-    };
-    defer result.deinit();
-
-    if (json) {
-        try writeJsonResult(&result, out);
-    } else {
-        try writeTable(&result, out);
-    }
-    return exit_ok;
-}
-
-fn writeTable(result: *const zaxonlite.QueryResult, out: *std.Io.Writer) !void {
-    for (result.columns, 0..) |column, index| {
-        if (index > 0) try out.writeAll(" | ");
-        try out.writeAll(column);
-    }
-    try out.writeAll("\n");
-    for (result.columns, 0..) |column, index| {
-        if (index > 0) try out.writeAll("-+-");
-        for (0..column.len) |_| try out.writeAll("-");
-    }
-    try out.writeAll("\n");
-    for (result.rows) |row| {
-        for (row, 0..) |cell, index| {
-            if (index > 0) try out.writeAll(" | ");
-            try out.writeAll(cell orelse "NULL");
-        }
-        try out.writeAll("\n");
-    }
-}
-
-fn writeJsonResult(result: *const zaxonlite.QueryResult, out: *std.Io.Writer) !void {
-    try out.writeAll("{\"columns\":[");
-    for (result.columns, 0..) |column, index| {
-        if (index > 0) try out.writeAll(",");
-        try writeJsonString(out, column);
-    }
-    try out.writeAll("],\"rows\":[");
-    for (result.rows, 0..) |row, row_index| {
-        if (row_index > 0) try out.writeAll(",");
-        try out.writeAll("[");
-        for (row, 0..) |cell, index| {
-            if (index > 0) try out.writeAll(",");
-            if (cell) |text| {
-                try writeJsonString(out, text);
-            } else {
-                try out.writeAll("null");
-            }
-        }
-        try out.writeAll("]");
-    }
-    try out.writeAll("]}\n");
-}
-
-fn writeJsonString(out: *std.Io.Writer, text: []const u8) !void {
-    try out.writeAll("\"");
-    for (text) |byte| {
-        switch (byte) {
-            '"' => try out.writeAll("\\\""),
-            '\\' => try out.writeAll("\\\\"),
-            '\n' => try out.writeAll("\\n"),
-            '\r' => try out.writeAll("\\r"),
-            '\t' => try out.writeAll("\\t"),
-            else => {
-                if (byte < 0x20) {
-                    try out.print("\\u{x:0>4}", .{byte});
-                } else {
-                    try out.writeAll(&.{byte});
-                }
-            },
-        }
-    }
-    try out.writeAll("\"");
-}
-
-fn printStatus(node: *Node, json: bool, out: *std.Io.Writer) !void {
-    const status = node.status();
-    const chain_hex = std.fmt.bytesToHex(status.chain, .lower);
-    if (json) {
-        try out.print(
-            "{{\"node_id\":{d},\"database_id\":\"{x:0>32}\"," ++
-                "\"configuration_id\":{d},\"role\":\"{s}\"," ++
-                "\"node_type\":\"{s}\"," ++
-                "\"leader\":{?d}," ++
-                "\"decided_slot\":{d},\"applied_slot\":{d}," ++
-                "\"journal_records\":{d},\"epoch_capacity\":{d}," ++
-                "\"chain\":\"{s}\",\"page_size\":{d},\"snapshot\":",
-            .{
-                status.node_id,          status.database_id,
-                status.configuration_id, status.role,
-                status.node_type,        status.leader,
-                status.decided_slot,     status.applied_slot,
-                status.journal_records,  status.epoch_capacity,
-                &chain_hex,              status.page_size,
-            },
-        );
-        if (status.snapshot) |name| {
-            try out.print("\"{s}\"}}\n", .{&name});
-        } else {
-            try out.writeAll("null}\n");
-        }
-    } else {
-        try out.print(
-            \\node id:          {d}
-            \\database id:      {x:0>32}
-            \\configuration id: {d}
-            \\role:             {s}
-            \\node type:        {s}
-            \\decided slot:     {d}
-            \\applied slot:     {d}
-            \\journal records:  {d}
-            \\epoch capacity:   {d}
-            \\chain:            {s}
-            \\page size:        {d}
-            \\snapshot:         {s}
-            \\
-        , .{
-            status.node_id,
-            status.database_id,
-            status.configuration_id,
-            status.role,
-            status.node_type,
-            status.decided_slot,
-            status.applied_slot,
-            status.journal_records,
-            status.epoch_capacity,
-            &chain_hex,
-            status.page_size,
-            if (status.snapshot) |name| &name else "(none)",
-        });
-    }
-}
-
-// ----------------------------------------------------------------------
-// Interactive shell (embedded)
-// ----------------------------------------------------------------------
-
-fn shell(
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    node: *Node,
-    out: *std.Io.Writer,
-    err_out: *std.Io.Writer,
-) !u8 {
-    try out.print(
-        "zaxonlite {s} — one durable node, journal-replicated SQLite\n" ++
-            "SQL statements end my line; dot commands: .status .tables .quit\n",
-        .{zaxonlite.version},
-    );
-    var stdin_buffer: [64 * 1024]u8 = undefined;
-    var stdin_reader = std.Io.File.stdin().readerStreaming(io, &stdin_buffer);
-    const in = &stdin_reader.interface;
-
-    while (true) {
-        try out.writeAll("zaxon> ");
-        try out.flush();
-        const raw_line = in.takeDelimiter('\n') catch |err| switch (err) {
-            error.StreamTooLong => {
-                try diagnostic.write(
-                    err_out,
-                    "input line too long",
-                    "The shell statement exceeds its bounded input buffer.",
-                    "Split the statement or run a smaller --sql request.",
-                );
-                try err_out.flush();
-                continue;
-            },
-            else => return err,
-        };
-        const line_bytes = raw_line orelse break;
-        const line = std.mem.trim(u8, line_bytes, " \t\r");
-        if (line.len == 0) continue;
-
-        if (line[0] == '.') {
-            if (std.mem.eql(u8, line, ".quit") or std.mem.eql(u8, line, ".exit")) break;
-            if (std.mem.eql(u8, line, ".status")) {
-                try printStatus(node, false, out);
-                continue;
-            }
-            if (std.mem.eql(u8, line, ".tables")) {
-                _ = try queryCommand(
-                    gpa,
-                    node,
-                    "select name from sqlite_master where type = 'table' " ++
-                        "and name not like '\\_\\_zaxon\\_%' escape '\\' order by name",
-                    false,
-                    out,
-                    err_out,
-                );
-                continue;
-            }
-            try diagnostic.write(
-                err_out,
-                "unknown shell command",
-                line,
-                "Use .status, .tables, or .quit, or enter SQL.",
-            );
-            try err_out.flush();
-            continue;
-        }
-
-        if (isReadStatement(line)) {
-            _ = try queryCommand(gpa, node, line, false, out, err_out);
-        } else {
-            const sql = try gpa.dupeZ(u8, line);
-            defer gpa.free(sql);
-            _ = try execCommand(node, sql, .{ .command = "exec" }, out, err_out);
-        }
-        try err_out.flush();
-    }
-    return exit_ok;
-}
-
-fn isReadStatement(sql: []const u8) bool {
-    var iterator = std.mem.tokenizeAny(u8, sql, " \t(");
-    const first = iterator.next() orelse return false;
-    const keywords = [_][]const u8{ "select", "with", "values", "explain" };
-    for (keywords) |keyword| {
-        if (std.ascii.eqlIgnoreCase(first, keyword)) return true;
-    }
-    return false;
 }
