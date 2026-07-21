@@ -65,7 +65,11 @@ const CClusterOptions = extern struct {
     cluster_id: ?[*:0]const u8,
     auth_secret: ?*const anyopaque,
     auth_secret_length: usize,
+    tls_cert_path: ?[*:0]const u8,
+    tls_key_path: ?[*:0]const u8,
+    tls_ca_path: ?[*:0]const u8,
     startup_timeout_ms: u64,
+    allow_insecure_test_tcp: bool,
 };
 
 const CValue = extern struct {
@@ -208,13 +212,28 @@ export fn zaxonlite_cluster_open(
         10_000
     else
         options.startup_timeout_ms;
+    const any_tls = options.tls_cert_path != null or
+        options.tls_key_path != null or options.tls_ca_path != null;
+    if (any_tls and (options.tls_cert_path == null or
+        options.tls_key_path == null or options.tls_ca_path == null))
+    {
+        handle.threaded.deinit();
+        gpa.destroy(handle);
+        return misuse_code;
+    }
     handle.embedded = Embedded.open(gpa, handle.threaded.io(), .{
         .directory = std.mem.span(directory),
         .node_id = options.node_id,
         .members = members,
         .cluster_id = if (options.cluster_id) |text| std.mem.span(text) else null,
         .auth_secret = secret,
+        .tls = if (any_tls) .{
+            .cert_path = std.mem.span(options.tls_cert_path.?),
+            .key_path = std.mem.span(options.tls_key_path.?),
+            .ca_path = std.mem.span(options.tls_ca_path.?),
+        } else null,
         .startup_timeout_ms = timeout,
+        .allow_insecure_test_tcp = options.allow_insecure_test_tcp,
     }) catch {
         handle.threaded.deinit();
         gpa.destroy(handle);

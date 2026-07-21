@@ -44,6 +44,34 @@ if [ ! -x "$zaxon_bin" ]; then
     exit 2
 fi
 require_command "$dqlite_demo"
+require_command openssl
+
+# Production Zaxon TCP is mTLS-only. Keep the comparison self-contained with
+# an ephemeral CA and one identity per node plus one client identity.
+openssl ecparam -name prime256v1 -genkey -noout -out "$run_dir/ca.key"
+chmod 600 "$run_dir/ca.key"
+openssl req -new -x509 -key "$run_dir/ca.key" -sha256 -days 1 \
+    -subj /CN=zaxon-benchmark-ca \
+    -addext basicConstraints=critical,CA:TRUE \
+    -addext keyUsage=critical,keyCertSign,cRLSign \
+    -out "$run_dir/ca.crt"
+issue_cert() {
+    name=$1
+    common_name=$2
+    openssl ecparam -name prime256v1 -genkey -noout -out "$run_dir/$name.key"
+    chmod 600 "$run_dir/$name.key"
+    openssl req -new -key "$run_dir/$name.key" -subj "/CN=$common_name" \
+        -out "$run_dir/$name.csr"
+    printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nsubjectAltName=DNS:%s\nextendedKeyUsage=serverAuth,clientAuth\n' \
+        "$common_name" >"$run_dir/$name.ext"
+    openssl x509 -req -in "$run_dir/$name.csr" -CA "$run_dir/ca.crt" \
+        -CAkey "$run_dir/ca.key" -CAcreateserial -days 1 -sha256 \
+        -extfile "$run_dir/$name.ext" -out "$run_dir/$name.crt"
+}
+issue_cert n1 zaxon-node-1
+issue_cert n2 zaxon-node-2
+issue_cert n3 zaxon-node-3
+issue_cert client zaxon-client
 
 wait_port() {
     "$python_bin" - "$1" "$2" <<'PY'
@@ -75,6 +103,8 @@ start_zaxon() {
     # shellcheck disable=SC2086
     "$zaxon_bin" serve --data "$run_dir/zaxon-$index" --node "$index" \
         --listen "127.0.0.1:$port" --cluster-id fair-3node $args \
+        --tls-cert "$run_dir/n$index.crt" \
+        --tls-key "$run_dir/n$index.key" --tls-ca "$run_dir/ca.crt" \
         >"$run_dir/zaxon-$index.log" 2>&1 &
     pids="$pids $!"
 }
@@ -111,9 +141,12 @@ wait_port 127.0.0.1 "$((base_port + 101))"
 wait_port 127.0.0.1 "$((base_port + 102))"
 
 common_args="--operations $operations --warmup $warmup --payload-bytes $payload_bytes"
+zaxon_addresses="127.0.0.1:$base_port,127.0.0.1:$((base_port + 1)),127.0.0.1:$((base_port + 2))"
 # shellcheck disable=SC2086
-"$python_bin" "$script_dir/driver.py" zaxonlite "127.0.0.1:$base_port" \
-    $common_args >"$run_dir/zaxon.json"
+"$python_bin" "$script_dir/driver.py" zaxonlite "$zaxon_addresses" \
+    $common_args --tls-cert "$run_dir/client.crt" \
+    --tls-key "$run_dir/client.key" --tls-ca "$run_dir/ca.crt" \
+    >"$run_dir/zaxon.json"
 # shellcheck disable=SC2086
 "$python_bin" "$script_dir/driver.py" dqlite \
     "127.0.0.1:$((base_port + 100))" $common_args >"$run_dir/dqlite.json"

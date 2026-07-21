@@ -66,7 +66,13 @@ typedef struct zaxonlite_cluster_options {
     const char *cluster_id;
     const void *auth_secret;
     size_t auth_secret_length;
+    /* All three TLS paths are required together for production TCP. */
+    const char *tls_cert_path;
+    const char *tls_key_path;
+    const char *tls_ca_path;
     uint64_t startup_timeout_ms;
+    /* Tests only: requires the library's failpoint-gated transport path. */
+    bool allow_insecure_test_tcp;
 } zaxonlite_cluster_options;
 
 typedef enum zaxonlite_value_type {

@@ -167,6 +167,7 @@ int main(int argc, char **argv) {
         .member_count = 2,
         .cluster_id = "c-api-smoke",
         .startup_timeout_ms = 5000,
+        .allow_insecure_test_tcp = true,
     };
     zaxonlite_cluster *cluster = NULL;
     CHECK("cluster facade open",
@@ -208,6 +209,7 @@ int main(int argc, char **argv) {
             .member_count = 2,
             .cluster_id = "c-api-smoke",
             .startup_timeout_ms = 5000,
+            .allow_insecure_test_tcp = true,
         };
         zaxonlite_cluster *gateway = NULL;
         CHECK("gateway C facade open",

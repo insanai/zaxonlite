@@ -6,6 +6,7 @@ import http.client
 import json
 import math
 import socket
+import ssl
 import statistics
 import struct
 import time
@@ -36,8 +37,10 @@ def summary(system, latencies, elapsed, operations, payload_bytes):
 
 
 class Zaxon:
-    def __init__(self, address):
+    def __init__(self, address, tls_cert, tls_key, tls_ca):
         self.addresses = address.split(",")
+        self.tls = ssl.create_default_context(cafile=tls_ca)
+        self.tls.load_cert_chain(tls_cert, tls_key)
         self.address_index = 0
         self.socket = None
         self.connect(0)
@@ -47,8 +50,10 @@ class Zaxon:
             self.socket.close()
         self.address_index = index
         host, port = self.addresses[index].rsplit(":", 1)
-        self.socket = socket.create_connection((host, int(port)), timeout=10)
-        hello = struct.pack("<HB", 4, 1)
+        raw = socket.create_connection((host, int(port)), timeout=10)
+        self.socket = self.tls.wrap_socket(
+            raw, server_hostname=f"zaxon-node-{index + 1}")
+        hello = struct.pack("<HB", 6, 1)
         hello += struct.pack("<I", 0) + bytes(16) + struct.pack("<Q", 0)
         self.send_frame(1, hello)
 
@@ -96,8 +101,8 @@ def receive_exact(stream, length):
     return bytes(chunks)
 
 
-def benchmark_zaxon(address, operations, warmup, payload_bytes):
-    client = Zaxon(address)
+def benchmark_zaxon(address, operations, warmup, payload_bytes, args):
+    client = Zaxon(address, args.tls_cert, args.tls_key, args.tls_ca)
     try:
         client.call({"op": "exec", "sql":
                      "create table if not exists bench(k integer primary key, v blob)"})
@@ -127,7 +132,7 @@ def benchmark_zaxon(address, operations, warmup, payload_bytes):
         client.close()
 
 
-def benchmark_dqlite(address, operations, warmup, payload_bytes):
+def benchmark_dqlite(address, operations, warmup, payload_bytes, _args):
     host, port = address.rsplit(":", 1)
     connection = http.client.HTTPConnection(host, int(port), timeout=10)
     value = b"x" * payload_bytes
@@ -151,7 +156,7 @@ def benchmark_dqlite(address, operations, warmup, payload_bytes):
         connection.close()
 
 
-def benchmark_rqlite(address, operations, warmup, payload_bytes):
+def benchmark_rqlite(address, operations, warmup, payload_bytes, _args):
     host, port = address.rsplit(":", 1)
     connection = http.client.HTTPConnection(host, int(port), timeout=30)
     value = "x" * payload_bytes
@@ -237,9 +242,15 @@ def main():
     parser.add_argument("--operations", type=int, default=1000)
     parser.add_argument("--warmup", type=int, default=100)
     parser.add_argument("--payload-bytes", type=int, default=256)
+    parser.add_argument("--tls-cert")
+    parser.add_argument("--tls-key")
+    parser.add_argument("--tls-ca")
     args = parser.parse_args()
     if args.operations <= 0 or args.warmup < 0 or args.payload_bytes < 1:
         parser.error("operation counts and payload size must be positive")
+    if args.system == "zaxonlite" and not all(
+            (args.tls_cert, args.tls_key, args.tls_ca)):
+        parser.error("zaxonlite requires --tls-cert, --tls-key, and --tls-ca")
     functions = {
         "zaxonlite": benchmark_zaxon,
         "dqlite": benchmark_dqlite,
@@ -247,7 +258,7 @@ def main():
     }
     function = functions[args.system]
     print(json.dumps(function(args.address, args.operations, args.warmup,
-                              args.payload_bytes), sort_keys=True))
+                              args.payload_bytes, args), sort_keys=True))
 
 
 if __name__ == "__main__":

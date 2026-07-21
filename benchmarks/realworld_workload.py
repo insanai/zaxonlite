@@ -8,6 +8,7 @@ import json
 import math
 import random
 import socket
+import ssl
 import statistics
 import struct
 import time
@@ -305,10 +306,12 @@ def receive_exact(stream, length):
 
 
 class ZaxonWireConnection:
-    def __init__(self, endpoint, timeout=5):
+    def __init__(self, endpoint, tls_context, node_id, timeout=5):
         self.endpoint = endpoint
-        self.socket = socket.create_connection(endpoint, timeout=timeout)
-        hello = struct.pack("<HB", 4, 1)
+        raw = socket.create_connection(endpoint, timeout=timeout)
+        self.socket = tls_context.wrap_socket(
+            raw, server_hostname=f"zaxon-node-{node_id}")
+        hello = struct.pack("<HB", 6, 1)
         hello += struct.pack("<I", 0) + bytes(16) + struct.pack("<Q", 0)
         self.send_frame(1, hello)
 
@@ -328,8 +331,9 @@ class ZaxonWireConnection:
         return json.loads(frame[1:])
 
 
-def zaxon_call_once(endpoint, request, timeout=5):
-    connection = ZaxonWireConnection(endpoint, timeout)
+def zaxon_call_once(endpoint, request, tls_context, node_id, timeout=5):
+    connection = ZaxonWireConnection(
+        endpoint, tls_context, node_id, timeout)
     try:
         return connection.call(request)
     finally:
@@ -337,8 +341,9 @@ def zaxon_call_once(endpoint, request, timeout=5):
 
 
 class ZaxonClient:
-    def __init__(self, endpoints, start_index=0, retry_timeout=30):
+    def __init__(self, endpoints, tls_context, start_index=0, retry_timeout=30):
         self.endpoints = endpoints
+        self.tls_context = tls_context
         self.index = start_index % len(endpoints)
         self.retry_timeout = retry_timeout
         self.connection = None
@@ -363,7 +368,9 @@ class ZaxonClient:
             attempts += 1
             try:
                 if self.connection is None:
-                    self.connection = ZaxonWireConnection(self.endpoints[self.index])
+                    self.connection = ZaxonWireConnection(
+                        self.endpoints[self.index], self.tls_context,
+                        self.index + 1)
                 response = self.connection.call(request)
             except (EOFError, OSError, TimeoutError, ValueError) as error:
                 last_error = error

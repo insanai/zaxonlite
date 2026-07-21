@@ -41,6 +41,7 @@ require_command() {
 require_command "$python_bin"
 require_command "$rqlited_bin"
 require_command "$rqlite_cli"
+require_command openssl
 if [ ! -x "$zaxon_bin" ]; then
     echo "benchmark: build zaxon first or set ZAXON_BIN" >&2
     exit 2
@@ -52,6 +53,33 @@ printf '%s\n' "$zaxon_bin" >"$run_dir/zaxon.path"
 "$rqlited_bin" -version >"$run_dir/rqlited.version" 2>&1
 "$rqlite_cli" -v >"$run_dir/rqlite-cli.version" 2>&1
 "$zaxon_bin" version >"$run_dir/zaxon.version" 2>&1
+
+# Production Zaxon TCP is mTLS-only. Generate one ephemeral benchmark CA,
+# one identity per configured node, and one single-principal client identity.
+openssl ecparam -name prime256v1 -genkey -noout -out "$run_dir/ca.key"
+chmod 600 "$run_dir/ca.key"
+openssl req -new -x509 -key "$run_dir/ca.key" -sha256 -days 1 \
+    -subj /CN=zaxon-benchmark-ca \
+    -addext basicConstraints=critical,CA:TRUE \
+    -addext keyUsage=critical,keyCertSign,cRLSign \
+    -out "$run_dir/ca.crt"
+issue_cert() {
+    name=$1
+    common_name=$2
+    openssl ecparam -name prime256v1 -genkey -noout -out "$run_dir/$name.key"
+    chmod 600 "$run_dir/$name.key"
+    openssl req -new -key "$run_dir/$name.key" -subj "/CN=$common_name" \
+        -out "$run_dir/$name.csr"
+    printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nsubjectAltName=DNS:%s\nextendedKeyUsage=serverAuth,clientAuth\n' \
+        "$common_name" >"$run_dir/$name.ext"
+    openssl x509 -req -in "$run_dir/$name.csr" -CA "$run_dir/ca.crt" \
+        -CAkey "$run_dir/ca.key" -CAcreateserial -days 1 -sha256 \
+        -extfile "$run_dir/$name.ext" -out "$run_dir/$name.crt"
+}
+issue_cert n1 zaxon-node-1
+issue_cert n2 zaxon-node-2
+issue_cert n3 zaxon-node-3
+issue_cert client zaxon-client
 
 wait_port() {
     "$python_bin" - "$1" "$2" <<'PY'
@@ -103,6 +131,8 @@ start_zaxon() {
     # shellcheck disable=SC2086
     "$zaxon_bin" serve --data "$run_dir/zaxon-$index" --node "$index" \
         --listen "127.0.0.1:$port" --cluster-id fair-3node-rqlite $args \
+        --tls-cert "$run_dir/n$index.crt" \
+        --tls-key "$run_dir/n$index.key" --tls-ca "$run_dir/ca.crt" \
         >"$run_dir/zaxon-$index.log" 2>&1 &
     pids="$pids $!"
 }
@@ -149,7 +179,9 @@ common_args="--operations $operations --warmup $warmup --payload-bytes $payload_
 zaxon_addresses="127.0.0.1:$base_port,127.0.0.1:$((base_port + 1)),127.0.0.1:$((base_port + 2))"
 # shellcheck disable=SC2086
 "$python_bin" "$script_dir/driver.py" zaxonlite "$zaxon_addresses" \
-    $common_args >"$run_dir/zaxon.json"
+    $common_args --tls-cert "$run_dir/client.crt" \
+    --tls-key "$run_dir/client.key" --tls-ca "$run_dir/ca.crt" \
+    >"$run_dir/zaxon.json"
 # shellcheck disable=SC2086
 "$python_bin" "$script_dir/driver.py" rqlite \
     "127.0.0.1:$((base_port + 100))" $common_args >"$run_dir/rqlite.json"
@@ -173,7 +205,8 @@ print(json.dumps({
     "run_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     "rules": {
         "nodes": 3,
-        "durability": "persistent quorum state and node directories",
+        "durability": "persistent quorum state and node directories; macOS full fsync defaults",
+        "zaxon_transport": "TLS 1.3 mutual authentication",
         "client": "one sequential persistent connection",
         "transaction": "one row per autocommit",
         "queued_writes": False,

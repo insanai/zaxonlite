@@ -10,6 +10,7 @@ from pathlib import Path
 import platform
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -110,6 +111,54 @@ class ZaxonCluster:
         self.binary = binary
         self.endpoints = [("127.0.0.1", base_port + index) for index in range(3)]
         self.children = ProcessSet(run_dir, "zaxon")
+        self.ca_path = run_dir / "zaxon-ca.crt"
+        self.client_cert = run_dir / "zaxon-client.crt"
+        self.client_key = run_dir / "zaxon-client.key"
+        self._generate_pki()
+        self.tls_context = ssl.create_default_context(cafile=str(self.ca_path))
+        self.tls_context.load_cert_chain(
+            str(self.client_cert), str(self.client_key))
+
+    def _openssl(self, *arguments):
+        subprocess.run(
+            ["openssl", *map(str, arguments)], check=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def _generate_pki(self):
+        ca_key = self.run_dir / "zaxon-ca.key"
+        self._openssl("ecparam", "-name", "prime256v1", "-genkey", "-noout",
+                      "-out", ca_key)
+        ca_key.chmod(0o600)
+        self._openssl(
+            "req", "-new", "-x509", "-key", ca_key, "-sha256", "-days", "1",
+            "-subj", "/CN=zaxon-realworld-ca",
+            "-addext", "basicConstraints=critical,CA:TRUE",
+            "-addext", "keyUsage=critical,keyCertSign,cRLSign",
+            "-out", self.ca_path)
+        for name, common_name in [
+                ("zaxon-node-1", "zaxon-node-1"),
+                ("zaxon-node-2", "zaxon-node-2"),
+                ("zaxon-node-3", "zaxon-node-3"),
+                ("zaxon-client", "zaxon-client")]:
+            key = self.run_dir / f"{name}.key"
+            csr = self.run_dir / f"{name}.csr"
+            cert = self.run_dir / f"{name}.crt"
+            extensions = self.run_dir / f"{name}.ext"
+            self._openssl("ecparam", "-name", "prime256v1", "-genkey",
+                          "-noout", "-out", key)
+            key.chmod(0o600)
+            self._openssl("req", "-new", "-key", key, "-subj",
+                          f"/CN={common_name}", "-out", csr)
+            extensions.write_text(
+                "basicConstraints=critical,CA:FALSE\n"
+                "keyUsage=critical,digitalSignature\n"
+                f"subjectAltName=DNS:{common_name}\n"
+                "extendedKeyUsage=serverAuth,clientAuth\n",
+                encoding="utf-8")
+            self._openssl(
+                "x509", "-req", "-in", csr, "-CA", self.ca_path,
+                "-CAkey", ca_key, "-CAcreateserial", "-days", "1", "-sha256",
+                "-extfile", extensions, "-out", cert)
 
     def data_dir(self, index):
         return self.run_dir / f"zaxon-{index + 1}"
@@ -132,6 +181,9 @@ class ZaxonCluster:
             "--node", str(index + 1),
             "--listen", f"{host}:{port}",
             "--cluster-id", "realworld-failure-benchmark",
+            "--tls-cert", str(self.run_dir / f"zaxon-node-{index + 1}.crt"),
+            "--tls-key", str(self.run_dir / f"zaxon-node-{index + 1}.key"),
+            "--tls-ca", str(self.ca_path),
             *peers,
         ]
         self.children.spawn(index, command)
@@ -150,7 +202,9 @@ class ZaxonCluster:
     def leader_index(self):
         for endpoint in self.endpoints:
             try:
-                response = zaxon_call_once(endpoint, {"op": "leader"}, timeout=1)
+                response = zaxon_call_once(
+                    endpoint, {"op": "leader"}, self.tls_context,
+                    self.endpoints.index(endpoint) + 1, timeout=1)
             except (OSError, EOFError, TimeoutError, ValueError):
                 continue
             leader = response.get("leader")
@@ -168,7 +222,7 @@ class ZaxonCluster:
         raise TimeoutError("Zaxonlite did not elect a leader")
 
     def client_factory(self, worker_id):
-        return ZaxonClient(self.endpoints, worker_id)
+        return ZaxonClient(self.endpoints, self.tls_context, worker_id)
 
     def setup(self):
         client = self.client_factory(0)
@@ -183,7 +237,7 @@ class ZaxonCluster:
             "op": "query",
             "level": "any",
             "sql": INVARIANT_SQL,
-        }, timeout=2)
+        }, self.tls_context, index + 1, timeout=2)
         if not response.get("ok"):
             raise RuntimeError(str(response))
         return values_from_zaxon(response)
@@ -221,7 +275,8 @@ class ZaxonCluster:
         reports = {}
         for index in self.children.running_indices():
             response = zaxon_call_once(
-                self.endpoints[index], {"op": "integrity"}, timeout=10)
+                self.endpoints[index], {"op": "integrity"},
+                self.tls_context, index + 1, timeout=10)
             if not response.get("ok"):
                 raise RuntimeError(f"Zaxonlite integrity failed: {response}")
             reports[str(index + 1)] = response
