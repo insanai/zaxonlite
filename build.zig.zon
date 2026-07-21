@@ -9,6 +9,10 @@
             .url = "https://sqlite.org/2025/sqlite-amalgamation-3500400.zip",
             .hash = "N-V-__8AAHCbqABM_X5RTjbDBDBWErxZE8tJzmtEnLOLRHGx",
         },
+        .vaxis = .{
+            .url = "git+https://github.com/rockorager/libvaxis?ref=main#d63a23c593c9b82f0b2886840161fa1f1df983e9",
+            .hash = "vaxis-0.6.0-BWNV_DsLCgCcKudOoFkyrSgjxUeLAOSf1LxwezEeVieH",
+        },
     },
     .paths = .{
         "build.zig",

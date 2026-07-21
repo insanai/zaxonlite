@@ -54,6 +54,13 @@ pub fn build(b: *std.Build) void {
     const sqlite_dep = b.dependency("sqlite", .{});
     const sqlite_lib = addSqliteLibrary(b, sqlite_dep, target, optimize);
 
+    // Terminal layer for the interactive shell (ZDS 0005). Confined to the
+    // CLI: the zaxonlite library module never imports it.
+    const vaxis = b.dependency("vaxis", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("vaxis");
+
     const translate_c = b.addTranslateC(.{
         .root_source_file = sqlite_dep.path("sqlite3.h"),
         .target = target,
@@ -79,7 +86,10 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "zaxonlite", .module = zaxonlite }},
+            .imports = &.{
+                .{ .name = "zaxonlite", .module = zaxonlite },
+                .{ .name = "vaxis", .module = vaxis },
+            },
         }),
     });
     b.installArtifact(zaxon);
@@ -95,6 +105,26 @@ pub fn build(b: *std.Build) void {
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run the zaxonlite test suite");
     test_step.dependOn(&run_unit_tests.step);
+
+    // Pure state machines of the interactive shell: editor, history,
+    // highlighter, renderer. No TTY or node is spawned.
+    const cli_unit_mod = b.createModule(.{
+        .root_source_file = b.path("src/cli/tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zaxonlite", .module = zaxonlite },
+            .{ .name = "vaxis", .module = vaxis },
+        },
+    });
+    const cli_unit_tests = b.addTest(.{ .root_module = cli_unit_mod });
+    const run_cli_unit_tests = b.addRunArtifact(cli_unit_tests);
+    const cli_unit_step = b.step(
+        "test-shell",
+        "Run the interactive-shell unit tests",
+    );
+    cli_unit_step.dependOn(&run_cli_unit_tests.step);
+    test_step.dependOn(&run_cli_unit_tests.step);
 
     const integration_mod = b.createModule(.{
         .root_source_file = b.path("src/integration_test.zig"),
@@ -299,13 +329,20 @@ pub fn build(b: *std.Build) void {
 
     // Three-node cluster benchmark: ReleaseFast server binary driven by a
     // ReleaseFast controller, in plaintext, PSK, or mTLS transport mode.
+    const vaxis_fast = b.dependency("vaxis", .{
+        .target = target,
+        .optimize = std.builtin.OptimizeMode.ReleaseFast,
+    }).module("vaxis");
     const zaxon_fast = b.addExecutable(.{
         .name = "zaxon-fast",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = .ReleaseFast,
-            .imports = &.{.{ .name = "zaxonlite", .module = bench_zaxonlite }},
+            .imports = &.{
+                .{ .name = "zaxonlite", .module = bench_zaxonlite },
+                .{ .name = "vaxis", .module = vaxis_fast },
+            },
         }),
     });
     const cluster_bench_exe = b.addExecutable(.{
@@ -317,6 +354,14 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "zaxonlite", .module = bench_zaxonlite }},
         }),
     });
+    // Compile-only gate: the ReleaseFast binaries otherwise build only
+    // inside the benchmark run steps.
+    const check_step = b.step("check", "Compile every binary without running");
+    check_step.dependOn(&zaxon.step);
+    check_step.dependOn(&zaxon_fast.step);
+    check_step.dependOn(&cluster_bench_exe.step);
+    check_step.dependOn(&bench_exe.step);
+
     const run_cluster_bench = b.addRunArtifact(cluster_bench_exe);
     run_cluster_bench.addArtifactArg(zaxon_fast);
     // Recorded runs update the JSON table the Zaxonlite book compiles in.
