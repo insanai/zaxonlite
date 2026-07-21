@@ -7,7 +7,7 @@ get a durable SQL store as one node or a transport-owning cluster. The
 run the same Paxos/SQLite node and on-disk layout. The companion CLI is `zaxon`.
 
 Product plan and safety argument:
-[`../docs/zaxonlite-product-plan.typ`](../docs/zaxonlite-product-plan.typ).
+[`../docs/zds/records/0002-zaxonlite-product-plan.typ`](../docs/zds/records/0002-zaxonlite-product-plan.typ).
 The full book (architecture, formats, operations, verification):
 `zig build book-zaxonlite` at the repository root →
 `docs/zaxonlite/zaxonlite.pdf`.
@@ -224,7 +224,7 @@ zaxon members --connect ...
 zaxon recover --data ./d1
 ```
 
-See [`../docs/zaxonlite-format.typ`](../docs/zaxonlite-format.typ) for the
+See [`../docs/zds/records/0004-zaxonlite-format.typ`](../docs/zds/records/0004-zaxonlite-format.typ) for the
 wire/disk compatibility policy and upgrade procedure.
 
 Exit codes: `0` ok, `1` SQL/session error, `2` usage, `3` integrity
