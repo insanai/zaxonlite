@@ -382,6 +382,10 @@ pub const ClusterConnection = struct {
     endpoint: ?Endpoint = null,
     next_endpoint: usize = 0,
     redirect_host_buffer: [64]u8 = undefined,
+    /// Set when the last `call` saw a leader advertisement it refused to
+    /// follow because the transport cannot authenticate node identity.
+    /// Lets callers explain the policy instead of a generic failure.
+    refused_leader_hint: ?RefusedLeaderHint = null,
 
     pub fn init(
         gpa: std.mem.Allocator,
@@ -425,6 +429,7 @@ pub const ClusterConnection = struct {
         require_leader: bool,
     ) !CallResult {
         if (self.endpoints.len == 0) return error.NoEndpoints;
+        self.refused_leader_hint = null;
         var redirect: ?Endpoint = null;
         var attempt: usize = 0;
         const max_attempts = 12;
@@ -457,6 +462,7 @@ pub const ClusterConnection = struct {
                 body,
                 self.transport.tls != null,
                 &self.redirect_host_buffer,
+                &self.refused_leader_hint,
             ) catch return self.result(body, endpoint);
             switch (leader) {
                 .not_redirect => return self.result(body, endpoint),
@@ -514,17 +520,33 @@ const Redirect = union(enum) {
     redirect: Endpoint,
 };
 
+/// A leader advertisement the client saw but refused to follow because the
+/// transport cannot authenticate the advertised node's identity.
+pub const RefusedLeaderHint = struct {
+    node_id: u32,
+    port: u16,
+    host_length: u8,
+    host_buffer: [64]u8,
+
+    pub fn host(self: *const RefusedLeaderHint) []const u8 {
+        return self.host_buffer[0..self.host_length];
+    }
+};
+
 /// Parses a `not_leader` response. Unauthenticated and PSK-only clients only
 /// follow configured targets: a shared PSK cannot bind a node identity.
 /// With mTLS, an advertised numeric address may leave the seed list because
 /// `Connection.openWithTransport` pins its certificate to the advertised
-/// node ID before sending the request.
+/// node ID before sending the request. A well-formed advertisement outside
+/// the seed list that policy forbids following is reported through
+/// `refused_hint` so callers can name the leader in diagnostics.
 fn leaderRedirect(
     gpa: std.mem.Allocator,
     endpoints: []const Endpoint,
     body: []const u8,
     allow_authenticated_advertisement: bool,
     redirect_host_buffer: *[64]u8,
+    refused_hint: ?*?RefusedLeaderHint,
 ) !Redirect {
     const parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch
         return .not_redirect;
@@ -583,6 +605,21 @@ fn leaderRedirect(
                         .expected_node_id = hinted_id,
                     } };
                 }
+                if (refused_hint) |slot| {
+                    if (host.?.string.len <= 64) {
+                        var record = RefusedLeaderHint{
+                            .node_id = hinted_id,
+                            .port = hinted_port,
+                            .host_length = @intCast(host.?.string.len),
+                            .host_buffer = undefined,
+                        };
+                        @memcpy(
+                            record.host_buffer[0..host.?.string.len],
+                            host.?.string,
+                        );
+                        slot.* = record;
+                    }
+                }
             }
         },
         else => {},
@@ -599,26 +636,59 @@ test "leader redirects leave the seed list only with mTLS identity pinning" {
         "\"leader\":{\"id\":3,\"host\":\"127.0.0.1\",\"port\":7003}}";
     var host_buffer: [64]u8 = undefined;
 
+    var refused: ?RefusedLeaderHint = null;
     const psk = try leaderRedirect(
         std.testing.allocator,
         &seeds,
         body,
         false,
         &host_buffer,
+        &refused,
     );
     try std.testing.expect(psk == .rotate);
+    try std.testing.expect(refused != null);
+    try std.testing.expectEqual(@as(u32, 3), refused.?.node_id);
+    try std.testing.expectEqual(@as(u16, 7003), refused.?.port);
+    try std.testing.expectEqualStrings("127.0.0.1", refused.?.host());
 
+    refused = null;
     const mtls = try leaderRedirect(
         std.testing.allocator,
         &seeds,
         body,
         true,
         &host_buffer,
+        &refused,
     );
     try std.testing.expect(mtls == .redirect);
+    try std.testing.expect(refused == null);
     try std.testing.expectEqual(@as(u16, 7003), mtls.redirect.port);
     try std.testing.expectEqual(@as(?u32, 3), mtls.redirect.expected_node_id);
     try std.testing.expectEqualStrings("127.0.0.1", mtls.redirect.host);
+}
+
+test "an advertised leader inside the seed list is followed without refusal" {
+    const seeds = [_]Endpoint{
+        .{ .host = "127.0.0.1", .port = 7001 },
+        .{ .host = "127.0.0.1", .port = 7003 },
+    };
+    const body =
+        "{\"ok\":false,\"error\":\"not_leader\"," ++
+        "\"leader\":{\"id\":3,\"host\":\"127.0.0.1\",\"port\":7003}}";
+    var host_buffer: [64]u8 = undefined;
+    var refused: ?RefusedLeaderHint = null;
+
+    const psk = try leaderRedirect(
+        std.testing.allocator,
+        &seeds,
+        body,
+        false,
+        &host_buffer,
+        &refused,
+    );
+    try std.testing.expect(psk == .redirect);
+    try std.testing.expect(refused == null);
+    try std.testing.expectEqual(@as(u16, 7003), psk.redirect.port);
 }
 
 test "endpoint parsing" {

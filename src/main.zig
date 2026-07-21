@@ -626,7 +626,33 @@ fn usageError(err_out: *std.Io.Writer, message: []const u8) !u8 {
     return exit_usage;
 }
 
-fn noLeaderDiagnostic(err_out: *std.Io.Writer) !void {
+fn noLeaderDiagnostic(
+    err_out: *std.Io.Writer,
+    refused: ?client.RefusedLeaderHint,
+) !void {
+    if (refused) |hint| {
+        var message_buffer: [320]u8 = undefined;
+        var hint_buffer: [320]u8 = undefined;
+        const message = std.fmt.bufPrint(
+            &message_buffer,
+            "The cluster advertised leader node {d} at {s}:{d}, but " ++
+                "without mTLS the client cannot verify a redirect " ++
+                "target's identity and only contacts --connect endpoints.",
+            .{ hint.node_id, hint.host(), hint.port },
+        ) catch unreachable;
+        const advice = std.fmt.bufPrint(
+            &hint_buffer,
+            "Add {s}:{d} to --connect (list every member), or use mTLS " ++
+                "so redirects are followed with identity pinning.",
+            .{ hint.host(), hint.port },
+        ) catch unreachable;
+        return diagnostic.write(
+            err_out,
+            "leader redirect refused",
+            message,
+            advice,
+        );
+    }
     try diagnostic.write(
         err_out,
         "no reachable leader",
@@ -836,15 +862,18 @@ fn remote(
     if (std.mem.eql(u8, command, "backup")) {
         const destination = options.to orelse
             return usageError(err_out, "backup needs --to");
-        var probe = client.callClusterWithTransport(
+        var probe_cluster = client.ClusterConnection.init(
             gpa,
             io,
             endpoints.items,
+            transport,
+        );
+        defer probe_cluster.deinit();
+        var probe = probe_cluster.call(
             "{\"op\":\"query\",\"sql\":\"select 1\"}",
             true,
-            transport,
         ) catch {
-            try noLeaderDiagnostic(err_out);
+            try noLeaderDiagnostic(err_out, probe_cluster.refused_leader_hint);
             return exit_unavailable;
         };
         defer probe.deinit(gpa);
@@ -972,15 +1001,15 @@ fn remote(
         return exit_usage;
     }
 
-    var result = client.callClusterWithTransport(
+    var cluster = client.ClusterConnection.init(
         gpa,
         io,
         endpoints.items,
-        request.written(),
-        require_leader,
         transport,
-    ) catch {
-        try noLeaderDiagnostic(err_out);
+    );
+    defer cluster.deinit();
+    var result = cluster.call(request.written(), require_leader) catch {
+        try noLeaderDiagnostic(err_out, cluster.refused_leader_hint);
         return exit_unavailable;
     };
     defer {
@@ -1418,7 +1447,7 @@ fn remoteShell(
         }
 
         var result = cluster.call(request.written(), true) catch {
-            try noLeaderDiagnostic(err_out);
+            try noLeaderDiagnostic(err_out, cluster.refused_leader_hint);
             try err_out.flush();
             continue;
         };
