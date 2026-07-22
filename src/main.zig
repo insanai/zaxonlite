@@ -200,122 +200,7 @@ fn run(
     };
     var options = Options{ .command = command };
     defer options.peers.deinit(gpa);
-
-    while (iterator.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--config")) {
-            options.config = iterator.next() orelse
-                return usageError(err_out, "--config needs a value");
-        } else if (std.mem.eql(u8, arg, "--data")) {
-            options.data = iterator.next() orelse return usageError(err_out, "--data needs a value");
-        } else if (std.mem.eql(u8, arg, "--connect")) {
-            options.connect = iterator.next() orelse return usageError(err_out, "--connect needs a value");
-        } else if (std.mem.eql(u8, arg, "--sql")) {
-            options.sql = iterator.next() orelse return usageError(err_out, "--sql needs a value");
-        } else if (std.mem.eql(u8, arg, "--session")) {
-            const text = iterator.next() orelse return usageError(err_out, "--session needs a value");
-            options.session = std.fmt.parseInt(u64, text, 10) catch
-                return usageError(err_out, "--session must be an integer");
-        } else if (std.mem.eql(u8, arg, "--sequence")) {
-            const text = iterator.next() orelse return usageError(err_out, "--sequence needs a value");
-            options.sequence = std.fmt.parseInt(u64, text, 10) catch
-                return usageError(err_out, "--sequence must be an integer");
-        } else if (std.mem.eql(u8, arg, "--level")) {
-            options.level = iterator.next() orelse return usageError(err_out, "--level needs a value");
-        } else if (std.mem.eql(u8, arg, "--freshness-ms")) {
-            const text = iterator.next() orelse
-                return usageError(err_out, "--freshness-ms needs a value");
-            options.freshness_ms = std.fmt.parseInt(u64, text, 10) catch
-                return usageError(err_out, "--freshness-ms must be an integer");
-        } else if (std.mem.eql(u8, arg, "--to")) {
-            options.to = iterator.next() orelse return usageError(err_out, "--to needs a value");
-        } else if (std.mem.eql(u8, arg, "--retain")) {
-            const text = iterator.next() orelse return usageError(err_out, "--retain needs a value");
-            options.retain = std.fmt.parseInt(u64, text, 10) catch
-                return usageError(err_out, "--retain must be an integer");
-        } else if (std.mem.eql(u8, arg, "--applied")) {
-            const text = iterator.next() orelse return usageError(err_out, "--applied needs a value");
-            options.applied = std.fmt.parseInt(u64, text, 10) catch
-                return usageError(err_out, "--applied must be an integer");
-        } else if (std.mem.eql(u8, arg, "--leader")) {
-            options.wait_leader = true;
-        } else if (std.mem.eql(u8, arg, "--timeout-ms")) {
-            const text = iterator.next() orelse return usageError(err_out, "--timeout-ms needs a value");
-            options.timeout_ms = std.fmt.parseInt(u64, text, 10) catch
-                return usageError(err_out, "--timeout-ms must be an integer");
-        } else if (std.mem.eql(u8, arg, "--node")) {
-            const text = iterator.next() orelse return usageError(err_out, "--node needs a value");
-            options.node_id = std.fmt.parseInt(u32, text, 10) catch
-                return usageError(err_out, "--node must be an integer");
-        } else if (std.mem.eql(u8, arg, "--listen")) {
-            options.listen = iterator.next() orelse return usageError(err_out, "--listen needs a value");
-        } else if (std.mem.eql(u8, arg, "--role")) {
-            const text = iterator.next() orelse
-                return usageError(err_out, "--role needs a value");
-            options.role = Role.parse(text) catch
-                return usageError(err_out, "--role is not a known node role");
-            options.role_set = true;
-        } else if (std.mem.eql(u8, arg, "--peer")) {
-            const text = iterator.next() orelse return usageError(err_out, "--peer needs a value");
-            try options.peers.append(gpa, text);
-        } else if (std.mem.eql(u8, arg, "--cluster-id")) {
-            options.cluster_id = iterator.next() orelse return usageError(err_out, "--cluster-id needs a value");
-        } else if (std.mem.eql(u8, arg, "--auth-file")) {
-            options.auth_file = iterator.next() orelse
-                return usageError(err_out, "--auth-file needs a value");
-        } else if (std.mem.eql(u8, arg, "--tls-cert")) {
-            options.tls_cert = iterator.next() orelse
-                return usageError(err_out, "--tls-cert needs a value");
-        } else if (std.mem.eql(u8, arg, "--tls-key")) {
-            options.tls_key = iterator.next() orelse
-                return usageError(err_out, "--tls-key needs a value");
-        } else if (std.mem.eql(u8, arg, "--tls-ca")) {
-            options.tls_ca = iterator.next() orelse
-                return usageError(err_out, "--tls-ca needs a value");
-        } else if (std.mem.eql(u8, arg, "--enrollment-ca-key")) {
-            options.enrollment_ca_key = iterator.next() orelse
-                return usageError(err_out, "--enrollment-ca-key needs a value");
-        } else if (std.mem.eql(u8, arg, "--token-file")) {
-            options.token_file = iterator.next() orelse
-                return usageError(err_out, "--token-file needs a value");
-        } else if (std.mem.eql(u8, arg, "--identity-dir")) {
-            options.identity_dir = iterator.next() orelse
-                return usageError(err_out, "--identity-dir needs a value");
-        } else if (std.mem.eql(u8, arg, "--ttl-seconds")) {
-            const text = iterator.next() orelse
-                return usageError(err_out, "--ttl-seconds needs a value");
-            options.ttl_seconds = std.fmt.parseInt(u64, text, 10) catch
-                return usageError(err_out, "--ttl-seconds must be an integer");
-        } else if (std.mem.eql(u8, arg, "--revocation-file")) {
-            options.revocation_file = iterator.next() orelse
-                return usageError(err_out, "--revocation-file needs a value");
-        } else if (std.mem.eql(u8, arg, "--sync")) {
-            options.sync = iterator.next() orelse
-                return usageError(err_out, "--sync needs a value");
-        } else if (std.mem.eql(u8, arg, "--enable-failpoints")) {
-            options.enable_failpoints = true;
-        } else if (std.mem.eql(u8, arg, "--dev-psk")) {
-            options.dev_psk = true;
-        } else if (std.mem.eql(u8, arg, "--insecure-test-tcp")) {
-            options.insecure_test_tcp = true;
-        } else if (std.mem.eql(u8, arg, "--json")) {
-            options.json = true;
-        } else if (std.mem.eql(u8, arg, "--no-color")) {
-            options.no_color = true;
-        } else if (std.mem.eql(u8, arg, "--no-history")) {
-            options.no_history = true;
-        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            try out.writeAll(usage_text);
-            return exit_ok;
-        } else {
-            try diagnostic.write(
-                err_out,
-                "unknown option",
-                arg,
-                "Run 'zaxon help' and remove or correct this option.",
-            );
-            return exit_usage;
-        }
-    }
+    if (try parseOptions(gpa, &iterator, &options, err_out, out)) |code| return code;
 
     if (std.mem.eql(u8, command, "version")) {
         try out.print("zaxon {s}\n", .{zaxonlite.version});
@@ -366,30 +251,58 @@ fn run(
         null;
     defer if (secret) |*value| value.deinit(gpa);
     const secret_bytes: ?[]const u8 = if (secret) |*value| value.bytes else null;
-    const tls_config: ?tls.Config = blk: {
-        const any = options.tls_cert != null or options.tls_key != null or
-            options.tls_ca != null;
-        if (!any) break :blk null;
-        if (options.tls_cert == null or options.tls_key == null or
-            options.tls_ca == null)
-        {
-            return usageError(
-                err_out,
-                "--tls-cert, --tls-key, and --tls-ca must be given together",
-            );
-        }
-        break :blk .{
-            .cert_path = options.tls_cert.?,
-            .key_path = options.tls_key.?,
-            .ca_path = options.tls_ca.?,
-        };
+    const tls_config = resolveTlsConfig(
+        options.tls_cert,
+        options.tls_key,
+        options.tls_ca,
+        err_out,
+    ) catch |err| switch (err) {
+        error.UsageError => return exit_usage,
+        else => return err,
     };
     if (std.mem.eql(u8, command, "serve")) {
         return serveCommand(gpa, io, &options, secret_bytes, tls_config, err_out);
     }
+    return dispatchRemoteOrLocal(
+        gpa,
+        io,
+        environ,
+        &options,
+        command,
+        secret_bytes,
+        tls_config,
+        out,
+        err_out,
+    );
+}
+
+fn resolveTlsConfig(
+    cert: ?[]const u8,
+    key: ?[]const u8,
+    ca: ?[]const u8,
+    err_out: *std.Io.Writer,
+) !?tls.Config {
+    const any = cert != null or key != null or ca != null;
+    if (!any) return null;
+    if (cert == null or key == null or ca == null) {
+        _ = try usageError(err_out, "--tls-cert, --tls-key, and --tls-ca must be given together");
+        return error.UsageError;
+    }
+    return .{ .cert_path = cert.?, .key_path = key.?, .ca_path = ca.? };
+}
+
+fn dispatchRemoteOrLocal(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    environ: *std.process.Environ.Map,
+    options: *Options,
+    command: []const u8,
+    secret_bytes: ?[]const u8,
+    tls_config: ?tls.Config,
+    out: *std.Io.Writer,
+    err_out: *std.Io.Writer,
+) !u8 {
     if (options.connect != null) {
-        // One client TLS identity serves every connection this command
-        // makes, including redirect follow-ups.
         var tls_context: ?tls.Context = null;
         defer if (tls_context) |*context| context.deinit();
         if (tls_config) |config| {
@@ -407,8 +320,7 @@ fn run(
                     err_out,
                     "tls identity failed",
                     @errorName(err),
-                    "Check that --tls-cert, --tls-key, and --tls-ca name " ++
-                        "readable PEM files.",
+                    "Check that --tls-cert, --tls-key, and --tls-ca name readable PEM files.",
                 );
                 return exit_usage;
             };
@@ -417,12 +329,11 @@ fn run(
             .secret = secret_bytes,
             .tls = if (tls_context) |*context| context else null,
         };
-        return remote(gpa, io, environ, &options, transport, out, err_out);
+        return remote(gpa, io, environ, options, transport, out, err_out);
     }
 
     const data = options.data orelse
         return usageError(err_out, "--data <dir> or --connect is required");
-
     const node = Node.open(gpa, io, .{ .directory = data }) catch |err| switch (err) {
         error.NodeLocked => {
             try diagnostic.write(
@@ -445,19 +356,30 @@ fn run(
     };
     defer node.close();
 
+    return executeLocalNodeCommand(gpa, io, environ, options, node, data, command, out, err_out);
+}
+
+fn executeLocalNodeCommand(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    environ: *std.process.Environ.Map,
+    options: *const Options,
+    node: *zaxonlite.Node,
+    data: []const u8,
+    command: []const u8,
+    out: *std.Io.Writer,
+    err_out: *std.Io.Writer,
+) !u8 {
     if (std.mem.eql(u8, command, "sql")) {
-        const history_path = try std.fmt.allocPrint(
-            gpa,
-            "{s}/.zaxon_history",
-            .{data},
-        );
+        const history_path = try std.fmt.allocPrint(gpa, "{s}/.zaxon_history", .{data});
         defer gpa.free(history_path);
         return cli_shell.run(gpa, io, environ, .{ .embedded = node }, .{
             .no_color = options.no_color,
             .no_history = options.no_history,
             .history_path = history_path,
         }, out, err_out);
-    } else if (std.mem.eql(u8, command, "exec")) {
+    }
+    if (std.mem.eql(u8, command, "exec")) {
         const sql = options.sql orelse return usageError(err_out, "exec needs --sql");
         if ((options.session == null) != (options.sequence == null)) {
             return usageError(err_out, "--session and --sequence go together");
@@ -471,10 +393,12 @@ fn run(
             out,
             err_out,
         );
-    } else if (std.mem.eql(u8, command, "query")) {
+    }
+    if (std.mem.eql(u8, command, "query")) {
         const sql = options.sql orelse return usageError(err_out, "query needs --sql");
         return cli_render.queryEmbedded(gpa, node, sql, options.json, out, err_out);
-    } else if (std.mem.eql(u8, command, "session")) {
+    }
+    if (std.mem.eql(u8, command, "session")) {
         const session = try node.openSession();
         if (options.json) {
             try out.print("{{\"session_id\":{d}}}\n", .{session});
@@ -482,10 +406,12 @@ fn run(
             try out.print("session {d}\n", .{session});
         }
         return exit_ok;
-    } else if (std.mem.eql(u8, command, "status")) {
+    }
+    if (std.mem.eql(u8, command, "status")) {
         try cli_render.printStatus(node, options.json, out);
         return exit_ok;
-    } else if (std.mem.eql(u8, command, "members")) {
+    }
+    if (std.mem.eql(u8, command, "members")) {
         const status = node.status();
         if (options.json) try out.writeAll("{\"membership\":\"static\",\"members\":[");
         for (node.memberIds(), 0..) |member, index| {
@@ -493,15 +419,40 @@ fn run(
                 if (index > 0) try out.writeAll(",");
                 try out.print("{d}", .{member});
             } else {
-                try out.print("node {d}{s}\n", .{
-                    member,
-                    if (member == status.node_id) " (self)" else "",
-                });
+                const suffix = if (member == status.node_id) " (self)" else "";
+                try out.print("node {d}{s}\n", .{ member, suffix });
             }
         }
         if (options.json) try out.writeAll("]}\n");
         return exit_ok;
-    } else if (std.mem.eql(u8, command, "snapshot")) {
+    }
+    if (std.mem.eql(u8, command, "snapshot") or
+        std.mem.eql(u8, command, "backup") or
+        std.mem.eql(u8, command, "integrity-check") or
+        std.mem.eql(u8, command, "recover") or
+        std.mem.eql(u8, command, "expire-sessions"))
+    {
+        return executeLocalMaintenanceCommand(options, node, command, out, err_out);
+    }
+
+    try diagnostic.write(
+        err_out,
+        "unknown command",
+        command,
+        "Run 'zaxon help' to list the supported commands.",
+    );
+    try out.writeAll(usage_text);
+    return exit_usage;
+}
+
+fn executeLocalMaintenanceCommand(
+    options: *const Options,
+    node: *zaxonlite.Node,
+    command: []const u8,
+    out: *std.Io.Writer,
+    err_out: *std.Io.Writer,
+) !u8 {
+    if (std.mem.eql(u8, command, "snapshot")) {
         try node.snapshot();
         const status = node.status();
         if (options.json) {
@@ -516,7 +467,8 @@ fn run(
             );
         }
         return exit_ok;
-    } else if (std.mem.eql(u8, command, "backup")) {
+    }
+    if (std.mem.eql(u8, command, "backup")) {
         const destination = options.to orelse return usageError(err_out, "backup needs --to");
         node.backup(destination) catch |err| switch (err) {
             error.SqliteError => {
@@ -532,9 +484,8 @@ fn run(
         };
         try out.print("backup written to {s}\n", .{destination});
         return exit_ok;
-    } else if (std.mem.eql(u8, command, "integrity-check") or
-        std.mem.eql(u8, command, "recover"))
-    {
+    }
+    if (std.mem.eql(u8, command, "integrity-check") or std.mem.eql(u8, command, "recover")) {
         const report = try node.integrityCheck();
         if (options.json) {
             try out.print(
@@ -542,30 +493,26 @@ fn run(
                 .{ report.sqlite_ok, report.chain_ok, report.payloads_ok },
             );
         } else {
+            const pass = passFail(report.sqlite_ok);
+            const chain_pass = passFail(report.chain_ok);
+            const payload_pass = passFail(report.payloads_ok);
             try out.print(
                 "sqlite: {s}\nchain: {s}\npayloads: {s}\n",
-                .{ passFail(report.sqlite_ok), passFail(report.chain_ok), passFail(report.payloads_ok) },
+                .{ pass, chain_pass, payload_pass },
             );
             if (std.mem.eql(u8, command, "recover")) {
                 try out.writeAll("recovery rebuild complete\n");
             }
         }
         return if (report.ok()) exit_ok else exit_integrity;
-    } else if (std.mem.eql(u8, command, "expire-sessions")) {
+    }
+    if (std.mem.eql(u8, command, "expire-sessions")) {
         const retain = options.retain orelse
             return usageError(err_out, "expire-sessions needs --retain");
         const result = try node.expireSessions(retain);
         try out.print("{d} session(s) expired\n", .{result.changes});
         return exit_ok;
     }
-
-    try diagnostic.write(
-        err_out,
-        "unknown command",
-        command,
-        "Run 'zaxon help' to list the supported commands.",
-    );
-    try out.writeAll(usage_text);
     return exit_usage;
 }
 
@@ -578,49 +525,61 @@ fn applyConfiguration(
     options: *Options,
     err_out: *std.Io.Writer,
 ) !void {
+    applyNetworkConfig(environ, file, options);
+    try applySecurityConfig(environ, file, options, err_out);
+    try applyPeersConfig(gpa, environ, file, options);
+}
+
+fn applyNetworkConfig(
+    environ: *std.process.Environ.Map,
+    file: ?*const configuration.File,
+    options: *Options,
+) void {
     if (options.data == null) {
-        options.data = environ.get("ZAXON_DATA") orelse
-            if (file) |value| value.data else null;
+        options.data = environ.get("ZAXON_DATA") orelse if (file) |v| v.data else null;
     }
     if (options.connect == null) {
         options.connect = environ.get("ZAXON_CONNECT") orelse
-            if (file) |value| value.connect else null;
+            if (file) |v| v.connect else null;
     }
     if (options.listen == null) {
-        options.listen = environ.get("ZAXON_LISTEN") orelse
-            if (file) |value| value.listen else null;
+        options.listen = environ.get("ZAXON_LISTEN") orelse if (file) |v| v.listen else null;
     }
     if (options.cluster_id == null) {
         options.cluster_id = environ.get("ZAXON_CLUSTER_ID") orelse
-            if (file) |value| value.cluster_id else null;
+            if (file) |v| v.cluster_id else null;
     }
+    if (options.sync == null) {
+        options.sync = environ.get("ZAXON_SYNC") orelse if (file) |v| v.sync else null;
+    }
+}
+
+fn applySecurityConfig(
+    environ: *std.process.Environ.Map,
+    file: ?*const configuration.File,
+    options: *Options,
+    err_out: *std.Io.Writer,
+) !void {
     if (options.auth_file == null) {
         options.auth_file = environ.get("ZAXON_AUTH_FILE") orelse
-            if (file) |value| value.auth_file else null;
+            if (file) |v| v.auth_file else null;
     }
     if (options.tls_cert == null) {
-        options.tls_cert = environ.get("ZAXON_TLS_CERT") orelse
-            if (file) |value| value.tls_cert else null;
+        options.tls_cert = environ.get("ZAXON_TLS_CERT") orelse if (file) |v| v.tls_cert else null;
     }
     if (options.tls_key == null) {
-        options.tls_key = environ.get("ZAXON_TLS_KEY") orelse
-            if (file) |value| value.tls_key else null;
+        options.tls_key = environ.get("ZAXON_TLS_KEY") orelse if (file) |v| v.tls_key else null;
     }
     if (options.tls_ca == null) {
-        options.tls_ca = environ.get("ZAXON_TLS_CA") orelse
-            if (file) |value| value.tls_ca else null;
+        options.tls_ca = environ.get("ZAXON_TLS_CA") orelse if (file) |v| v.tls_ca else null;
     }
     if (options.enrollment_ca_key == null) {
         options.enrollment_ca_key = environ.get("ZAXON_ENROLLMENT_CA_KEY") orelse
-            if (file) |value| value.enrollment_ca_key else null;
+            if (file) |v| v.enrollment_ca_key else null;
     }
     if (options.revocation_file == null) {
         options.revocation_file = environ.get("ZAXON_REVOCATION_FILE") orelse
-            if (file) |value| value.revocation_file else null;
-    }
-    if (options.sync == null) {
-        options.sync = environ.get("ZAXON_SYNC") orelse
-            if (file) |value| value.sync else null;
+            if (file) |v| v.revocation_file else null;
     }
     if (options.node_id == null) {
         if (environ.get("ZAXON_NODE")) |text| {
@@ -628,26 +587,37 @@ fn applyConfiguration(
                 _ = try usageError(err_out, "ZAXON_NODE must be an integer");
                 return error.InvalidEnvironment;
             };
-        } else if (file) |value| {
-            options.node_id = value.node;
+        } else if (file) |v| {
+            options.node_id = v.node;
         }
     }
     if (!options.role_set) {
-        const role_text = environ.get("ZAXON_ROLE") orelse
-            if (file) |value| value.role else null;
+        const role_text = environ.get("ZAXON_ROLE") orelse if (file) |v| v.role else null;
         if (role_text) |text| {
             options.role = Role.parse(text) catch {
                 _ = try usageError(err_out, "ZAXON_ROLE/config role is unknown");
                 return error.InvalidEnvironment;
             };
+            options.role_set = true;
         }
     }
+}
+
+fn applyPeersConfig(
+    gpa: std.mem.Allocator,
+    environ: *std.process.Environ.Map,
+    file: ?*const configuration.File,
+    options: *Options,
+) !void {
     if (options.peers.items.len == 0) {
-        if (environ.get("ZAXON_PEERS")) |text| {
-            var peers = std.mem.tokenizeScalar(u8, text, ',');
-            while (peers.next()) |peer| try options.peers.append(gpa, peer);
+        if (environ.get("ZAXON_PEER")) |text| {
+            var iterator = std.mem.splitScalar(u8, text, ',');
+            while (iterator.next()) |item| {
+                const trimmed = std.mem.trim(u8, item, " \t\r\n");
+                if (trimmed.len > 0) try options.peers.append(gpa, trimmed);
+            }
         } else if (file) |value| {
-            try options.peers.appendSlice(gpa, value.peers);
+            for (value.peers) |item| try options.peers.append(gpa, item);
         }
     }
 }
@@ -711,35 +681,10 @@ fn serveCommand(
 
     var members: std.ArrayList(server.PeerAddress) = .empty;
     defer members.deinit(gpa);
-    try members.append(gpa, .{
-        .id = node_id,
-        .host = listen.host,
-        .port = listen.port,
-        .role = options.role,
-    });
-    for (options.peers.items) |peer_text| {
-        const at = std.mem.indexOfScalar(u8, peer_text, '@') orelse
-            return usageError(err_out, "--peer must be id@host:port");
-        const id = std.fmt.parseInt(u32, peer_text[0..at], 10) catch
-            return usageError(err_out, "--peer must be id@host:port");
-        if (id == node_id) continue;
-        const address_and_role = peer_text[at + 1 ..];
-        const slash = std.mem.lastIndexOfScalar(u8, address_and_role, '/');
-        const address = if (slash) |index| address_and_role[0..index] else address_and_role;
-        const role = if (slash) |index|
-            Role.parse(address_and_role[index + 1 ..]) catch
-                return usageError(err_out, "--peer has an unknown role")
-        else
-            Role.data_voter;
-        const endpoint = client.Endpoint.parse(address) catch
-            return usageError(err_out, "--peer must be id@host:port[/role]");
-        try members.append(gpa, .{
-            .id = id,
-            .host = endpoint.host,
-            .port = endpoint.port,
-            .role = role,
-        });
-    }
+    buildPeerMembers(gpa, options, node_id, listen, &members, err_out) catch |err| switch (err) {
+        error.UsageError => return exit_usage,
+        else => return err,
+    };
 
     const database_id: ?u128 = if (members.items.len > 1)
         server.deriveDatabaseId(members.items, options.cluster_id)
@@ -799,6 +744,53 @@ fn serveCommand(
     }, err_out);
 }
 
+fn buildPeerMembers(
+    gpa: std.mem.Allocator,
+    options: *const Options,
+    node_id: u32,
+    listen: client.Endpoint,
+    members: *std.ArrayList(server.PeerAddress),
+    err_out: *std.Io.Writer,
+) !void {
+    try members.append(gpa, .{
+        .id = node_id,
+        .host = listen.host,
+        .port = listen.port,
+        .role = options.role,
+    });
+    for (options.peers.items) |peer_text| {
+        const at = std.mem.indexOfScalar(u8, peer_text, '@') orelse {
+            _ = try usageError(err_out, "--peer must be id@host:port");
+            return error.UsageError;
+        };
+        const id = std.fmt.parseInt(u32, peer_text[0..at], 10) catch {
+            _ = try usageError(err_out, "--peer must be id@host:port");
+            return error.UsageError;
+        };
+        if (id == node_id) continue;
+        const address_and_role = peer_text[at + 1 ..];
+        const slash = std.mem.lastIndexOfScalar(u8, address_and_role, '/');
+        const address = if (slash) |index| address_and_role[0..index] else address_and_role;
+        const role = if (slash) |index|
+            Role.parse(address_and_role[index + 1 ..]) catch {
+                _ = try usageError(err_out, "--peer has an unknown role");
+                return error.UsageError;
+            }
+        else
+            Role.data_voter;
+        const endpoint = client.Endpoint.parse(address) catch {
+            _ = try usageError(err_out, "--peer must be id@host:port[/role]");
+            return error.UsageError;
+        };
+        try members.append(gpa, .{
+            .id = id,
+            .host = endpoint.host,
+            .port = endpoint.port,
+            .role = role,
+        });
+    }
+}
+
 // ----------------------------------------------------------------------
 // Client mode
 // ----------------------------------------------------------------------
@@ -846,146 +838,20 @@ fn remote(
         }, out, err_out);
     }
     if (std.mem.eql(u8, command, "backup")) {
-        const destination = options.to orelse
-            return usageError(err_out, "backup needs --to");
-        var probe_cluster = client.ClusterConnection.init(
-            gpa,
-            io,
-            endpoints.items,
-            transport,
-        );
-        defer probe_cluster.deinit();
-        var probe = probe_cluster.call(
-            "{\"op\":\"query\",\"sql\":\"select 1\"}",
-            true,
-        ) catch {
-            try cli_render.noLeaderDiagnostic(err_out, probe_cluster.refused_leader_hint);
-            return exit_unavailable;
-        };
-        defer probe.deinit(gpa);
-        const connection = client.Connection.openWithTransport(
-            gpa,
-            io,
-            probe.endpoint,
-            transport,
-        ) catch {
-            try diagnostic.write(
-                err_out,
-                "backup interrupted",
-                "The selected leader became unavailable.",
-                "Retry against the endpoint list; the destination was not installed.",
-            );
-            return exit_unavailable;
-        };
-        defer connection.close();
-        connection.backupTo(destination) catch |err| {
-            try diagnostic.write(
-                err_out,
-                "remote backup failed",
-                @errorName(err),
-                "Check the destination, cluster health, and transport logs.",
-            );
-            return exit_unavailable;
-        };
-        if (options.json) {
-            try out.writeAll("{\"ok\":true}\n");
-        } else {
-            try out.print("backup written to {s}\n", .{destination});
-        }
-        return exit_ok;
+        return remoteBackup(gpa, io, options, endpoints.items, transport, out, err_out);
     }
 
     var request: std.Io.Writer.Allocating = .init(gpa);
     defer request.deinit();
-    const writer = &request.writer;
-    var require_leader = true;
-
-    if (std.mem.eql(u8, command, "exec")) {
-        const sql = options.sql orelse return usageError(err_out, "exec needs --sql");
-        if ((options.session == null) != (options.sequence == null)) {
-            return usageError(err_out, "--session and --sequence go together");
-        }
-        try writer.writeAll("{\"op\":\"exec\",\"sql\":");
-        try cli_render.writeJsonString(writer, sql);
-        if (options.session) |session| {
-            try writer.print(
-                ",\"session\":{d},\"sequence\":{d}",
-                .{ session, options.sequence.? },
-            );
-        }
-        try writer.writeAll("}");
-    } else if (std.mem.eql(u8, command, "query")) {
-        const sql = options.sql orelse return usageError(err_out, "query needs --sql");
-        const level = options.level orelse "linearizable";
-        require_leader = !std.mem.eql(u8, level, "any");
-        try writer.writeAll("{\"op\":\"query\",\"sql\":");
-        try cli_render.writeJsonString(writer, sql);
-        try writer.print(",\"level\":\"{s}\"", .{level});
-        if (options.freshness_ms) |freshness| {
-            try writer.print(",\"freshness_ms\":{d}", .{freshness});
-        }
-        try writer.writeAll("}");
-    } else if (std.mem.eql(u8, command, "status")) {
-        require_leader = false;
-        try writer.writeAll("{\"op\":\"status\"}");
-    } else if (std.mem.eql(u8, command, "members")) {
-        require_leader = false;
-        try writer.writeAll("{\"op\":\"members\"}");
-    } else if (std.mem.eql(u8, command, "leader")) {
-        require_leader = false;
-        try writer.writeAll("{\"op\":\"leader\"}");
-    } else if (std.mem.eql(u8, command, "session")) {
-        try writer.writeAll("{\"op\":\"session\"}");
-    } else if (std.mem.eql(u8, command, "wait")) {
-        require_leader = false;
-        try writer.print(
-            "{{\"op\":\"wait\",\"applied\":{d},\"leader\":{},\"timeout_ms\":{d}}}",
-            .{
-                options.applied orelse 0,
-                options.wait_leader,
-                options.timeout_ms orelse 10_000,
-            },
-        );
-    } else if (std.mem.eql(u8, command, "snapshot")) {
-        try writer.writeAll("{\"op\":\"snapshot\"}");
-    } else if (std.mem.eql(u8, command, "integrity-check")) {
-        require_leader = false;
-        try writer.writeAll("{\"op\":\"integrity\"}");
-    } else if (std.mem.eql(u8, command, "expire-sessions")) {
-        const retain = options.retain orelse
-            return usageError(err_out, "expire-sessions needs --retain");
-        try writer.print("{{\"op\":\"expire-sessions\",\"retain\":{d}}}", .{retain});
-    } else if (std.mem.eql(u8, command, "enroll-token")) {
-        require_leader = false;
-        const node_id = options.node_id orelse
-            return usageError(err_out, "enroll-token needs --node");
-        const ttl_seconds = options.ttl_seconds orelse enrollment.default_ttl_seconds;
-        if (ttl_seconds == 0 or ttl_seconds > enrollment.maximum_ttl_seconds) {
-            return usageError(err_out, "--ttl-seconds must be between 1 and 86400");
-        }
-        if (options.to == null) {
-            return usageError(err_out, "enroll-token needs --to");
-        }
-        if (options.tls_ca == null) {
-            return usageError(err_out, "enroll-token requires --tls-ca");
-        }
-        try writer.print(
-            "{{\"op\":\"issue-enrollment-token\",\"node_id\":{d}," ++
-                "\"ttl_seconds\":{d}}}",
-            .{ node_id, ttl_seconds },
-        );
-    } else if (std.mem.eql(u8, command, "stop")) {
-        require_leader = false;
-        try writer.writeAll("{\"op\":\"stop\"}");
-    } else {
-        try diagnostic.write(
-            err_out,
-            "unsupported client command",
-            command,
-            "Use --data for this operation or select a remote-capable command.",
-        );
-        return exit_usage;
-    }
+    const require_leader = buildRemoteRequestBody(
+        command,
+        options,
+        &request.writer,
+        err_out,
+    ) catch |err| switch (err) {
+        error.UsageError => return exit_usage,
+        else => return err,
+    };
 
     var cluster = client.ClusterConnection.init(
         gpa,
@@ -1022,6 +888,179 @@ fn remote(
     );
 }
 
+fn remoteBackup(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    options: *Options,
+    endpoint_list: []const client.Endpoint,
+    transport: client.Transport,
+    out: *std.Io.Writer,
+    err_out: *std.Io.Writer,
+) !u8 {
+    const destination = options.to orelse return usageError(err_out, "backup needs --to");
+    var probe_cluster = client.ClusterConnection.init(gpa, io, endpoint_list, transport);
+    defer probe_cluster.deinit();
+    var probe = probe_cluster.call("{\"op\":\"query\",\"sql\":\"select 1\"}", true) catch {
+        try cli_render.noLeaderDiagnostic(err_out, probe_cluster.refused_leader_hint);
+        return exit_unavailable;
+    };
+    defer probe.deinit(gpa);
+    const connection = client.Connection.openWithTransport(
+        gpa,
+        io,
+        probe.endpoint,
+        transport,
+    ) catch {
+        try diagnostic.write(
+            err_out,
+            "backup interrupted",
+            "The selected leader became unavailable.",
+            "Retry against the endpoint list; the destination was not installed.",
+        );
+        return exit_unavailable;
+    };
+    defer connection.close();
+    connection.backupTo(destination) catch |err| {
+        try diagnostic.write(
+            err_out,
+            "remote backup failed",
+            @errorName(err),
+            "Check the destination, cluster health, and transport logs.",
+        );
+        return exit_unavailable;
+    };
+    if (options.json) {
+        try out.writeAll("{\"ok\":true}\n");
+    } else {
+        try out.print("backup written to {s}\n", .{destination});
+    }
+    return exit_ok;
+}
+
+fn buildRemoteRequestBody(
+    command: []const u8,
+    options: *const Options,
+    writer: *std.Io.Writer,
+    err_out: *std.Io.Writer,
+) !bool {
+    if (std.mem.eql(u8, command, "exec")) {
+        const sql = options.sql orelse {
+            _ = try usageError(err_out, "exec needs --sql");
+            return error.UsageError;
+        };
+        if ((options.session == null) != (options.sequence == null)) {
+            _ = try usageError(err_out, "--session and --sequence go together");
+            return error.UsageError;
+        }
+        try writer.writeAll("{\"op\":\"exec\",\"sql\":");
+        try cli_render.writeJsonString(writer, sql);
+        if (options.session) |session| {
+            try writer.print(",\"session\":{d},\"sequence\":{d}", .{ session, options.sequence.? });
+        }
+        try writer.writeAll("}");
+        return true;
+    }
+    if (std.mem.eql(u8, command, "query")) {
+        const sql = options.sql orelse {
+            _ = try usageError(err_out, "query needs --sql");
+            return error.UsageError;
+        };
+        const level = options.level orelse "linearizable";
+        const require_leader = !std.mem.eql(u8, level, "any");
+        try writer.writeAll("{\"op\":\"query\",\"sql\":");
+        try cli_render.writeJsonString(writer, sql);
+        try writer.print(",\"level\":\"{s}\"", .{level});
+        if (options.freshness_ms) |freshness| {
+            try writer.print(",\"freshness_ms\":{d}", .{freshness});
+        }
+        try writer.writeAll("}");
+        return require_leader;
+    }
+    if (std.mem.eql(u8, command, "status")) {
+        try writer.writeAll("{\"op\":\"status\"}");
+        return false;
+    }
+    if (std.mem.eql(u8, command, "members")) {
+        try writer.writeAll("{\"op\":\"members\"}");
+        return false;
+    }
+    if (std.mem.eql(u8, command, "leader")) {
+        try writer.writeAll("{\"op\":\"leader\"}");
+        return false;
+    }
+    if (std.mem.eql(u8, command, "session")) {
+        try writer.writeAll("{\"op\":\"session\"}");
+        return true;
+    }
+    if (std.mem.eql(u8, command, "wait")) {
+        try writer.print(
+            "{{\"op\":\"wait\",\"applied\":{d},\"leader\":{},\"timeout_ms\":{d}}}",
+            .{ options.applied orelse 0, options.wait_leader, options.timeout_ms orelse 10_000 },
+        );
+        return false;
+    }
+    if (std.mem.eql(u8, command, "snapshot")) {
+        try writer.writeAll("{\"op\":\"snapshot\"}");
+        return true;
+    }
+    if (std.mem.eql(u8, command, "integrity-check")) {
+        try writer.writeAll("{\"op\":\"integrity\"}");
+        return false;
+    }
+    if (std.mem.eql(u8, command, "expire-sessions")) {
+        const retain = options.retain orelse {
+            _ = try usageError(err_out, "expire-sessions needs --retain");
+            return error.UsageError;
+        };
+        try writer.print("{{\"op\":\"expire-sessions\",\"retain\":{d}}}", .{retain});
+        return true;
+    }
+    if (std.mem.eql(u8, command, "enroll-token")) {
+        return buildRemoteEnrollTokenBody(options, writer, err_out);
+    }
+    if (std.mem.eql(u8, command, "stop")) {
+        try writer.writeAll("{\"op\":\"stop\"}");
+        return false;
+    }
+
+    try diagnostic.write(
+        err_out,
+        "unsupported client command",
+        command,
+        "Use --data for this operation or select a remote-capable command.",
+    );
+    return error.UsageError;
+}
+
+fn buildRemoteEnrollTokenBody(
+    options: *const Options,
+    writer: *std.Io.Writer,
+    err_out: *std.Io.Writer,
+) !bool {
+    const node_id = options.node_id orelse {
+        _ = try usageError(err_out, "enroll-token needs --node");
+        return error.UsageError;
+    };
+    const ttl_seconds = options.ttl_seconds orelse enrollment.default_ttl_seconds;
+    if (ttl_seconds == 0 or ttl_seconds > enrollment.maximum_ttl_seconds) {
+        _ = try usageError(err_out, "--ttl-seconds must be between 1 and 86400");
+        return error.UsageError;
+    }
+    if (options.to == null) {
+        _ = try usageError(err_out, "enroll-token needs --to");
+        return error.UsageError;
+    }
+    if (options.tls_ca == null) {
+        _ = try usageError(err_out, "enroll-token requires --tls-ca");
+        return error.UsageError;
+    }
+    try writer.print(
+        "{{\"op\":\"issue-enrollment-token\",\"node_id\":{d},\"ttl_seconds\":{d}}}",
+        .{ node_id, ttl_seconds },
+    );
+    return false;
+}
+
 fn saveEnrollmentBundle(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -1030,49 +1069,6 @@ fn saveEnrollmentBundle(
     out: *std.Io.Writer,
     err_out: *std.Io.Writer,
 ) !u8 {
-    const Response = struct {
-        ok: bool = false,
-        node_id: u32 = 0,
-        issuer_node_id: u32 = 0,
-        database_id: []const u8 = "",
-        expires_unix_seconds: u64 = 0,
-        token: []const u8 = "",
-        @"error": ?[]const u8 = null,
-        message: ?[]const u8 = null,
-    };
-    const parsed = std.json.parseFromSlice(Response, gpa, result.body, .{
-        .ignore_unknown_fields = true,
-    }) catch {
-        try cli_render.malformedResponseDiagnostic(err_out);
-        return exit_unavailable;
-    };
-    defer parsed.deinit();
-    const response = parsed.value;
-    if (!response.ok) {
-        try diagnostic.write(
-            err_out,
-            response.@"error" orelse "enrollment_unavailable",
-            response.message orelse "token issuance failed",
-            "Connect with an existing mTLS identity to a configured issuer node.",
-        );
-        return exit_unavailable;
-    }
-    if (response.node_id == 0 or response.issuer_node_id == 0 or
-        response.database_id.len != 32 or response.token.len != 64 or
-        response.expires_unix_seconds == 0 or result.endpoint.unix_path != null)
-    {
-        try cli_render.malformedResponseDiagnostic(err_out);
-        return exit_unavailable;
-    }
-    var secret: [enrollment.token_bytes]u8 = undefined;
-    _ = std.fmt.hexToBytes(&secret, response.token) catch {
-        try cli_render.malformedResponseDiagnostic(err_out);
-        return exit_unavailable;
-    };
-    const database_id = std.fmt.parseInt(u128, response.database_id, 16) catch {
-        try cli_render.malformedResponseDiagnostic(err_out);
-        return exit_unavailable;
-    };
     const ca_pem = std.Io.Dir.cwd().readFileAlloc(
         io,
         options.tls_ca.?,
@@ -1088,21 +1084,25 @@ fn saveEnrollmentBundle(
         return exit_usage;
     };
     defer gpa.free(ca_pem);
+
     const endpoint = try std.fmt.allocPrint(
         gpa,
         "{s}:{d}",
         .{ result.endpoint.host, result.endpoint.port },
     );
     defer gpa.free(endpoint);
-    const bundle = enrollment.Bundle{
-        .node_id = response.node_id,
-        .issuer_node_id = response.issuer_node_id,
-        .database_id = database_id,
-        .expires_unix_seconds = response.expires_unix_seconds,
-        .secret = secret,
-        .endpoint = endpoint,
-        .ca_pem = ca_pem,
+
+    const bundle = parseEnrollmentBundle(
+        gpa,
+        result,
+        ca_pem,
+        endpoint,
+        err_out,
+    ) catch |err| switch (err) {
+        error.Unavailable => return exit_unavailable,
+        else => return err,
     };
+
     const encoded = bundle.encodeAlloc(gpa) catch |err| {
         try diagnostic.write(
             err_out,
@@ -1127,17 +1127,77 @@ fn saveEnrollmentBundle(
     };
     if (options.json) {
         try out.print(
-            "{{\"ok\":true,\"path\":\"{s}\",\"node_id\":{d}," ++
-                "\"expires_unix_seconds\":{d}}}\n",
-            .{ options.to.?, response.node_id, response.expires_unix_seconds },
+            "{{\"ok\":true,\"path\":\"{s}\",\"node_id\":{d},\"expires_unix_seconds\":{d}}}\n",
+            .{ options.to.?, bundle.node_id, bundle.expires_unix_seconds },
         );
     } else {
         try out.print(
-            "enrollment token for node {d} written to {s}; expires at Unix second {d}\n",
-            .{ response.node_id, options.to.?, response.expires_unix_seconds },
+            "enrollment token bundle written to {s} (node {d})\n",
+            .{ options.to.?, bundle.node_id },
         );
     }
     return exit_ok;
+}
+
+fn parseEnrollmentBundle(
+    gpa: std.mem.Allocator,
+    result: client.CallResult,
+    ca_pem: []const u8,
+    endpoint: []const u8,
+    err_out: *std.Io.Writer,
+) !enrollment.Bundle {
+    const Response = struct {
+        ok: bool = false,
+        node_id: u32 = 0,
+        issuer_node_id: u32 = 0,
+        database_id: []const u8 = "",
+        expires_unix_seconds: u64 = 0,
+        token: []const u8 = "",
+        @"error": ?[]const u8 = null,
+        message: ?[]const u8 = null,
+    };
+    const parsed = std.json.parseFromSlice(Response, gpa, result.body, .{
+        .ignore_unknown_fields = true,
+    }) catch {
+        try cli_render.malformedResponseDiagnostic(err_out);
+        return error.Unavailable;
+    };
+    defer parsed.deinit();
+    const response = parsed.value;
+    if (!response.ok) {
+        try diagnostic.write(
+            err_out,
+            response.@"error" orelse "enrollment_unavailable",
+            response.message orelse "token issuance failed",
+            "Connect with an existing mTLS identity to a configured issuer node.",
+        );
+        return error.Unavailable;
+    }
+    if (response.node_id == 0 or response.issuer_node_id == 0 or
+        response.database_id.len != 32 or response.token.len != 64 or
+        response.expires_unix_seconds == 0 or result.endpoint.unix_path != null)
+    {
+        try cli_render.malformedResponseDiagnostic(err_out);
+        return error.Unavailable;
+    }
+    var secret: [enrollment.token_bytes]u8 = undefined;
+    _ = std.fmt.hexToBytes(&secret, response.token) catch {
+        try cli_render.malformedResponseDiagnostic(err_out);
+        return error.Unavailable;
+    };
+    const database_id = std.fmt.parseInt(u128, response.database_id, 16) catch {
+        try cli_render.malformedResponseDiagnostic(err_out);
+        return error.Unavailable;
+    };
+    return .{
+        .node_id = response.node_id,
+        .issuer_node_id = response.issuer_node_id,
+        .database_id = database_id,
+        .expires_unix_seconds = response.expires_unix_seconds,
+        .secret = secret,
+        .endpoint = endpoint,
+        .ca_pem = ca_pem,
+    };
 }
 
 fn enrollCommand(
@@ -1178,7 +1238,7 @@ fn enrollCommand(
             err_out,
             "enrollment refused",
             @errorName(err),
-            "Check expiry, target node ID, issuer reachability, and request a new token after any ambiguous failure.",
+            "Check expiry, target node ID, issuer reachability, and request a new token.",
         );
         return exit_unavailable;
     };
@@ -1188,7 +1248,7 @@ fn enrollCommand(
             err_out,
             "identity installation failed",
             @errorName(err),
-            "The token is already consumed. Preserve the error, remove no existing identity, and issue a replacement token.",
+            "Token consumed. Preserve error, remove no existing identity, and request new token.",
         );
         return exit_unavailable;
     };
@@ -1205,4 +1265,155 @@ fn enrollCommand(
         );
     }
     return exit_ok;
+}
+
+fn optError(err_out: *std.Io.Writer, msg: []const u8) !?u8 {
+    try diagnostic.write(err_out, "invalid options", msg, "Run 'zaxon help' to list options.");
+    return exit_usage;
+}
+
+fn parseOptions(
+    gpa: std.mem.Allocator,
+    iterator: *std.process.Args.Iterator,
+    options: *Options,
+    err_out: *std.Io.Writer,
+    out: *std.Io.Writer,
+) !?u8 {
+    while (iterator.next()) |arg| {
+        if (try parseOptionFlag(gpa, iterator, options, arg, err_out, out)) |code| {
+            return code;
+        }
+    }
+    return null;
+}
+
+fn parseOptionFlag(
+    gpa: std.mem.Allocator,
+    iterator: *std.process.Args.Iterator,
+    options: *Options,
+    arg: []const u8,
+    err_out: *std.Io.Writer,
+    out: *std.Io.Writer,
+) !?u8 {
+    if (std.mem.eql(u8, arg, "--config")) {
+        options.config = iterator.next() orelse
+            return optError(err_out, "--config needs a value");
+    } else if (std.mem.eql(u8, arg, "--data")) {
+        options.data = iterator.next() orelse
+            return optError(err_out, "--data needs a value");
+    } else if (std.mem.eql(u8, arg, "--connect")) {
+        options.connect = iterator.next() orelse
+            return optError(err_out, "--connect needs a value");
+    } else if (std.mem.eql(u8, arg, "--sql")) {
+        options.sql = iterator.next() orelse
+            return optError(err_out, "--sql needs a value");
+    } else if (std.mem.eql(u8, arg, "--session")) {
+        const text = iterator.next() orelse
+            return optError(err_out, "--session needs a value");
+        options.session = std.fmt.parseInt(u64, text, 10) catch
+            return optError(err_out, "--session must be an integer");
+    } else if (std.mem.eql(u8, arg, "--sequence")) {
+        const text = iterator.next() orelse
+            return optError(err_out, "--sequence needs a value");
+        options.sequence = std.fmt.parseInt(u64, text, 10) catch
+            return optError(err_out, "--sequence must be an integer");
+    } else if (std.mem.eql(u8, arg, "--level")) {
+        options.level = iterator.next() orelse
+            return optError(err_out, "--level needs a value");
+    } else if (std.mem.eql(u8, arg, "--freshness-ms")) {
+        const text = iterator.next() orelse
+            return optError(err_out, "--freshness-ms needs a value");
+        options.freshness_ms = std.fmt.parseInt(u64, text, 10) catch
+            return optError(err_out, "--freshness-ms must be an integer");
+    } else if (std.mem.eql(u8, arg, "--to")) {
+        options.to = iterator.next() orelse
+            return optError(err_out, "--to needs a value");
+    } else if (std.mem.eql(u8, arg, "--retain")) {
+        const text = iterator.next() orelse
+            return optError(err_out, "--retain needs a value");
+        options.retain = std.fmt.parseInt(u64, text, 10) catch
+            return optError(err_out, "--retain must be an integer");
+    } else if (std.mem.eql(u8, arg, "--applied")) {
+        const text = iterator.next() orelse
+            return optError(err_out, "--applied needs a value");
+        options.applied = std.fmt.parseInt(u64, text, 10) catch
+            return optError(err_out, "--applied must be an integer");
+    } else if (std.mem.eql(u8, arg, "--leader")) {
+        options.wait_leader = true;
+    } else if (std.mem.eql(u8, arg, "--timeout-ms")) {
+        const text = iterator.next() orelse
+            return optError(err_out, "--timeout-ms needs a value");
+        options.timeout_ms = std.fmt.parseInt(u64, text, 10) catch
+            return optError(err_out, "--timeout-ms must be an integer");
+    } else if (std.mem.eql(u8, arg, "--node")) {
+        const text = iterator.next() orelse
+            return optError(err_out, "--node needs a value");
+        options.node_id = std.fmt.parseInt(u32, text, 10) catch
+            return optError(err_out, "--node must be an integer");
+    } else if (std.mem.eql(u8, arg, "--listen")) {
+        options.listen = iterator.next() orelse
+            return optError(err_out, "--listen needs a value");
+    } else if (std.mem.eql(u8, arg, "--role")) {
+        const text = iterator.next() orelse
+            return optError(err_out, "--role needs a value");
+        options.role = Role.parse(text) catch
+            return optError(err_out, "--role is not a known node role");
+        options.role_set = true;
+    } else if (std.mem.eql(u8, arg, "--peer")) {
+        const text = iterator.next() orelse
+            return optError(err_out, "--peer needs a value");
+        try options.peers.append(gpa, text);
+    } else if (std.mem.eql(u8, arg, "--cluster-id")) {
+        options.cluster_id = iterator.next() orelse
+            return optError(err_out, "--cluster-id needs a value");
+    } else if (std.mem.eql(u8, arg, "--auth-file")) {
+        options.auth_file = iterator.next() orelse
+            return optError(err_out, "--auth-file needs a value");
+    } else if (std.mem.eql(u8, arg, "--tls-cert")) {
+        options.tls_cert = iterator.next() orelse
+            return optError(err_out, "--tls-cert needs a value");
+    } else if (std.mem.eql(u8, arg, "--tls-key")) {
+        options.tls_key = iterator.next() orelse
+            return optError(err_out, "--tls-key needs a value");
+    } else if (std.mem.eql(u8, arg, "--tls-ca")) {
+        options.tls_ca = iterator.next() orelse
+            return optError(err_out, "--tls-ca needs a value");
+    } else if (std.mem.eql(u8, arg, "--enrollment-ca-key")) {
+        options.enrollment_ca_key = iterator.next() orelse
+            return optError(err_out, "--enrollment-ca-key needs a value");
+    } else if (std.mem.eql(u8, arg, "--token-file")) {
+        options.token_file = iterator.next() orelse
+            return optError(err_out, "--token-file needs a value");
+    } else if (std.mem.eql(u8, arg, "--identity-dir")) {
+        options.identity_dir = iterator.next() orelse
+            return optError(err_out, "--identity-dir needs a value");
+    } else if (std.mem.eql(u8, arg, "--ttl-seconds")) {
+        const text = iterator.next() orelse
+            return optError(err_out, "--ttl-seconds needs a value");
+        options.ttl_seconds = std.fmt.parseInt(u64, text, 10) catch
+            return optError(err_out, "--ttl-seconds must be an integer");
+    } else if (std.mem.eql(u8, arg, "--revocation-file")) {
+        options.revocation_file = iterator.next() orelse
+            return optError(err_out, "--revocation-file needs a value");
+    } else if (std.mem.eql(u8, arg, "--sync")) {
+        options.sync = iterator.next() orelse return optError(err_out, "--sync needs a value");
+    } else if (std.mem.eql(u8, arg, "--enable-failpoints")) {
+        options.enable_failpoints = true;
+    } else if (std.mem.eql(u8, arg, "--dev-psk")) {
+        options.dev_psk = true;
+    } else if (std.mem.eql(u8, arg, "--insecure-test-tcp")) {
+        options.insecure_test_tcp = true;
+    } else if (std.mem.eql(u8, arg, "--json")) {
+        options.json = true;
+    } else if (std.mem.eql(u8, arg, "--no-color")) {
+        options.no_color = true;
+    } else if (std.mem.eql(u8, arg, "--no-history")) {
+        options.no_history = true;
+    } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+        try out.writeAll(usage_text);
+        return exit_ok;
+    } else {
+        return optError(err_out, "unknown option");
+    }
+    return null;
 }

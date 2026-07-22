@@ -2171,7 +2171,11 @@ pub const Node = struct {
         const old_configuration = self.identity.configuration_id;
         const new_configuration = stop.configuration_id;
 
-        var new_journal = Journal.create(self.io, self.dir, new_configuration) catch |err| switch (err) {
+        var new_journal = Journal.create(
+            self.io,
+            self.dir,
+            new_configuration,
+        ) catch |err| switch (err) {
             error.PathAlreadyExists => blk: {
                 // A previous rollover attempt crashed after creating the
                 // file; it can only be empty or already truncated.

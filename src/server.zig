@@ -2811,7 +2811,11 @@ pub const Server = struct {
 
         if (level == .linearizable and !self.node.single) {
             self.awaitReadFence() catch |err| switch (err) {
-                error.ReadFenceTimeout => return writeErrorResponse(out, "timeout", "fence timed out"),
+                error.ReadFenceTimeout => return writeErrorResponse(
+                    out,
+                    "timeout",
+                    "fence timed out",
+                ),
                 error.ReadFenceLeadershipChanged => return writeErrorResponse(
                     out,
                     "retry",
