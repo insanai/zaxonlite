@@ -67,35 +67,47 @@ pub fn serve(
                 break;
             }
         }
-        const context = gpa.create(Proxy) catch {
-            inbound.close(io);
-            continue;
-        };
-        if (!runtime.tryStarted(inbound, options.max_connections)) {
-            gpa.destroy(context);
-            inbound.close(io);
-            continue;
-        }
-        context.* = .{
-            .gpa = gpa,
-            .io = io,
-            .owner = &runtime,
-            .inbound = inbound,
-            .backends = options.backends,
-            .first = next,
-        };
-        next = (next + 1) % options.backends.len;
-        const thread = std.Thread.spawn(.{}, Proxy.run, .{context}) catch {
-            runtime.finished(inbound);
-            inbound.close(io);
-            gpa.destroy(context);
-            continue;
-        };
-        thread.detach();
+        next = handleInboundConnection(gpa, io, &runtime, inbound, options, next);
     }
     runtime.shutdown();
     runtime.wait();
     return exit_code;
+}
+
+fn handleInboundConnection(
+    gpa: std.mem.Allocator,
+    io: Io,
+    runtime: *Runtime,
+    inbound: std.Io.net.Stream,
+    options: Options,
+    next: usize,
+) usize {
+    const context = gpa.create(Proxy) catch {
+        inbound.close(io);
+        return next;
+    };
+    if (!runtime.tryStarted(inbound, options.max_connections)) {
+        gpa.destroy(context);
+        inbound.close(io);
+        return next;
+    }
+    context.* = .{
+        .gpa = gpa,
+        .io = io,
+        .owner = runtime,
+        .inbound = inbound,
+        .backends = options.backends,
+        .first = next,
+    };
+    const new_next = (next + 1) % options.backends.len;
+    const thread = std.Thread.spawn(.{}, Proxy.run, .{context}) catch {
+        runtime.finished(inbound);
+        inbound.close(io);
+        gpa.destroy(context);
+        return new_next;
+    };
+    thread.detach();
+    return new_next;
 }
 
 fn report(err_out: *Io.Writer, message: []const u8) !u8 {

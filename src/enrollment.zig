@@ -385,6 +385,25 @@ pub fn requestCertificate(
         return error.TlsPeerUnverified;
     }
 
+    const cert_pem = try performEnrollmentExchange(gpa, &tls_stream, bundle, credentials.csr_pem);
+    try tls.validateIssuedIdentity(
+        cert_pem,
+        credentials.private_key_pem,
+        bundle.node_id,
+        bundle.ca_pem,
+    );
+    return .{
+        .credentials = credentials,
+        .certificate_pem = cert_pem,
+    };
+}
+
+fn performEnrollmentExchange(
+    gpa: std.mem.Allocator,
+    tls_stream: *tls.Stream,
+    bundle: Bundle,
+    csr_pem: []const u8,
+) ![]u8 {
     var hello_buffer: [wire.Hello.encoded_size]u8 = undefined;
     const hello = wire.Hello{
         .version = wire.protocol_version,
@@ -399,7 +418,7 @@ pub fn requestCertificate(
         .secret = bundle.secret,
         .node_id = bundle.node_id,
         .database_id = bundle.database_id,
-        .csr = credentials.csr_pem,
+        .csr = csr_pem,
     };
     try wire.writeFrame(
         &tls_stream.writer,
@@ -417,16 +436,7 @@ pub fn requestCertificate(
     defer gpa.free(body);
     const response = try wire.EnrollmentResponse.decode(body);
     if (response.status != .ok) return error.EnrollmentRefused;
-    try tls.validateIssuedIdentity(
-        response.certificate,
-        credentials.private_key_pem,
-        bundle.node_id,
-        bundle.ca_pem,
-    );
-    return .{
-        .credentials = credentials,
-        .certificate_pem = try gpa.dupe(u8, response.certificate),
-    };
+    return try gpa.dupe(u8, response.certificate);
 }
 
 /// Installs all three PEM files as one directory rename. A crash exposes either

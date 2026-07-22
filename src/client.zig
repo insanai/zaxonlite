@@ -118,27 +118,14 @@ pub const Connection = struct {
             .write_buffer = write_buffer,
         };
         if (transport.tls) |context| {
-            const tls_stream = try gpa.create(tls.Stream);
-            errdefer gpa.destroy(tls_stream);
-            tls_stream.* = try tls.Stream.connect(
+            self.tls_stream = try initTlsStream(
+                gpa,
                 context,
                 stream,
                 read_buffer,
                 write_buffer,
+                endpoint,
             );
-            const peer_node_id = tls.parseNodeCommonName(
-                tls_stream.peerCommonName(),
-            ) orelse {
-                tls_stream.deinit();
-                return error.TlsPeerUnverified;
-            };
-            if (endpoint.expected_node_id) |expected| {
-                if (peer_node_id != expected) {
-                    tls_stream.deinit();
-                    return error.TlsPeerUnverified;
-                }
-            }
-            self.tls_stream = tls_stream;
         } else {
             self.reader = self.stream.reader(io, self.read_buffer);
             self.writer = self.stream.writer(io, self.write_buffer);
@@ -148,7 +135,35 @@ pub const Connection = struct {
             gpa.destroy(tls_stream);
         };
 
-        // Client handshake.
+        try performClientHandshake(self, transport);
+        return self;
+    }
+
+    fn initTlsStream(
+        gpa: std.mem.Allocator,
+        context: *const tls.Context,
+        stream: std.Io.net.Stream,
+        read_buffer: []u8,
+        write_buffer: []u8,
+        endpoint: Endpoint,
+    ) !*tls.Stream {
+        const tls_stream = try gpa.create(tls.Stream);
+        errdefer gpa.destroy(tls_stream);
+        tls_stream.* = try tls.Stream.connect(context, stream, read_buffer, write_buffer);
+        const peer_node_id = tls.parseNodeCommonName(tls_stream.peerCommonName()) orelse {
+            tls_stream.deinit();
+            return error.TlsPeerUnverified;
+        };
+        if (endpoint.expected_node_id) |expected| {
+            if (peer_node_id != expected) {
+                tls_stream.deinit();
+                return error.TlsPeerUnverified;
+            }
+        }
+        return tls_stream;
+    }
+
+    fn performClientHandshake(self: *Connection, transport: Transport) !void {
         const hello = wire.Hello{
             .version = wire.protocol_version,
             .kind = .client,
@@ -161,14 +176,13 @@ pub const Connection = struct {
         try self.writerInterface().flush();
         if (transport.secret) |bytes| {
             self.authenticated = try transport_auth.connect(
-                gpa,
+                self.gpa,
                 self.readerInterface(),
                 self.writerInterface(),
                 bytes,
                 &hello_buffer,
             );
         }
-        return self;
     }
 
     fn readerInterface(self: *Connection) *Io.Reader {
@@ -235,26 +249,10 @@ pub const Connection = struct {
         else
             try Io.Dir.cwd().openDir(self.io, directory_name, .{});
         defer directory.close(self.io);
-        if (directory.access(self.io, file_name, .{})) |_| {
-            return error.BackupDestinationExists;
-        } else |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        }
 
-        var random_bytes: [8]u8 = undefined;
-        self.io.random(&random_bytes);
-        const nonce = std.mem.readInt(u64, &random_bytes, .little);
-        const temporary_name = try std.fmt.allocPrint(
-            self.gpa,
-            ".{s}.zaxon-{x}.tmp",
-            .{ file_name, nonce },
-        );
+        var temporary_name: []u8 = undefined;
+        var file = try self.createBackupTempFile(&directory, file_name, &temporary_name);
         defer self.gpa.free(temporary_name);
-        var file = try directory.createFile(self.io, temporary_name, .{
-            .read = true,
-            .exclusive = true,
-        });
         var file_open = true;
         var keep_temporary = true;
         defer {
@@ -262,15 +260,49 @@ pub const Connection = struct {
             if (keep_temporary) directory.deleteFile(self.io, temporary_name) catch {};
         }
 
+        try self.streamBackupPayload(&file);
+        try durability.syncFile(self.io, file);
+        file.close(self.io);
+        file_open = false;
+        try directory.rename(temporary_name, directory, file_name, self.io);
+        try durability.syncDirectory(directory);
+        keep_temporary = false;
+    }
+
+    fn createBackupTempFile(
+        self: *Connection,
+        directory: *Io.Dir,
+        file_name: []const u8,
+        temporary_name: *[]u8,
+    ) !Io.File {
+        if (directory.access(self.io, file_name, .{})) |_| {
+            return error.BackupDestinationExists;
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        }
+        var random_bytes: [8]u8 = undefined;
+        self.io.random(&random_bytes);
+        const nonce = std.mem.readInt(u64, &random_bytes, .little);
+        temporary_name.* = try std.fmt.allocPrint(
+            self.gpa,
+            ".{s}.zaxon-{x}.tmp",
+            .{ file_name, nonce },
+        );
+        return directory.createFile(self.io, temporary_name.*, .{
+            .read = true,
+            .exclusive = true,
+        });
+    }
+
+    fn streamBackupPayload(self: *Connection, file: *Io.File) !void {
         try self.writeRequest("{\"op\":\"backup\"}");
         const begin_frame = try self.readFrame();
         defer self.gpa.free(begin_frame.body);
         if (begin_frame.kind == .rpc_response) return error.RemoteBackupRejected;
         if (begin_frame.kind != .backup_begin) return error.InvalidFrame;
         const begin = try wire.BackupBegin.decode(begin_frame.body);
-        if (begin.size == 0 or begin.size > wire.max_transfer_bytes) {
-            return error.InvalidBackupSize;
-        }
+        if (begin.size == 0 or begin.size > wire.max_transfer_bytes) return error.InvalidBackupSize;
 
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
         var received: u64 = 0;
@@ -278,13 +310,10 @@ pub const Connection = struct {
             const frame = try self.readFrame();
             defer self.gpa.free(frame.body);
             if (frame.kind == .backup_end) break;
-            if (frame.kind != .backup_chunk or frame.body.len <= 8) {
-                return error.InvalidFrame;
-            }
+            if (frame.kind != .backup_chunk or frame.body.len <= 8) return error.InvalidFrame;
             const offset = std.mem.readInt(u64, frame.body[0..8], .little);
             const bytes = frame.body[8..];
-            const end = std.math.add(u64, offset, bytes.len) catch
-                return error.InvalidFrame;
+            const end = std.math.add(u64, offset, bytes.len) catch return error.InvalidFrame;
             if (offset != received or end > begin.size) return error.InvalidFrame;
             try file.writePositionalAll(self.io, bytes, offset);
             hasher.update(bytes);
@@ -294,12 +323,6 @@ pub const Connection = struct {
         var actual: [32]u8 = undefined;
         hasher.final(&actual);
         if (!std.mem.eql(u8, &actual, &begin.sha256)) return error.BackupDigestMismatch;
-        try durability.syncFile(self.io, file);
-        file.close(self.io);
-        file_open = false;
-        try directory.rename(temporary_name, directory, file_name, self.io);
-        try durability.syncDirectory(directory);
-        keep_temporary = false;
     }
 };
 
@@ -688,69 +711,68 @@ fn leaderRedirect(
     }
     if (object.get("leader")) |leader| switch (leader) {
         .object => |leader_object| {
-            const id = leader_object.get("id");
-            const host = leader_object.get("host");
-            const port = leader_object.get("port");
-            if (id != null and host != null and port != null and
-                id.? == .integer and id.?.integer > 0 and
-                id.?.integer <= std.math.maxInt(u32) and
-                host.? == .string and port.? == .integer and
-                port.?.integer >= 0 and
-                port.?.integer <= std.math.maxInt(u16))
-            {
-                const hinted_id: u32 = @intCast(id.?.integer);
-                const hinted_port: u16 = @intCast(port.?.integer);
-                for (endpoints) |candidate| {
-                    if (candidate.unix_path != null) continue;
-                    if (candidate.port == hinted_port and
-                        std.mem.eql(u8, candidate.host, host.?.string))
-                    {
-                        var target = candidate;
-                        if (allow_authenticated_advertisement) {
-                            target.expected_node_id = hinted_id;
-                        }
-                        return .{ .redirect = target };
-                    }
-                }
-                if (allow_authenticated_advertisement) {
-                    const copied_host = std.fmt.bufPrint(
-                        redirect_host_buffer,
-                        "{s}",
-                        .{host.?.string},
-                    ) catch return .rotate;
-                    // Server registries and the dialer accept numeric IP
-                    // addresses only. Reject malformed hints before retrying.
-                    _ = std.Io.net.IpAddress.parse(
-                        copied_host,
-                        hinted_port,
-                    ) catch return .rotate;
-                    return .{ .redirect = .{
-                        .host = copied_host,
-                        .port = hinted_port,
-                        .expected_node_id = hinted_id,
-                    } };
-                }
-                if (refused_hint) |slot| {
-                    if (host.?.string.len <= 64) {
-                        var record = RefusedLeaderHint{
-                            .node_id = hinted_id,
-                            .port = hinted_port,
-                            .host_length = @intCast(host.?.string.len),
-                            .host_buffer = undefined,
-                        };
-                        @memcpy(
-                            record.host_buffer[0..host.?.string.len],
-                            host.?.string,
-                        );
-                        slot.* = record;
-                    }
-                }
-            }
+            return resolveLeaderRedirect(
+                endpoints,
+                leader_object,
+                allow_authenticated_advertisement,
+                redirect_host_buffer,
+                refused_hint,
+            );
         },
         else => {},
     };
-    // It is a genuine redirect response but did not name a configured target.
-    // Rotate through the caller's configured set instead of returning it.
+    return .rotate;
+}
+
+fn resolveLeaderRedirect(
+    endpoints: []const Endpoint,
+    leader_object: std.json.ObjectMap,
+    allow_authenticated_advertisement: bool,
+    redirect_host_buffer: *[64]u8,
+    refused_hint: ?*?RefusedLeaderHint,
+) Redirect {
+    const id = leader_object.get("id");
+    const host = leader_object.get("host");
+    const port = leader_object.get("port");
+    if (id == null or host == null or port == null or
+        id.? != .integer or id.?.integer <= 0 or id.?.integer > std.math.maxInt(u32) or
+        host.? != .string or port.? != .integer or port.?.integer < 0 or
+        port.?.integer > std.math.maxInt(u16))
+    {
+        return .rotate;
+    }
+    const hinted_id: u32 = @intCast(id.?.integer);
+    const hinted_port: u16 = @intCast(port.?.integer);
+    for (endpoints) |candidate| {
+        if (candidate.unix_path != null) continue;
+        if (candidate.port == hinted_port and std.mem.eql(u8, candidate.host, host.?.string)) {
+            var target = candidate;
+            if (allow_authenticated_advertisement) target.expected_node_id = hinted_id;
+            return .{ .redirect = target };
+        }
+    }
+    if (allow_authenticated_advertisement) {
+        const copied_host = std.fmt.bufPrint(redirect_host_buffer, "{s}", .{host.?.string}) catch
+            return .rotate;
+        _ = std.Io.net.IpAddress.parse(copied_host, hinted_port) catch return .rotate;
+        return .{ .redirect = .{
+            .host = copied_host,
+            .port = hinted_port,
+            .expected_node_id = hinted_id,
+        } };
+    }
+    if (refused_hint) |slot| {
+        if (host.?.string.len <= 64) {
+            var record = RefusedLeaderHint{
+                .node_id = hinted_id,
+                .port = hinted_port,
+                .host_length = @intCast(host.?.string.len),
+                .host_buffer = undefined,
+            };
+            @memcpy(record.host_buffer[0..host.?.string.len], host.?.string);
+            slot.* = record;
+        }
+    }
     return .rotate;
 }
 
