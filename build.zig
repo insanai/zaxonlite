@@ -31,10 +31,22 @@ fn addSqliteLibrary(
 
 /// Links the system OpenSSL 3 (libssl/libcrypto) that backs the optional
 /// mTLS transport in `src/tls.zig`.
-fn linkOpenSsl(b: *std.Build, module: *std.Build.Module, prefix: []const u8) void {
-    module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{prefix}) });
-    module.linkSystemLibrary("ssl", .{});
-    module.linkSystemLibrary("crypto", .{});
+fn linkOpenSsl(
+    b: *std.Build,
+    module: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    prefix: []const u8,
+) void {
+    if (prefix.len > 0) {
+        module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{prefix}) });
+    }
+    const windows = target.result.os.tag == .windows;
+    module.linkSystemLibrary(if (windows) "libssl" else "ssl", .{
+        .use_pkg_config = .no,
+    });
+    module.linkSystemLibrary(if (windows) "libcrypto" else "crypto", .{
+        .use_pkg_config = .no,
+    });
 }
 
 pub fn build(b: *std.Build) void {
@@ -43,8 +55,11 @@ pub fn build(b: *std.Build) void {
     const openssl_prefix = b.option(
         []const u8,
         "openssl-prefix",
-        "OpenSSL 3 installation prefix (default: Homebrew openssl@3)",
-    ) orelse "/opt/homebrew/opt/openssl@3";
+        "Target OpenSSL 3 SDK prefix (default: Homebrew openssl@3 on macOS)",
+    ) orelse if (target.result.os.tag == .macos)
+        "/opt/homebrew/opt/openssl@3"
+    else
+        "";
 
     const paxos = b.dependency("paxos", .{
         .target = target,
@@ -78,7 +93,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     zaxonlite.linkLibrary(sqlite_lib);
-    linkOpenSsl(b, zaxonlite, openssl_prefix);
+    linkOpenSsl(b, zaxonlite, target, openssl_prefix);
 
     const zaxon = b.addExecutable(.{
         .name = "zaxon",
@@ -309,7 +324,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     bench_zaxonlite.linkLibrary(bench_sqlite);
-    linkOpenSsl(b, bench_zaxonlite, openssl_prefix);
+    linkOpenSsl(b, bench_zaxonlite, target, openssl_prefix);
     const bench_exe = b.addExecutable(.{
         .name = "zaxon-bench",
         .root_module = b.createModule(.{
