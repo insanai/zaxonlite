@@ -381,93 +381,25 @@ pub fn main(init: std.process.Init) !u8 {
         leader_endpoint,
         transport,
     );
-    defer connection.close();
-    const leader_call = struct {
-        fn call(
-            allocator: std.mem.Allocator,
-            io_: Io,
-            endpoint_list: []const Endpoint,
-            connection_slot: **client.Connection,
-            transport_: client.Transport,
-            request: []const u8,
-        ) !void {
-            const body = try connection_slot.*.call(request);
-            if (std.mem.startsWith(u8, body, "{\"ok\":true")) {
-                allocator.free(body);
-                return;
-            }
-            allocator.free(body);
-            var retry = try client.callClusterWithTransport(
-                allocator,
-                io_,
-                endpoint_list,
-                request,
-                true,
-                transport_,
-            );
-            defer retry.deinit(allocator);
-            if (!std.mem.startsWith(u8, retry.body, "{\"ok\":true")) {
-                return error.RequestFailed;
-            }
-            connection_slot.*.close();
-            connection_slot.* = try client.Connection.openWithTransport(
-                allocator,
-                io_,
-                retry.endpoint,
-                transport_,
-            );
-        }
-    }.call;
-
-    // Write path.
-    const write_samples = try gpa.alloc(u64, write_count);
-    defer gpa.free(write_samples);
-    const write_payload = [_]u8{'x'} ** 256;
-    var request_buffer: [640]u8 = undefined;
-    const write_start = nowNs(io);
-    for (0..write_count) |index| {
-        const request = std.fmt.bufPrint(
-            &request_buffer,
-            "{{\"op\":\"exec\",\"sql\":\"insert into b(k, v) values " ++
-                "({d}, '{s}')\"}}",
-            .{ index % 997, &write_payload },
-        ) catch unreachable;
-        const op_start = nowNs(io);
-        try leader_call(gpa, io, &endpoints, &connection, transport, request);
-        write_samples[index] = @intCast(nowNs(io) - op_start);
-    }
-    const write_elapsed = nowNs(io) - write_start;
-    const write_stats = Stats.compute(write_samples);
-    printRow("write", write_count, write_elapsed, write_stats);
-
-    // Leader-local reads and linearizable (read-fence) reads.
-    var read_stats: [2]Stats = undefined;
-    var read_ops: [2]u64 = undefined;
-    inline for (.{ "leader", "linearizable" }, 0..) |level, level_index| {
-        const read_samples = try gpa.alloc(u64, read_count);
-        defer gpa.free(read_samples);
-        const read_start = nowNs(io);
-        for (0..read_count) |index| {
-            const request = std.fmt.bufPrint(
-                &request_buffer,
-                "{{\"op\":\"query\",\"sql\":\"select v from b where id = " ++
-                    "{d}\",\"level\":\"" ++ level ++ "\"}}",
-                .{1 + (index % write_count)},
-            ) catch unreachable;
-            const op_start = nowNs(io);
-            try leader_call(gpa, io, &endpoints, &connection, transport, request);
-            read_samples[index] = @intCast(nowNs(io) - op_start);
-        }
-        const read_elapsed = nowNs(io) - read_start;
-        read_stats[level_index] = Stats.compute(read_samples);
-        read_ops[level_index] = opsPerSecond(read_count, read_elapsed);
-        printRow(
-            "read-" ++ level,
-            read_count,
-            read_elapsed,
-            read_stats[level_index],
-        );
-    }
+    var connection_ptr = connection;
+    defer connection_ptr.close();
+    const write_res = try runBenchWrites(
+        gpa,
+        io,
+        &endpoints,
+        &connection_ptr,
+        transport,
+        write_count,
+    );
+    const read_res = try runBenchReads(
+        gpa,
+        io,
+        &endpoints,
+        &connection_ptr,
+        transport,
+        read_count,
+        write_count,
+    );
 
     const after = try sampleAll(gpa, io, &nodes);
     std.debug.print("per-node resources (workload delta):\n", .{});
@@ -496,17 +428,17 @@ pub fn main(init: std.process.Init) !u8 {
             .mode = @tagName(mode),
             .sync = sync_text,
             .writes = write_count,
-            .payload_bytes = write_payload.len,
-            .write_ops_s = opsPerSecond(write_count, write_elapsed),
-            .write_p50_us = write_stats.p50 / 1000,
-            .write_p95_us = write_stats.p95 / 1000,
-            .write_p99_us = write_stats.p99 / 1000,
-            .write_max_us = write_stats.max / 1000,
+            .payload_bytes = 256,
+            .write_ops_s = opsPerSecond(write_count, write_res.elapsed),
+            .write_p50_us = write_res.stats.p50 / 1000,
+            .write_p95_us = write_res.stats.p95 / 1000,
+            .write_p99_us = write_res.stats.p99 / 1000,
+            .write_max_us = write_res.stats.max / 1000,
             .reads = read_count,
-            .read_leader_ops_s = read_ops[0],
-            .read_leader_p50_us = read_stats[0].p50 / 1000,
-            .read_linearizable_ops_s = read_ops[1],
-            .read_linearizable_p50_us = read_stats[1].p50 / 1000,
+            .read_leader_ops_s = read_res.ops[0],
+            .read_leader_p50_us = read_res.stats[0].p50 / 1000,
+            .read_linearizable_ops_s = read_res.ops[1],
+            .read_linearizable_p50_us = read_res.stats[1].p50 / 1000,
             .max_node_rss_mib = max_rss_mib,
             .max_node_cpu_ms = max_cpu_ms,
         });
@@ -665,39 +597,7 @@ fn spawnNode(
         try scratch.append(gpa, peer_text);
         try argv.appendSlice(gpa, &.{ "--peer", peer_text });
     }
-    switch (mode) {
-        .plaintext => try argv.appendSlice(gpa, &.{
-            "--enable-failpoints",
-            "--insecure-test-tcp",
-        }),
-        .psk => {
-            const secret_path = try std.fmt.allocPrint(gpa, "{s}/secret", .{root});
-            try scratch.append(gpa, secret_path);
-            try argv.appendSlice(gpa, &.{ "--auth-file", secret_path });
-            try argv.append(gpa, "--dev-psk");
-        },
-        .tls => {
-            const cert = try std.fmt.allocPrint(
-                gpa,
-                "{s}/n{d}.crt",
-                .{ root, node.id },
-            );
-            try scratch.append(gpa, cert);
-            const key = try std.fmt.allocPrint(
-                gpa,
-                "{s}/n{d}.key",
-                .{ root, node.id },
-            );
-            try scratch.append(gpa, key);
-            const ca = try std.fmt.allocPrint(gpa, "{s}/ca.crt", .{root});
-            try scratch.append(gpa, ca);
-            try argv.appendSlice(gpa, &.{
-                "--tls-cert", cert,
-                "--tls-key",  key,
-                "--tls-ca",   ca,
-            });
-        },
-    }
+    try appendSpawnNodeModeArgs(gpa, argv, scratch, root, node.id, mode);
 
     try argv.appendSlice(gpa, &.{ "--sync", sync_text });
 
@@ -715,4 +615,146 @@ fn spawnNode(
         .stderr = .{ .file = log_file },
     });
     log_file.close(io);
+}
+
+const BenchWriteResult = struct {
+    elapsed: u64,
+    stats: Stats,
+};
+
+const BenchReadResult = struct {
+    ops: [2]u64,
+    stats: [2]Stats,
+};
+
+fn runBenchWrites(
+    gpa: std.mem.Allocator,
+    io: Io,
+    endpoints: []const Endpoint,
+    connection: **client.Connection,
+    transport: client.Transport,
+    write_count: usize,
+) !BenchWriteResult {
+    const write_samples = try gpa.alloc(u64, write_count);
+    defer gpa.free(write_samples);
+    const write_payload = [_]u8{'x'} ** 256;
+    var request_buffer: [640]u8 = undefined;
+    const write_start = nowNs(io);
+    for (0..write_count) |index| {
+        const request = std.fmt.bufPrint(
+            &request_buffer,
+            "{{\"op\":\"exec\",\"sql\":\"insert into b(k, v) values ({d}, '{s}')\"}}",
+            .{ index % 997, &write_payload },
+        ) catch unreachable;
+        const op_start = nowNs(io);
+        try executeLeaderCall(gpa, io, endpoints, connection, transport, request);
+        write_samples[index] = @intCast(nowNs(io) - op_start);
+    }
+    const write_elapsed = nowNs(io) - write_start;
+    const write_stats = Stats.compute(write_samples);
+    printRow("write", write_count, write_elapsed, write_stats);
+    return .{ .elapsed = write_elapsed, .stats = write_stats };
+}
+
+fn runBenchReads(
+    gpa: std.mem.Allocator,
+    io: Io,
+    endpoints: []const Endpoint,
+    connection: **client.Connection,
+    transport: client.Transport,
+    read_count: usize,
+    write_count: usize,
+) !BenchReadResult {
+    var read_stats: [2]Stats = undefined;
+    var read_ops: [2]u64 = undefined;
+    var request_buffer: [640]u8 = undefined;
+    inline for (.{ "leader", "linearizable" }, 0..) |level, level_index| {
+        const read_samples = try gpa.alloc(u64, read_count);
+        defer gpa.free(read_samples);
+        const read_start = nowNs(io);
+        for (0..read_count) |index| {
+            const request = std.fmt.bufPrint(
+                &request_buffer,
+                "{{\"op\":\"query\",\"sql\":\"select v from b where id = {d}\"," ++
+                    "\"level\":\"" ++ level ++ "\"}}",
+                .{1 + (index % write_count)},
+            ) catch unreachable;
+            const op_start = nowNs(io);
+            try executeLeaderCall(gpa, io, endpoints, connection, transport, request);
+            read_samples[index] = @intCast(nowNs(io) - op_start);
+        }
+        const read_elapsed = nowNs(io) - read_start;
+        read_stats[level_index] = Stats.compute(read_samples);
+        read_ops[level_index] = opsPerSecond(read_count, read_elapsed);
+        printRow("read-" ++ level, read_count, read_elapsed, read_stats[level_index]);
+    }
+    return .{ .ops = read_ops, .stats = read_stats };
+}
+
+fn executeLeaderCall(
+    allocator: std.mem.Allocator,
+    io_: Io,
+    endpoint_list: []const Endpoint,
+    connection_slot: **client.Connection,
+    transport_: client.Transport,
+    request: []const u8,
+) !void {
+    const body = try connection_slot.*.call(request);
+    if (std.mem.startsWith(u8, body, "{\"ok\":true")) {
+        allocator.free(body);
+        return;
+    }
+    allocator.free(body);
+    var retry = try client.callClusterWithTransport(
+        allocator,
+        io_,
+        endpoint_list,
+        request,
+        true,
+        transport_,
+    );
+    defer retry.deinit(allocator);
+    if (!std.mem.startsWith(u8, retry.body, "{\"ok\":true")) return error.RequestFailed;
+    connection_slot.*.close();
+    connection_slot.* = try client.Connection.openWithTransport(
+        allocator,
+        io_,
+        retry.endpoint,
+        transport_,
+    );
+}
+
+fn appendSpawnNodeModeArgs(
+    gpa: std.mem.Allocator,
+    argv: *std.ArrayList([]const u8),
+    scratch: *std.ArrayList([]u8),
+    root: []const u8,
+    node_id: u32,
+    mode: Mode,
+) !void {
+    switch (mode) {
+        .plaintext => try argv.appendSlice(gpa, &.{
+            "--enable-failpoints",
+            "--insecure-test-tcp",
+        }),
+        .psk => {
+            const secret_path = try std.fmt.allocPrint(gpa, "{s}/secret", .{root});
+            try scratch.append(gpa, secret_path);
+            try argv.appendSlice(gpa, &.{ "--auth-file", secret_path });
+            try argv.append(gpa, "--dev-psk");
+        },
+        .tls => {
+            const cert = try std.fmt.allocPrint(gpa, "{s}/n{d}.crt", .{ root, node_id });
+            try scratch.append(gpa, cert);
+            const key = try std.fmt.allocPrint(gpa, "{s}/n{d}.key", .{ root, node_id });
+            try scratch.append(gpa, key);
+            const ca = try std.fmt.allocPrint(gpa, "{s}/ca.crt", .{root});
+            try scratch.append(gpa, ca);
+            try argv.appendSlice(gpa, &.{
+                "--tls-cert", cert,
+                "--tls-key",  key,
+                "--tls-ca",   ca,
+            });
+        },
+    }
 }

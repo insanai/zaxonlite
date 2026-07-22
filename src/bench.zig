@@ -100,15 +100,20 @@ pub fn main(init: std.process.Init) !u8 {
     defer Io.Dir.cwd().deleteTree(io, root) catch {};
 
     std.debug.print(
-        "zaxonlite benchmark: {d} writes, {d} reads " ++
-            "(fsync per write: payload + journal)\n",
+        "zaxonlite benchmark: {d} writes, {d} reads (fsync per write: payload + journal)\n",
         .{ write_count, read_count },
     );
 
     var node = try Node.open(gpa, io, .{ .directory = root });
     _ = try node.exec("create table b(id integer primary key, k integer, v text)");
 
-    // Write path.
+    try benchWrites(gpa, io, node, write_count);
+    try benchReads(gpa, io, node, read_count, write_count);
+    try benchRecovery(gpa, io, &node, root, write_count);
+    return 0;
+}
+
+fn benchWrites(gpa: std.mem.Allocator, io: std.Io, node: *Node, write_count: usize) !void {
     const write_samples = try gpa.alloc(u64, write_count);
     defer gpa.free(write_samples);
     var sql_buffer: [160]u8 = undefined;
@@ -125,11 +130,18 @@ pub fn main(init: std.process.Init) !u8 {
     }
     const write_elapsed = nowNs(io) - write_start;
     printRow("write", write_count, write_elapsed, Stats.compute(write_samples));
+}
 
-    // Read path (point query on the live connection; no log append, no
-    // disk sync — the single-node equivalent of the fence read path).
+fn benchReads(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    node: *Node,
+    read_count: usize,
+    write_count: usize,
+) !void {
     const read_samples = try gpa.alloc(u64, read_count);
     defer gpa.free(read_samples);
+    var sql_buffer: [160]u8 = undefined;
     const read_start = nowNs(io);
     for (0..read_count) |index| {
         const sql = std.fmt.bufPrint(
@@ -144,15 +156,21 @@ pub fn main(init: std.process.Init) !u8 {
     }
     const read_elapsed = nowNs(io) - read_start;
     printRow("read", read_count, read_elapsed, Stats.compute(read_samples));
+}
 
-    // Recovery: reopen with the whole epoch suffix to replay and apply.
-    node.close();
+fn benchRecovery(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    node_ptr: **Node,
+    root: []const u8,
+    write_count: usize,
+) !void {
+    node_ptr.*.close();
     const recovery_start = nowNs(io);
-    node = try Node.open(gpa, io, .{ .directory = root });
+    node_ptr.* = try Node.open(gpa, io, .{ .directory = root });
     const recovery_elapsed = nowNs(io) - recovery_start;
     std.debug.print(
-        "{s:<18} {d:>7} ms (journal replay + image validation, " ++
-            "{d} committed writes)\n",
+        "{s:<18} {d:>7} ms (journal replay + image validation, {d} committed writes)\n",
         .{
             "recovery",
             @as(u64, @intCast(@divTrunc(recovery_elapsed, std.time.ns_per_ms))),
@@ -160,20 +178,15 @@ pub fn main(init: std.process.Init) !u8 {
         },
     );
 
-    // Snapshot + rebuild-from-scratch recovery.
-    try node.snapshot();
-    node.close();
+    try node_ptr.*.snapshot();
+    node_ptr.*.close();
     {
         var db_buffer: [96]u8 = undefined;
-        const db_path = std.fmt.bufPrint(
-            &db_buffer,
-            "{s}/current.db",
-            .{root},
-        ) catch unreachable;
+        const db_path = std.fmt.bufPrint(&db_buffer, "{s}/current.db", .{root}) catch unreachable;
         Io.Dir.cwd().deleteFile(io, db_path) catch {};
     }
     const rebuild_start = nowNs(io);
-    node = try Node.open(gpa, io, .{ .directory = root });
+    node_ptr.* = try Node.open(gpa, io, .{ .directory = root });
     const rebuild_elapsed = nowNs(io) - rebuild_start;
     std.debug.print(
         "{s:<18} {d:>7} ms (image restored from snapshot)\n",
@@ -182,6 +195,5 @@ pub fn main(init: std.process.Init) !u8 {
             @as(u64, @intCast(@divTrunc(rebuild_elapsed, std.time.ns_per_ms))),
         },
     );
-    node.close();
-    return 0;
+    node_ptr.*.close();
 }

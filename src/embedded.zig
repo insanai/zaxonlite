@@ -106,14 +106,8 @@ pub const Embedded = struct {
     /// release it with `close`, never with `gpa.destroy`. `gpa` and `io` must
     /// outlive the facade. Startup replays the local journal, so a node with
     /// existing state is durable-consistent before `open` returns.
-    pub fn open(
-        gpa: std.mem.Allocator,
-        io: Io,
-        options: OpenOptions,
-    ) !*Embedded {
-        if (options.members.len == 0 or
-            options.members.len > max_registry_members)
-        {
+    fn validateOpenOptions(gpa: std.mem.Allocator, options: OpenOptions) !void {
+        if (options.members.len == 0 or options.members.len > max_registry_members) {
             return error.InvalidMemberCount;
         }
         var voter_count: usize = 0;
@@ -131,6 +125,15 @@ pub const Embedded = struct {
             return error.InvalidVoterCount;
         }
         if (campaigner_count == 0) return error.CampaignerRequired;
+    }
+
+    pub fn open(
+        gpa: std.mem.Allocator,
+        io: Io,
+        options: OpenOptions,
+    ) !*Embedded {
+        try validateOpenOptions(gpa, options);
+
         const self = try gpa.create(Embedded);
         errdefer gpa.destroy(self);
         self.* = undefined;
@@ -138,45 +141,36 @@ pub const Embedded = struct {
         self.io = io;
         self.arena = std.heap.ArenaAllocator.init(gpa);
         errdefer self.arena.deinit();
-        const allocator = self.arena.allocator();
 
+        try self.initEmbeddedState(options);
+        self.client_mutex = .init;
+        self.cluster = client.ClusterConnection.init(
+            gpa,
+            io,
+            self.endpoints,
+            self.transport(),
+        );
+        errdefer self.cluster.deinit();
+        self.finished = .init(false);
+        self.exit_code = .init(255);
+        self.thread = try std.Thread.spawn(.{}, runServer, .{self});
+        errdefer self.thread.join();
+        try self.waitUntilListening(options.startup_timeout_ms);
+        return self;
+    }
+
+    fn initEmbeddedState(self: *Embedded, options: OpenOptions) !void {
+        const allocator = self.arena.allocator();
         const directory = try allocator.dupe(u8, options.directory);
-        const peers = try allocator.alloc(server.PeerAddress, options.members.len);
-        const endpoints = try allocator.alloc(client.Endpoint, options.members.len);
-        const backends = try allocator.alloc(client.Endpoint, options.members.len);
-        var backend_count: usize = 0;
-        var self_endpoint: ?client.Endpoint = null;
-        var self_role: ?roles.Role = null;
-        for (options.members, 0..) |member, index| {
-            const address = try allocator.dupe(u8, member.address);
-            const endpoint = try client.Endpoint.parse(address);
-            peers[index] = .{
-                .id = member.id,
-                .host = endpoint.host,
-                .port = endpoint.port,
-                .role = member.role,
-            };
-            endpoints[index] = endpoint;
-            const capabilities = member.role.capabilities();
-            if (capabilities.serves_reads or capabilities.serves_writes) {
-                backends[backend_count] = endpoint;
-                backend_count += 1;
-            }
-            if (member.id == options.node_id) {
-                self_endpoint = endpoint;
-                self_role = member.role;
-            }
-        }
-        const own = self_endpoint orelse return error.NotMember;
-        const own_role = self_role orelse return error.NotMember;
-        const secret = if (options.auth_secret) |bytes|
-            try allocator.dupe(u8, bytes)
-        else
-            null;
-        const cluster_id = if (options.cluster_id) |text|
-            try allocator.dupe(u8, text)
-        else
-            null;
+        const parsed_members = try parseOpenMembers(allocator, options.members, options.node_id);
+        const own = parsed_members.self_endpoint orelse return error.NotMember;
+        const own_role = parsed_members.self_role orelse return error.NotMember;
+        const peers = parsed_members.peers;
+        const endpoints = parsed_members.endpoints;
+        const backends = parsed_members.backends;
+        const backend_count = parsed_members.backend_count;
+        const secret = if (options.auth_secret) |bytes| try allocator.dupe(u8, bytes) else null;
+        const cluster_id = if (options.cluster_id) |text| try allocator.dupe(u8, text) else null;
         const tls_config: ?tls.Config = if (options.tls) |config| .{
             .cert_path = try allocator.dupe(u8, config.cert_path),
             .key_path = try allocator.dupe(u8, config.key_path),
@@ -197,8 +191,7 @@ pub const Embedded = struct {
             .auth_secret = secret,
             .tls = tls_config,
             .enrollment_ca_key = enrollment_ca_key,
-            .enable_failpoints = options.enable_test_faults or
-                options.allow_insecure_test_tcp,
+            .enable_failpoints = options.enable_test_faults or options.allow_insecure_test_tcp,
             .allow_insecure_test_tcp = options.allow_insecure_test_tcp,
             .test_faults = options.test_faults,
         };
@@ -218,20 +211,56 @@ pub const Embedded = struct {
             self.tls_client = try tls.Context.initClient(config);
         }
         errdefer if (self.tls_client) |*context| context.deinit();
-        self.client_mutex = .init;
-        self.cluster = client.ClusterConnection.init(
-            gpa,
-            io,
-            endpoints,
-            self.transport(),
-        );
-        errdefer self.cluster.deinit();
-        self.finished = .init(false);
-        self.exit_code = .init(255);
-        self.thread = try std.Thread.spawn(.{}, runServer, .{self});
-        errdefer self.thread.join();
-        try self.waitUntilListening(options.startup_timeout_ms);
-        return self;
+    }
+
+    const ParsedMembers = struct {
+        peers: []server.PeerAddress,
+        endpoints: []client.Endpoint,
+        backends: []client.Endpoint,
+        backend_count: usize,
+        self_endpoint: ?client.Endpoint,
+        self_role: ?roles.Role,
+    };
+
+    fn parseOpenMembers(
+        allocator: std.mem.Allocator,
+        members: []const Member,
+        self_node_id: u32,
+    ) !ParsedMembers {
+        const peers = try allocator.alloc(server.PeerAddress, members.len);
+        const endpoints = try allocator.alloc(client.Endpoint, members.len);
+        const backends = try allocator.alloc(client.Endpoint, members.len);
+        var backend_count: usize = 0;
+        var self_endpoint: ?client.Endpoint = null;
+        var self_role: ?roles.Role = null;
+        for (members, 0..) |member, index| {
+            const address = try allocator.dupe(u8, member.address);
+            const endpoint = try client.Endpoint.parse(address);
+            peers[index] = .{
+                .id = member.id,
+                .host = endpoint.host,
+                .port = endpoint.port,
+                .role = member.role,
+            };
+            endpoints[index] = endpoint;
+            const capabilities = member.role.capabilities();
+            if (capabilities.serves_reads or capabilities.serves_writes) {
+                backends[backend_count] = endpoint;
+                backend_count += 1;
+            }
+            if (member.id == self_node_id) {
+                self_endpoint = endpoint;
+                self_role = member.role;
+            }
+        }
+        return .{
+            .peers = peers,
+            .endpoints = endpoints,
+            .backends = backends,
+            .backend_count = backend_count,
+            .self_endpoint = self_endpoint,
+            .self_role = self_role,
+        };
     }
 
     fn waitUntilListening(self: *Embedded, timeout_ms: u64) !void {

@@ -175,32 +175,14 @@ export fn zaxonlite_cluster_open(
     {
         return misuse_code;
     }
-    const secret: ?[]const u8 = if (options.auth_secret) |pointer| blk: {
-        if (options.auth_secret_length == 0 or
-            options.auth_secret_length >
-                zaxonlite.configuration.maximum_secret_file_bytes)
-        {
-            return misuse_code;
-        }
-        break :blk @as([*]const u8, @ptrCast(pointer))[0..options.auth_secret_length];
-    } else if (options.auth_secret_length == 0)
-        null
-    else
-        return misuse_code;
+    const secret = parseAuthSecret(options) catch return misuse_code;
 
-    const members = gpa.alloc(zaxonlite.EmbeddedMember, options.member_count) catch
-        return unavailable_code;
+    const members = parseClusterMembers(options) catch |err| switch (err) {
+        error.Misuse => return misuse_code,
+        error.Unavailable => return unavailable_code,
+        else => return unavailable_code,
+    };
     defer gpa.free(members);
-    for (raw_members[0..options.member_count], members) |source, *destination| {
-        const address = source.address orelse return misuse_code;
-        const role = std.enums.fromInt(zaxonlite.Role, source.role) orelse
-            return misuse_code;
-        destination.* = .{
-            .id = source.id,
-            .address = std.mem.span(address),
-            .role = role,
-        };
-    }
 
     const handle = gpa.create(ClusterHandle) catch return unavailable_code;
     handle.* = .{
@@ -208,10 +190,7 @@ export fn zaxonlite_cluster_open(
         .embedded = undefined,
     };
     handle.error_buffer[0] = 0;
-    const timeout = if (options.startup_timeout_ms == 0)
-        10_000
-    else
-        options.startup_timeout_ms;
+    const timeout = if (options.startup_timeout_ms == 0) 10_000 else options.startup_timeout_ms;
     const any_tls = options.tls_cert_path != null or
         options.tls_key_path != null or options.tls_ca_path != null;
     if (any_tls and (options.tls_cert_path == null or
@@ -241,6 +220,37 @@ export fn zaxonlite_cluster_open(
     };
     out.* = handle;
     return ok_code;
+}
+
+fn parseAuthSecret(options: *const CClusterOptions) !?[]const u8 {
+    if (options.auth_secret) |pointer| {
+        if (options.auth_secret_length == 0 or
+            options.auth_secret_length > zaxonlite.configuration.maximum_secret_file_bytes)
+        {
+            return error.Misuse;
+        }
+        return @as([*]const u8, @ptrCast(pointer))[0..options.auth_secret_length];
+    } else if (options.auth_secret_length == 0) {
+        return null;
+    }
+    return error.Misuse;
+}
+
+fn parseClusterMembers(options: *const CClusterOptions) ![]zaxonlite.EmbeddedMember {
+    const raw_members = options.members orelse return error.Misuse;
+    const members = gpa.alloc(zaxonlite.EmbeddedMember, options.member_count) catch
+        return error.Unavailable;
+    errdefer gpa.free(members);
+    for (raw_members[0..options.member_count], members) |source, *destination| {
+        const address = source.address orelse return error.Misuse;
+        const role = std.enums.fromInt(zaxonlite.Role, source.role) orelse return error.Misuse;
+        destination.* = .{
+            .id = source.id,
+            .address = std.mem.span(address),
+            .role = role,
+        };
+    }
+    return members;
 }
 
 export fn zaxonlite_cluster_close(pointer: ?*anyopaque) void {
