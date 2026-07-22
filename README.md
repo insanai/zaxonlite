@@ -104,8 +104,9 @@ deferred; the checked recovery fixture is 1 MiB.
 
 ## Build and test
 
-Requires Zig 0.16 and (for the book) Typst. SQLite 3.50.4 is a pinned
-`build.zig.zon` dependency; the parent Paxos library is a path dependency.
+Requires Zig 0.16, system OpenSSL 3, and (for the book) Typst. SQLite 3.50.4
+is a pinned `build.zig.zon` dependency; the parent Paxos library is a path
+dependency. Cross-builds pass `-Dopenssl-prefix` for the target OpenSSL SDK.
 
 ```sh
 cd zaxonlite
