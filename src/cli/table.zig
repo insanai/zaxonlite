@@ -61,15 +61,14 @@ fn cellWidth(cell: ?[]const u8) u16 {
 
 fn cellNumeric(cell: []const u8) bool {
     if (cell.len == 0) return false;
-    for (cell) |byte| {
-        const ok = std.ascii.isDigit(byte) or byte == '.' or byte == '-' or
-            byte == '+' or byte == 'e' or byte == 'E';
-        if (!ok) return false;
-    }
+    _ = std.fmt.parseFloat(f64, cell) catch return false;
     return true;
 }
 
-const max_columns = 256;
+// SQLite's default and compiled-in maximum. Keeping the fixed layout at the
+// database bound avoids allocation while never silently dropping valid result
+// columns (the former 256-column cap did exactly that).
+const max_columns = 2000;
 
 const Layout = struct {
     widths: [max_columns]u16,
@@ -80,8 +79,9 @@ const Layout = struct {
         var layout = Layout{
             .widths = @splat(0),
             .numeric = @splat(true),
-            .column_count = @min(view.columns.len, max_columns),
+            .column_count = view.columns.len,
         };
+        std.debug.assert(layout.column_count <= max_columns);
         for (view.columns[0..layout.column_count], 0..) |column, index| {
             layout.widths[index] = sanitizedWidth(column);
         }
@@ -109,6 +109,7 @@ const Layout = struct {
 
 /// Whether `auto` mode should fall back to the expanded per-record layout.
 pub fn shouldExpand(view: View, terminal_width: u16) bool {
+    if (view.columns.len > max_columns) return true;
     const layout = Layout.measure(view);
     return layout.totalWidth() > terminal_width;
 }
@@ -172,7 +173,10 @@ pub fn write(view: View, options: Options, out: *std.Io.Writer) !usize {
         else => options.mode,
     };
     switch (mode) {
-        .table => try writeAligned(view, options, out),
+        .table => {
+            if (view.columns.len > max_columns) return error.TooManyColumns;
+            try writeAligned(view, options, out);
+        },
         .expanded => try writeExpanded(view, options, out),
         .csv => try writeCsv(view, out),
         .json => try render.writeJsonResult(view, out),
@@ -245,7 +249,7 @@ fn writeRule(
     try out.writeAll(left);
     for (layout.widths[0..layout.column_count], 0..) |width, index| {
         if (index > 0) try out.writeAll(join);
-        for (0..width + 2) |_| try out.writeAll(rules.horizontal);
+        for (0..@as(u32, width) + 2) |_| try out.writeAll(rules.horizontal);
     }
     try out.writeAll(right);
     try out.writeAll("\n");
@@ -314,7 +318,7 @@ fn writeCsvField(text: []const u8, out: *std.Io.Writer) !void {
     for (text) |byte| {
         if (byte == '"') {
             try out.writeAll("\"\"");
-        } else if (isControlByte(byte) and byte != '\n' and byte != '\r') {
+        } else if (isControlByte(byte)) {
             try out.writeAll(&.{ '^', byte ^ 0x40 });
         } else {
             try out.writeAll(&.{byte});

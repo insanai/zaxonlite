@@ -12,10 +12,12 @@ const std = @import("std");
 
 pub const max_entries = 1000;
 const max_file_bytes = 4 * 1024 * 1024;
+const max_entry_bytes = 64 * 1024;
 
 pub const History = struct {
     gpa: std.mem.Allocator,
     entries: std.ArrayList([]u8) = .empty,
+    encoded_bytes: usize = 0,
     nav: ?usize = null,
     saved: ?[]u8 = null,
 
@@ -42,7 +44,7 @@ pub const History = struct {
     /// escape hatch for sensitive statements; consecutive duplicates are
     /// stored once; the oldest entry is evicted beyond the bound.
     pub fn append(self: *History, text: []const u8) !void {
-        if (text.len == 0 or text[0] == ' ') return;
+        if (text.len == 0 or text.len > max_entry_bytes or text[0] == ' ') return;
         if (self.entries.items.len > 0) {
             const last = self.entries.items[self.entries.items.len - 1];
             if (std.mem.eql(u8, last, text)) return;
@@ -50,8 +52,12 @@ pub const History = struct {
         const copy = try self.gpa.dupe(u8, text);
         errdefer self.gpa.free(copy);
         try self.entries.append(self.gpa, copy);
-        if (self.entries.items.len > max_entries) {
+        self.encoded_bytes += encodedSize(text) + 1;
+        while (self.entries.items.len > max_entries or
+            self.encoded_bytes > max_file_bytes)
+        {
             const evicted = self.entries.orderedRemove(0);
+            self.encoded_bytes -= encodedSize(evicted) + 1;
             self.gpa.free(evicted);
         }
     }
@@ -123,12 +129,18 @@ pub const History = struct {
             path,
             self.gpa,
             .limited(max_file_bytes),
-        ) catch return;
+        ) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
         defer self.gpa.free(bytes);
         var lines = std.mem.splitScalar(u8, bytes, '\n');
         while (lines.next()) |line| {
             if (line.len == 0) continue;
-            const decoded = try decodeAlloc(self.gpa, line);
+            const decoded = decodeAlloc(self.gpa, line) catch |err| switch (err) {
+                error.InvalidEscape => continue,
+                else => return err,
+            };
             defer self.gpa.free(decoded);
             try self.append(decoded);
         }
@@ -143,13 +155,26 @@ pub const History = struct {
             try encode(&data.writer, item);
             try data.writer.writeAll("\n");
         }
-        try std.Io.Dir.cwd().writeFile(io, .{
-            .sub_path = path,
-            .data = data.written(),
-            .flags = .{ .permissions = @enumFromInt(0o600) },
+        var file = try std.Io.Dir.cwd().createFile(io, path, .{
+            .truncate = false,
+            .permissions = @enumFromInt(0o600),
         });
+        defer file.close(io);
+        // Creation permissions do not tighten an existing file, so enforce
+        // the security invariant on the opened handle before writing data.
+        try file.setPermissions(io, @enumFromInt(0o600));
+        try file.setLength(io, 0);
+        try file.writeStreamingAll(io, data.written());
     }
 };
+
+fn encodedSize(text: []const u8) usize {
+    var size: usize = 0;
+    for (text) |byte| {
+        size += if (byte == '\\' or byte == '\n') 2 else 1;
+    }
+    return size;
+}
 
 fn encode(out: *std.Io.Writer, text: []const u8) !void {
     for (text) |byte| {
@@ -163,13 +188,19 @@ fn encode(out: *std.Io.Writer, text: []const u8) !void {
 
 fn decodeAlloc(gpa: std.mem.Allocator, line: []const u8) ![]u8 {
     var decoded = try gpa.alloc(u8, line.len);
+    errdefer gpa.free(decoded);
     var length: usize = 0;
     var index: usize = 0;
     while (index < line.len) : (index += 1) {
         const byte = line[index];
-        if (byte == '\\' and index + 1 < line.len) {
+        if (byte == '\\' and index + 1 == line.len) return error.InvalidEscape;
+        if (byte == '\\') {
             index += 1;
-            decoded[length] = if (line[index] == 'n') '\n' else line[index];
+            decoded[length] = switch (line[index]) {
+                'n' => '\n',
+                '\\' => '\\',
+                else => return error.InvalidEscape,
+            };
         } else {
             decoded[length] = byte;
         }

@@ -13,9 +13,14 @@ const history_mod = @import("history.zig");
 const highlight = @import("highlight.zig");
 const table = @import("table.zig");
 const render = @import("render.zig");
+const shell = @import("shell.zig");
 
 const Key = term.Key;
 const Editor = editor_mod.Editor;
+
+test "shell module declarations compile" {
+    try testing.expect(shell.isReadStatement("select 1"));
+}
 
 fn keyOf(text: []const u8) Key {
     const view = std.unicode.Utf8View.init(text) catch unreachable;
@@ -94,6 +99,19 @@ test "editor word movement and kill operations" {
     _ = editor.feed(alt('b'));
     _ = editor.feed(ctrl('k'));
     try testing.expectEqualStrings("abc ", editor.text());
+    _ = editor.feed(ctrl('y'));
+    try testing.expectEqualStrings("abc def", editor.text());
+}
+
+test "editor history replacement preserves UTF-8 boundaries" {
+    var editor = Editor{};
+    const prefix = "x" ** (editor_mod.capacity - 1);
+    editor.setText(prefix ++ "\u{1f44d}");
+    try testing.expectEqual(prefix.len, editor.text().len);
+    try testing.expect(std.unicode.utf8ValidateSlice(editor.text()));
+
+    editor.setText("bad\xffhistory");
+    try testing.expectEqual(@as(usize, 0), editor.text().len);
 }
 
 test "editor control actions map to shell actions" {
@@ -189,6 +207,9 @@ test "statement completion follows quotes and comments" {
     try testing.expect(!highlight.statementComplete("insert into t\nvalues (1)"));
     try testing.expect(highlight.statementComplete("insert into t\nvalues (1);"));
     try testing.expect(highlight.statementComplete("select 'it''s fine';"));
+    try testing.expect(!highlight.statementComplete("select 1; /* unfinished"));
+    try testing.expect(!highlight.statementComplete("select \"unfinished;"));
+    try testing.expect(!highlight.statementComplete("select [unfinished;"));
 }
 
 test "keyword matching is case-insensitive and bounded" {
@@ -213,6 +234,33 @@ test "history dedupes, skips secrets, and stays bounded" {
     try testing.expectEqual(@as(usize, 1), history.count());
     try history.append("select 2;");
     try testing.expectEqual(@as(usize, 2), history.count());
+}
+
+test "history persistence representation stays within its file bound" {
+    var history = history_mod.History.init(testing.allocator);
+    defer history.deinit();
+    const entry = "\\" ** (8 * 1024);
+    for (0..400) |index| {
+        var buffer: [32]u8 = undefined;
+        const suffix = try std.fmt.bufPrint(&buffer, "{d}", .{index});
+        var value: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer value.deinit();
+        try value.writer.writeAll(entry);
+        try value.writer.writeAll(suffix);
+        try history.append(value.written());
+    }
+    try testing.expect(history.count() < 400);
+
+    var persisted: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer persisted.deinit();
+    for (0..history.count()) |index| {
+        for (history.entry(index)) |byte| {
+            if (byte == '\\' or byte == '\n') try persisted.writer.writeAll("\\");
+            try persisted.writer.writeAll(&.{byte});
+        }
+        try persisted.writer.writeAll("\n");
+    }
+    try testing.expect(persisted.written().len <= 4 * 1024 * 1024);
 }
 
 test "history navigation preserves the in-progress line" {
@@ -285,6 +333,38 @@ test "history persists multi-line entries with owner-only permissions" {
     try testing.expectEqualStrings(
         "with a\\b as (select 1) select * from a\\b;",
         loaded.entry(1),
+    );
+}
+
+test "history save tightens an existing file and skips malformed records" {
+    const io = testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &path_buffer);
+    const path = try std.fmt.allocPrint(
+        testing.allocator,
+        "{s}/.zaxon_history",
+        .{path_buffer[0..dir_len]},
+    );
+    defer testing.allocator.free(path);
+
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = path,
+        .data = "bad\\qrecord\nvalid;\n",
+        .flags = .{ .permissions = @enumFromInt(0o644) },
+    });
+    var history = history_mod.History.init(testing.allocator);
+    defer history.deinit();
+    try history.load(io, path);
+    try testing.expectEqual(@as(usize, 1), history.count());
+    try testing.expectEqualStrings("valid;", history.entry(0));
+    try history.save(io, path);
+
+    const stat = try std.Io.Dir.cwd().statFile(io, path, .{});
+    try testing.expectEqual(
+        @as(u32, 0o600),
+        @as(u32, @intCast(@intFromEnum(stat.permissions) & 0o777)),
     );
 }
 
@@ -372,6 +452,23 @@ test "auto mode expands when the table exceeds the terminal" {
     try testing.expect(table.shouldExpand(golden_view, 20));
 }
 
+test "aligned tables do not truncate wide SQLite result sets" {
+    const columns = try testing.allocator.alloc([]const u8, 257);
+    defer testing.allocator.free(columns);
+    @memset(columns, "x");
+    const view = render.View{ .columns = columns, .rows = &.{} };
+    var output: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer output.deinit();
+    _ = try table.write(view, .{
+        .mode = .table,
+        .caps = .{ .color = false, .unicode = false },
+    }, &output.writer);
+    try testing.expectEqual(
+        @as(usize, 257),
+        std.mem.count(u8, output.written(), "| x "),
+    );
+}
+
 test "csv output quotes and escapes" {
     const view = render.View{
         .columns = &.{ "a", "b" },
@@ -387,6 +484,16 @@ test "csv output quotes and escapes" {
         "plain,\"with,comma\"\n" ++
         "\"quote\"\"inside\",\n";
     try testing.expectEqualStrings(expected, output);
+}
+
+test "csv renders line controls visibly" {
+    const view = render.View{
+        .columns = &.{"payload"},
+        .rows = &.{&.{"first\nsecond\r"}},
+    };
+    var buffer: [128]u8 = undefined;
+    const output = try renderToBuffer(&buffer, view, .{ .mode = .csv });
+    try testing.expectEqualStrings("payload\n\"first^Jsecond^M\"\n", output);
 }
 
 test "hostile cells cannot inject escape sequences" {

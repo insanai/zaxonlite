@@ -219,12 +219,27 @@ pub fn statementComplete(source: []const u8) bool {
     var last_semicolon = false;
     while (tokenizer.next()) |span| {
         switch (span.kind) {
-            .text, .comment => continue,
+            .text => continue,
+            .comment => {
+                const body = span.bytes(source);
+                if (std.mem.startsWith(u8, body, "/*") and
+                    !std.mem.endsWith(u8, body, "*/")) return false;
+                continue;
+            },
             .operator => last_semicolon = source[span.start] == ';',
             .string => {
                 // An unterminated string keeps the statement open.
                 const body = span.bytes(source);
                 if (body.len < 2 or !closedQuote(body, '\'')) return false;
+                last_semicolon = false;
+            },
+            .identifier => {
+                const body = span.bytes(source);
+                if (body.len > 0) switch (body[0]) {
+                    '"', '`' => if (!closedQuote(body, body[0])) return false,
+                    '[' => if (body.len < 2 or body[body.len - 1] != ']') return false,
+                    else => {},
+                };
                 last_semicolon = false;
             },
             else => last_semicolon = false,

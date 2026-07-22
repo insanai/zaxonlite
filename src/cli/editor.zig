@@ -30,6 +30,8 @@ pub const Editor = struct {
     buffer: [capacity]u8 = undefined,
     len: usize = 0,
     cursor: usize = 0,
+    yank_buffer: [capacity]u8 = undefined,
+    yank_len: usize = 0,
 
     pub fn text(self: *const Editor) []const u8 {
         return self.buffer[0..self.len];
@@ -41,9 +43,19 @@ pub const Editor = struct {
     }
 
     /// Replaces the buffer (history recall). Oversized text is truncated at
-    /// the capacity; the cursor moves to the end.
+    /// the capacity without splitting UTF-8; invalid UTF-8 is rejected so the
+    /// cursor invariant remains true.
     pub fn setText(self: *Editor, new_text: []const u8) void {
-        const n = @min(new_text.len, capacity);
+        var n = @min(new_text.len, capacity);
+        while (n > 0 and n < new_text.len and
+            new_text[n] & 0xc0 == 0x80)
+        {
+            n -= 1;
+        }
+        if (!std.unicode.utf8ValidateSlice(new_text[0..n])) {
+            self.clear();
+            return;
+        }
         @memcpy(self.buffer[0..n], new_text[0..n]);
         self.len = n;
         self.cursor = n;
@@ -82,6 +94,7 @@ pub const Editor = struct {
         if (key.matches('w', .{ .ctrl = true })) return self.killPrevWord();
         if (key.matches('u', .{ .ctrl = true })) return self.killToStart();
         if (key.matches('k', .{ .ctrl = true })) return self.killToEnd();
+        if (key.matches('y', .{ .ctrl = true })) return self.yank();
         if (isTextKey(key)) return self.insertText(key.text.?);
         return .none;
     }
@@ -96,6 +109,7 @@ pub const Editor = struct {
     }
 
     pub fn insertText(self: *Editor, bytes: []const u8) Action {
+        if (!std.unicode.utf8ValidateSlice(bytes)) return .none;
         if (self.len + bytes.len > capacity) return .none;
         std.mem.copyBackwards(
             u8,
@@ -162,6 +176,7 @@ pub const Editor = struct {
     fn killPrevWord(self: *Editor) Action {
         if (self.cursor == 0) return .none;
         const start = prevWordStart(self.text(), self.cursor);
+        self.rememberKill(start, self.cursor);
         self.removeRange(start, self.cursor);
         self.cursor = start;
         return .redraw;
@@ -169,6 +184,7 @@ pub const Editor = struct {
 
     fn killToStart(self: *Editor) Action {
         if (self.cursor == 0) return .none;
+        self.rememberKill(0, self.cursor);
         self.removeRange(0, self.cursor);
         self.cursor = 0;
         return .redraw;
@@ -176,8 +192,20 @@ pub const Editor = struct {
 
     fn killToEnd(self: *Editor) Action {
         if (self.cursor >= self.len) return .none;
+        self.rememberKill(self.cursor, self.len);
         self.len = self.cursor;
         return .redraw;
+    }
+
+    fn yank(self: *Editor) Action {
+        if (self.yank_len == 0) return .none;
+        return self.insertText(self.yank_buffer[0..self.yank_len]);
+    }
+
+    fn rememberKill(self: *Editor, start: usize, end: usize) void {
+        std.debug.assert(start <= end and end <= self.len);
+        self.yank_len = end - start;
+        @memcpy(self.yank_buffer[0..self.yank_len], self.buffer[start..end]);
     }
 
     fn removeRange(self: *Editor, start: usize, end: usize) void {

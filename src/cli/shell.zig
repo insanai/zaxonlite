@@ -10,8 +10,8 @@
 //!   byte-identical so pipes, scripts, and the CLI contract test observe
 //!   no change.
 //!
-//! Raw mode is active only while a line is being edited; results and
-//! diagnostics always print in cooked mode through the ordinary writers.
+//! Raw mode is active only while editing or waiting for an interruptible
+//! remote request; results and diagnostics always print in cooked mode.
 
 const std = @import("std");
 const zaxonlite = @import("zaxonlite");
@@ -59,6 +59,7 @@ pub fn run(
         if (term_mod.Term.init(gpa, io, detection.caps)) |terminal_value| {
             var terminal = terminal_value;
             defer terminal.deinit();
+            try terminal.installResizeHandler();
             return runRich(gpa, io, backend, config, &terminal, out, err_out);
         } else |_| {
             // No controlling terminal after all: fall through to plain.
@@ -73,11 +74,57 @@ pub fn run(
 /// Statement routing shared by every path: reads go to `query`, everything
 /// else is a replicated write.
 pub fn isReadStatement(sql: []const u8) bool {
-    var iterator = std.mem.tokenizeAny(u8, sql, " \t(");
-    const first = iterator.next() orelse return false;
-    const keywords = [_][]const u8{ "select", "with", "values", "explain" };
-    for (keywords) |keyword| {
-        if (std.ascii.eqlIgnoreCase(first, keyword)) return true;
+    var tokenizer = highlight.Tokenizer.init(sql);
+    while (tokenizer.next()) |span| {
+        switch (span.kind) {
+            .text, .comment => continue,
+            .keyword, .identifier => {
+                const first = span.bytes(sql);
+                if (std.ascii.eqlIgnoreCase(first, "with")) {
+                    return withStatementIsRead(sql, &tokenizer);
+                }
+                return std.ascii.eqlIgnoreCase(first, "select") or
+                    std.ascii.eqlIgnoreCase(first, "values") or
+                    std.ascii.eqlIgnoreCase(first, "explain");
+            },
+            else => return false,
+        }
+    }
+    return false;
+}
+
+/// Finds the top-level statement after one or more CTE bodies. Tracking
+/// parentheses is sufficient here because the tokenizer has already hidden
+/// quoted text and comments from the structural scan.
+fn withStatementIsRead(sql: []const u8, tokenizer: *highlight.Tokenizer) bool {
+    var depth: usize = 0;
+    var completed_group = false;
+    while (tokenizer.next()) |span| {
+        switch (span.kind) {
+            .text, .comment, .string => continue,
+            .operator => switch (sql[span.start]) {
+                '(' => depth += 1,
+                ')' => if (depth > 0) {
+                    depth -= 1;
+                    if (depth == 0) completed_group = true;
+                },
+                ',' => if (depth == 0) {
+                    completed_group = false;
+                },
+                else => {},
+            },
+            .keyword, .identifier => {
+                if (depth != 0 or !completed_group) continue;
+                const word = span.bytes(sql);
+                if (std.ascii.eqlIgnoreCase(word, "select") or
+                    std.ascii.eqlIgnoreCase(word, "values")) return true;
+                if (std.ascii.eqlIgnoreCase(word, "insert") or
+                    std.ascii.eqlIgnoreCase(word, "update") or
+                    std.ascii.eqlIgnoreCase(word, "delete") or
+                    std.ascii.eqlIgnoreCase(word, "replace")) return false;
+            },
+            else => {},
+        }
     }
     return false;
 }
@@ -253,6 +300,7 @@ pub const Shell = struct {
     mode: table.Mode = .auto,
     timer: bool = false,
     history_enabled: bool,
+    history_configured: bool,
     history_path: ?[]const u8,
     painted_cursor_row: u16 = 0,
     quit: bool = false,
@@ -260,7 +308,14 @@ pub const Shell = struct {
     /// The explicit failure surface of the shell and every dot command.
     /// Backend and SQL failures are rendered as diagnostics and never
     /// escape as errors.
-    pub const Error = error{ OutOfMemory, WriteFailed, ReadFailed, EndOfStream };
+    pub const Error = error{
+        OutOfMemory,
+        WriteFailed,
+        ReadFailed,
+        EndOfStream,
+        TtyUnavailable,
+        ConcurrencyUnavailable,
+    };
 };
 
 fn runRich(
@@ -281,16 +336,19 @@ fn runRich(
         .err_out = err_out,
         .history = history_mod.History.init(gpa),
         .history_enabled = !config.no_history and config.history_path != null,
+        .history_configured = !config.no_history and config.history_path != null,
         .history_path = config.history_path,
     };
     defer shell.history.deinit();
     defer shell.statement.deinit(gpa);
 
+    try terminal.suspendRaw();
     if (shell.history_enabled) {
-        shell.history.load(io, shell.history_path.?) catch {};
+        shell.history.load(io, shell.history_path.?) catch |err| {
+            try historyIoDiagnostic(&shell, "history load failed", err);
+        };
     }
 
-    terminal.suspendRaw();
     try out.print(
         "zaxonlite {s} — interactive shell\n" ++
             "Statements end with ';'. Type .help for commands and keys.\n",
@@ -311,14 +369,29 @@ fn runRich(
             continue;
         }
 
-        try shell.statement.appendSlice(gpa, shell.editor.text());
+        const edited = shell.editor.text();
+        if (shell.statement.items.len + edited.len > editor_mod.capacity) {
+            try statementTooLongDiagnostic(&shell);
+            shell.statement.clearRetainingCapacity();
+            shell.history.resetNav();
+            continue;
+        }
+        try shell.statement.appendSlice(gpa, edited);
         if (!highlight.statementComplete(shell.statement.items)) {
+            if (shell.statement.items.len == editor_mod.capacity) {
+                try statementTooLongDiagnostic(&shell);
+                shell.statement.clearRetainingCapacity();
+                shell.history.resetNav();
+                continue;
+            }
             try shell.statement.append(gpa, '\n');
             continue;
         }
         const statement = std.mem.trim(u8, shell.statement.items, " \t\r\n");
         if (statement.len > 0) {
-            try shell.history.append(statement);
+            // Append before trimming so the leading-space privacy convention
+            // remains effective for the first line of a statement.
+            try shell.history.append(shell.statement.items);
             try executeStatement(&shell, statement);
         }
         shell.history.resetNav();
@@ -328,7 +401,9 @@ fn runRich(
     }
 
     if (shell.history_enabled) {
-        shell.history.save(io, shell.history_path.?) catch {};
+        shell.history.save(io, shell.history_path.?) catch |err| {
+            try historyIoDiagnostic(&shell, "history save failed", err);
+        };
     }
     return exit_ok;
 }
@@ -338,66 +413,140 @@ fn runRich(
 /// cooked mode and the editor holds the submitted text.
 fn editLine(shell: *Shell) Shell.Error!bool {
     const terminal = shell.terminal;
-    terminal.resumeRaw();
-    defer terminal.suspendRaw();
+    try terminal.resumeRaw();
+    var raw_active = true;
+    defer if (raw_active) terminal.suspendRaw() catch {};
     shell.editor.clear();
     shell.painted_cursor_row = 0;
     try paint(shell);
+    var paste_buffer: [editor_mod.capacity]u8 = undefined;
+    var paste_len: usize = 0;
+    var paste_overflow = false;
+    var pasting = false;
 
     while (true) {
         const event = terminal.nextEvent() catch |err| switch (err) {
-            error.EndOfStream => return false,
+            error.EndOfStream => {
+                try terminal.suspendRaw();
+                raw_active = false;
+                return false;
+            },
             else => return error.ReadFailed,
         };
         switch (event) {
-            .key_press => |key| switch (shell.editor.feed(key)) {
-                .none => {},
-                .redraw => try paint(shell),
-                .submit => {
-                    try finishLine(terminal);
-                    return true;
-                },
-                .cancel => {
-                    try terminal.writer().writeAll("^C");
-                    try finishLine(terminal);
-                    shell.editor.clear();
-                    shell.statement.clearRetainingCapacity();
-                    shell.history.resetNav();
-                    shell.painted_cursor_row = 0;
-                    try paint(shell);
-                },
-                .eof => {
-                    try finishLine(terminal);
-                    return false;
-                },
-                .history_prev => {
-                    const recalled = shell.history.prev(shell.editor.text()) catch
-                        return error.OutOfMemory;
-                    if (recalled) |text| {
-                        shell.editor.setText(text);
-                        try paint(shell);
+            .key_press => |key| {
+                if (pasting) {
+                    if (pastedKeyBytes(key)) |bytes| {
+                        if (paste_len + bytes.len <= paste_buffer.len) {
+                            @memcpy(paste_buffer[paste_len .. paste_len + bytes.len], bytes);
+                            paste_len += bytes.len;
+                        } else {
+                            paste_overflow = true;
+                        }
                     }
-                },
-                .history_next => {
-                    if (shell.history.next()) |text| {
-                        shell.editor.setText(text);
+                    continue;
+                }
+                switch (shell.editor.feed(key)) {
+                    .none => {},
+                    .redraw => try paint(shell),
+                    .submit => {
+                        try finishLine(terminal);
+                        try terminal.suspendRaw();
+                        raw_active = false;
+                        return true;
+                    },
+                    .cancel => {
+                        try terminal.writer().writeAll("^C");
+                        try finishLine(terminal);
+                        shell.editor.clear();
+                        shell.statement.clearRetainingCapacity();
+                        shell.history.resetNav();
+                        shell.painted_cursor_row = 0;
                         try paint(shell);
-                    }
-                },
-                .search => {
-                    try runSearch(shell);
-                    try paint(shell);
-                },
-                .clear_screen => {
-                    try terminal.writer().writeAll("\x1b[2J\x1b[H");
-                    shell.painted_cursor_row = 0;
-                    try paint(shell);
-                },
+                    },
+                    .eof => {
+                        try finishLine(terminal);
+                        try terminal.suspendRaw();
+                        raw_active = false;
+                        return false;
+                    },
+                    .history_prev => {
+                        const recalled = shell.history.prev(shell.editor.text()) catch
+                            return error.OutOfMemory;
+                        if (recalled) |text| {
+                            shell.editor.setText(text);
+                            try paint(shell);
+                        }
+                    },
+                    .history_next => {
+                        if (shell.history.next()) |text| {
+                            shell.editor.setText(text);
+                            try paint(shell);
+                        }
+                    },
+                    .search => {
+                        try runSearch(shell);
+                        try paint(shell);
+                    },
+                    .clear_screen => {
+                        try terminal.writer().writeAll("\x1b[2J\x1b[H");
+                        shell.painted_cursor_row = 0;
+                        try paint(shell);
+                    },
+                }
+            },
+            .paste_start => {
+                pasting = true;
+                paste_len = 0;
+                paste_overflow = false;
+            },
+            .paste_end => {
+                if (pasting and !paste_overflow) {
+                    _ = shell.editor.insertText(paste_buffer[0..paste_len]);
+                }
+                pasting = false;
+                try paint(shell);
+            },
+            .paste => |bytes| {
+                defer shell.gpa.free(bytes);
+                _ = shell.editor.insertText(bytes);
+                try paint(shell);
             },
             .winsize => try paint(shell),
             else => {},
         }
     }
+}
+
+fn pastedKeyBytes(key: Key) ?[]const u8 {
+    if (key.matches(Key.enter, .{}) or key.matches('j', .{ .ctrl = true })) {
+        return "\n";
+    }
+    if (key.matches(Key.tab, .{})) return "\t";
+    return key.text;
+}
+
+fn statementTooLongDiagnostic(shell: *Shell) Shell.Error!void {
+    diagnostic.write(
+        shell.err_out,
+        "input statement too long",
+        "The accumulated statement exceeds the 64 KiB shell limit.",
+        "Split the statement or run a smaller --sql request.",
+    ) catch return error.WriteFailed;
+}
+
+fn historyIoDiagnostic(
+    shell: *Shell,
+    title: []const u8,
+    err: anyerror,
+) Shell.Error!void {
+    diagnostic.write(
+        shell.err_out,
+        title,
+        @errorName(err),
+        "Check the history path and its owner-only file permissions.",
+    ) catch return error.WriteFailed;
+    shell.err_out.flush() catch return error.WriteFailed;
 }
 
 fn finishLine(terminal: *term_mod.Term) Shell.Error!void {
@@ -490,6 +639,10 @@ fn runSearch(shell: *Shell) Shell.Error!void {
         const event = terminal.nextEvent() catch return error.ReadFailed;
         const key = switch (event) {
             .key_press => |key| key,
+            .paste => |bytes| {
+                shell.gpa.free(bytes);
+                continue;
+            },
             else => continue,
         };
         if (key.matches(Key.enter, .{}) or key.matches('j', .{ .ctrl = true })) {
@@ -618,13 +771,118 @@ fn executeRemote(
         request.writer.writeAll("}") catch return error.OutOfMemory;
     }
 
-    var result = cluster.call(request.written(), true) catch {
-        render.noLeaderDiagnostic(shell.err_out, cluster.refused_leader_hint) catch
-            return error.WriteFailed;
+    var result = (try waitForRemote(shell, cluster, request.written())) orelse
         return;
-    };
     defer result.deinit(shell.gpa);
     try renderRemoteBody(shell, if (read) "query" else "exec", result.body);
+}
+
+const RemoteOutcome = union(enum) {
+    success: client.CallResult,
+    failure: anyerror,
+};
+
+const InterruptOutcome = union(enum) {
+    interrupted,
+    unavailable: anyerror,
+};
+
+const RemoteWaitOutcome = union(enum) {
+    remote: RemoteOutcome,
+    interrupt: InterruptOutcome,
+};
+
+fn callRemote(
+    cluster: *client.ClusterConnection,
+    request: []const u8,
+    started: *std.Io.Event,
+) RemoteOutcome {
+    const result = cluster.callInterruptible(request, true, started) catch |err|
+        return .{ .failure = err };
+    return .{ .success = result };
+}
+
+fn waitForInterrupt(terminal: *term_mod.Term) InterruptOutcome {
+    terminal.waitForInterrupt() catch |err|
+        return .{ .unavailable = err };
+    return .interrupted;
+}
+
+fn waitForRemote(
+    shell: *Shell,
+    cluster: *client.ClusterConnection,
+    request: []const u8,
+) Shell.Error!?client.CallResult {
+    var outcomes: [2]RemoteWaitOutcome = undefined;
+    var select = std.Io.Select(RemoteWaitOutcome).init(shell.io, &outcomes);
+    var remote_started: std.Io.Event = .unset;
+    var select_active = true;
+    defer if (select_active) drainRemoteWait(&select, shell.gpa);
+
+    try shell.terminal.resumeRaw();
+    var raw_active = true;
+    defer if (raw_active) shell.terminal.suspendRaw() catch {};
+
+    select.concurrent(.remote, callRemote, .{ cluster, request, &remote_started }) catch
+        return error.ConcurrencyUnavailable;
+    remote_started.wait(shell.io) catch return error.ReadFailed;
+    select.concurrent(.interrupt, waitForInterrupt, .{shell.terminal}) catch
+        return error.ConcurrencyUnavailable;
+
+    while (true) {
+        const outcome = select.await() catch return error.ReadFailed;
+        switch (outcome) {
+            .remote => |remote| {
+                drainRemoteWait(&select, shell.gpa);
+                select_active = false;
+                try shell.terminal.suspendRaw();
+                raw_active = false;
+                return switch (remote) {
+                    .success => |result| result,
+                    .failure => {
+                        render.noLeaderDiagnostic(
+                            shell.err_out,
+                            cluster.refused_leader_hint,
+                        ) catch return error.WriteFailed;
+                        return null;
+                    },
+                };
+            },
+            .interrupt => |interrupt| switch (interrupt) {
+                .unavailable => continue,
+                .interrupted => {
+                    cluster.cancelCurrent();
+                    drainRemoteWait(&select, shell.gpa);
+                    select_active = false;
+                    try shell.terminal.suspendRaw();
+                    raw_active = false;
+                    diagnostic.write(
+                        shell.err_out,
+                        "canceled locally",
+                        "The remote statement may still apply server-side.",
+                        "Check its effects before retrying, especially for writes.",
+                    ) catch return error.WriteFailed;
+                    return null;
+                },
+            },
+        }
+    }
+}
+
+fn drainRemoteWait(
+    select: *std.Io.Select(RemoteWaitOutcome),
+    gpa: std.mem.Allocator,
+) void {
+    while (select.cancel()) |outcome| switch (outcome) {
+        .remote => |remote| switch (remote) {
+            .success => |value| {
+                var result = value;
+                result.deinit(gpa);
+            },
+            .failure => {},
+        },
+        .interrupt => {},
+    };
 }
 
 /// Renders a remote response body richly: query results go through the
@@ -707,7 +965,18 @@ fn renderView(shell: *Shell, view: table.View) Shell.Error!void {
             .unicode = shell.terminal.caps.unicode,
         },
         .terminal_width = width,
-    }, &buffer.writer) catch return error.OutOfMemory;
+    }, &buffer.writer) catch |err| switch (err) {
+        error.TooManyColumns => {
+            diagnostic.write(
+                shell.err_out,
+                "result has too many columns",
+                "Table mode supports SQLite's compiled 2,000-column limit.",
+                "Use .mode expanded, json, or csv for a malformed remote result.",
+            ) catch return error.WriteFailed;
+            return;
+        },
+        else => return error.OutOfMemory,
+    };
 
     if (paged) {
         try page(shell, buffer.written());
@@ -728,8 +997,9 @@ fn renderView(shell: *Shell, view: table.View) Shell.Error!void {
 fn page(shell: *Shell, text: []const u8) Shell.Error!void {
     const terminal = shell.terminal;
     const out = terminal.writer();
-    terminal.resumeRaw();
-    defer terminal.suspendRaw();
+    try terminal.resumeRaw();
+    var raw_active = true;
+    defer if (raw_active) terminal.suspendRaw() catch {};
 
     var line_count: usize = 0;
     var lines_iterator = std.mem.splitScalar(u8, text, '\n');
@@ -771,12 +1041,18 @@ fn page(shell: *Shell, text: []const u8) Shell.Error!void {
         const event = terminal.nextEvent() catch return error.ReadFailed;
         const key = switch (event) {
             .key_press => |key| key,
+            .paste => |bytes| {
+                shell.gpa.free(bytes);
+                continue;
+            },
             .winsize => continue,
             else => continue,
         };
         if (key.matches('q', .{}) or key.matches(Key.escape, .{}) or
             key.matches('c', .{ .ctrl = true }))
         {
+            try terminal.suspendRaw();
+            raw_active = false;
             return;
         }
         if (key.matches(Key.up, .{}) or key.matches('k', .{})) {
@@ -804,7 +1080,7 @@ fn writeTruncated(out: *std.Io.Writer, line: []const u8, width: u16) Shell.Error
         table.writeSanitized(out, line) catch return error.WriteFailed;
         return;
     }
-    var written: u16 = 0;
+    var written: u32 = 0;
     var iterator = term_mod.GraphemeIterator.init(line);
     while (iterator.next()) |grapheme| {
         const bytes = grapheme.bytes(line);
@@ -898,9 +1174,11 @@ fn runHelp(shell: *Shell, args: []const u8) Shell.Error!void {
         \\  alt+b / alt+f      word left / right
         \\  ctrl+w             delete the previous word
         \\  ctrl+u / ctrl+k    delete to start / end of line
+        \\  ctrl+y             restore the most recently deleted text
+        \\  ctrl+l             clear and repaint the screen
         \\  up / down          walk history
         \\  ctrl+r             reverse incremental history search
-        \\  ctrl+c             cancel the current statement
+        \\  ctrl+c             cancel input or abandon a remote wait
         \\  ctrl+d             leave the shell (empty line)
         \\
         \\A statement runs when it ends with ';'. A leading space keeps a
@@ -1042,6 +1320,12 @@ fn runHistory(shell: *Shell, args: []const u8) Shell.Error!void {
     if (std.mem.eql(u8, args, "clear")) {
         shell.history.deinit();
         shell.history = history_mod.History.init(shell.gpa);
+        if (shell.history_configured) {
+            shell.history.save(shell.io, shell.history_path.?) catch |err| {
+                try historyIoDiagnostic(shell, "history clear failed", err);
+                return;
+            };
+        }
         shell.out.writeAll("history cleared\n") catch return error.WriteFailed;
         return;
     }
@@ -1144,5 +1428,30 @@ fn writeSchemaRows(shell: *Shell, view: table.View) Shell.Error!void {
             table.writeSanitized(shell.out, text) catch return error.WriteFailed;
             shell.out.writeAll(";\n") catch return error.WriteFailed;
         }
+    }
+}
+
+test "statement routing skips comments and classifies CTE bodies" {
+    const testing = std.testing;
+    try testing.expect(isReadStatement("-- comment\nselect 1"));
+    try testing.expect(isReadStatement("/* comment */ values (1)"));
+    try testing.expect(isReadStatement(
+        "with a as (select 1), b(x) as (values (2)) select * from b",
+    ));
+    try testing.expect(!isReadStatement(
+        "with a as (select 1) insert into t select * from a",
+    ));
+    try testing.expect(!isReadStatement(
+        "with recursive a(x) as (values(1) union all select x+1 from a) " ++
+            "update t set x = (select max(x) from a)",
+    ));
+}
+
+test "dot-command registry is complete and maps every declaration" {
+    const testing = std.testing;
+    inline for (dot_commands, 0..) |command, index| {
+        try testing.expect(command.name.len > 0);
+        try testing.expect(command.help.len > 0);
+        try testing.expectEqual(index, dot_map.get(command.name).?);
     }
 }

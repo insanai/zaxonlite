@@ -30,7 +30,13 @@ const is_windows = builtin.os.tag == .windows;
 /// Returns the display-cell width of a byte string, counting grapheme
 /// clusters and East Asian width, so `wo/rld` and emoji math is correct.
 pub fn displayWidth(bytes: []const u8) u16 {
-    return vaxis.gwidth.gwidth(bytes, .unicode);
+    var width: u32 = 0;
+    var iterator = GraphemeIterator.init(bytes);
+    while (iterator.next()) |grapheme| {
+        width += vaxis.gwidth.gwidth(grapheme.bytes(bytes), .unicode);
+        if (width >= std.math.maxInt(u16)) return std.math.maxInt(u16);
+    }
+    return @intCast(width);
 }
 
 /// What the terminal supports; decided once at startup from the
@@ -106,6 +112,14 @@ pub const Style = struct {
 /// ordinary writers, because raw mode disables output post-processing.
 /// `deinit` restores the terminal on every path and is idempotent.
 pub const Term = struct {
+    const deferred_capacity = 64;
+    const deferred_text_capacity = 64;
+
+    const DeferredEvent = struct {
+        event: Event,
+        key_text: [deferred_text_capacity]u8 = undefined,
+    };
+
     io: std.Io,
     gpa: std.mem.Allocator,
     tty: vaxis.Tty,
@@ -116,8 +130,15 @@ pub const Term = struct {
     pending: [512]u8 = undefined,
     pending_start: usize = 0,
     pending_len: usize = 0,
+    bracketed_paste: bool = false,
+    resize_pending: std.atomic.Value(bool) = .init(false),
+    resize_handler_installed: bool = false,
+    deferred: [deferred_capacity]DeferredEvent = undefined,
+    deferred_start: usize = 0,
+    deferred_len: usize = 0,
 
     pub const Error = error{ TtyUnavailable, OutOfMemory };
+    pub const ModeError = error{ TtyUnavailable, WriteFailed };
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, caps: Caps) Error!Term {
         const write_buffer = try gpa.alloc(u8, 4096);
@@ -135,28 +156,71 @@ pub const Term = struct {
     }
 
     pub fn deinit(self: *Term) void {
+        while (self.popDeferred()) |event| self.releaseEvent(event);
+        if (builtin.is_test) {
+            self.tty.deinit();
+            vaxis.tty.global_tty = null;
+            self.gpa.free(self.write_buffer);
+            self.raw = false;
+            return;
+        }
+        if (self.resize_handler_installed and !is_windows) {
+            vaxis.Tty.removeWinsize(self.resizeHandler());
+            self.resize_handler_installed = false;
+        }
+        self.setBracketedPaste(false) catch {};
         self.writer().flush() catch {};
         // Tty.deinit restores the saved terminal state; a prior suspendRaw
         // makes that restore a no-op rather than an error.
         self.tty.deinit();
         vaxis.tty.Tty.resetSignalHandler();
+        // Upstream keeps a copy solely for panic recovery. It must not point
+        // at our already-deinitialized terminal after a normal shell exit.
+        vaxis.tty.global_tty = null;
         self.gpa.free(self.write_buffer);
         self.raw = false;
+    }
+
+    /// Installs libvaxis's SIGWINCH hook after the returned `Term` has a
+    /// stable address. Windows delivers resize events in-band instead.
+    pub fn installResizeHandler(self: *Term) Error!void {
+        if (builtin.is_test) return;
+        if (is_windows or self.resize_handler_installed) return;
+        vaxis.Tty.notifyWinsize(self.resizeHandler()) catch
+            return error.TtyUnavailable;
+        self.resize_handler_installed = true;
+    }
+
+    fn resizeHandler(self: *Term) vaxis.Tty.SignalHandler {
+        return .{ .context = self, .callback = resizeCallback };
+    }
+
+    fn resizeCallback(context: *anyopaque) void {
+        const self: *Term = @ptrCast(@alignCast(context));
+        self.resize_pending.store(true, .release);
     }
 
     /// Leaves raw mode so results and diagnostics can be printed through
     /// the ordinary cooked-mode writers. Idempotent. `.DRAIN`, never
     /// `.FLUSH`: flushing would silently discard type-ahead keys pressed
     /// while a statement was executing.
-    pub fn suspendRaw(self: *Term) void {
+    pub fn suspendRaw(self: *Term) ModeError!void {
         if (!self.raw) return;
-        self.writer().flush() catch {};
+        if (builtin.is_test) {
+            self.raw = false;
+            return;
+        }
+        try self.setBracketedPaste(false);
+        self.writer().flush() catch return error.WriteFailed;
         if (is_windows) {
             const W = vaxis.tty.WindowsTty;
-            W.setConsoleMode(self.tty.stdin, self.tty.initial_input_mode) catch {};
-            W.setConsoleMode(self.tty.stdout, self.tty.initial_output_mode) catch {};
+            W.setConsoleMode(self.tty.stdin, self.tty.initial_input_mode) catch
+                return error.TtyUnavailable;
+            W.setConsoleMode(self.tty.stdout, self.tty.initial_output_mode) catch
+                return error.TtyUnavailable;
         } else {
-            std.posix.tcsetattr(self.tty.fd.handle, .DRAIN, self.tty.termios) catch {};
+            std.posix.tcsetattr(self.tty.fd.handle, .DRAIN, self.tty.termios) catch
+                return error.TtyUnavailable;
         }
         self.raw = false;
     }
@@ -164,12 +228,18 @@ pub const Term = struct {
     /// Re-enters raw mode for the next edited line. Idempotent. Applies
     /// the same flag set as the library's raw entry but with `.DRAIN`, so
     /// pending input survives the transition.
-    pub fn resumeRaw(self: *Term) void {
+    pub fn resumeRaw(self: *Term) ModeError!void {
         if (self.raw) return;
+        if (builtin.is_test) {
+            self.raw = true;
+            return;
+        }
         if (is_windows) {
             const W = vaxis.tty.WindowsTty;
-            W.setConsoleMode(self.tty.stdin, W.input_raw_mode) catch {};
-            W.setConsoleMode(self.tty.stdout, W.output_raw_mode) catch {};
+            W.setConsoleMode(self.tty.stdin, W.input_raw_mode) catch
+                return error.TtyUnavailable;
+            W.setConsoleMode(self.tty.stdout, W.output_raw_mode) catch
+                return error.TtyUnavailable;
         } else {
             var raw_state = self.tty.termios;
             raw_state.iflag.IGNBRK = false;
@@ -190,9 +260,19 @@ pub const Term = struct {
             raw_state.cflag.PARENB = false;
             raw_state.cc[@intFromEnum(std.posix.V.MIN)] = 1;
             raw_state.cc[@intFromEnum(std.posix.V.TIME)] = 0;
-            std.posix.tcsetattr(self.tty.fd.handle, .DRAIN, raw_state) catch {};
+            std.posix.tcsetattr(self.tty.fd.handle, .DRAIN, raw_state) catch
+                return error.TtyUnavailable;
         }
         self.raw = true;
+        try self.setBracketedPaste(true);
+    }
+
+    fn setBracketedPaste(self: *Term, enabled: bool) error{WriteFailed}!void {
+        if (self.bracketed_paste == enabled) return;
+        const sequence = if (enabled) "\x1b[?2004h" else "\x1b[?2004l";
+        self.writer().writeAll(sequence) catch return error.WriteFailed;
+        self.writer().flush() catch return error.WriteFailed;
+        self.bracketed_paste = enabled;
     }
 
     /// Buffered writer to the terminal itself. In raw mode, line breaks
@@ -204,26 +284,49 @@ pub const Term = struct {
     /// The terminal width in cells, with a safe floor so width math never
     /// divides by zero on degenerate reports.
     pub fn width(self: *Term) u16 {
-        if (is_windows) return 80;
         const winsize = self.tty.getWinsize() catch return 80;
         return if (winsize.cols < 8) 80 else @intCast(winsize.cols);
     }
 
     pub fn height(self: *Term) u16 {
-        if (is_windows) return 24;
         const winsize = self.tty.getWinsize() catch return 24;
         return if (winsize.rows < 2) 24 else @intCast(winsize.rows);
     }
 
     /// Blocks until the next decoded terminal event.
     pub fn nextEvent(self: *Term) !Event {
+        if (self.popDeferred()) |event| return event;
+        return self.readEvent();
+    }
+
+    /// Waits specifically for Ctrl+C while preserving ordinary type-ahead for
+    /// the next editor prompt. Used while a remote request runs concurrently.
+    pub fn waitForInterrupt(self: *Term) !void {
+        while (true) {
+            const event = try self.readEvent();
+            if (event == .key_press and
+                event.key_press.matches('c', .{ .ctrl = true }))
+            {
+                return;
+            }
+            self.deferEvent(event);
+        }
+    }
+
+    fn readEvent(self: *Term) !Event {
+        if (builtin.is_test) {
+            return self.tty.nextEvent(&self.parser, self.gpa);
+        }
         if (is_windows) {
-            return self.tty.nextEvent(&self.parser, null);
+            return self.tty.nextEvent(&self.parser, self.gpa);
         }
         while (true) {
+            if (self.resize_pending.swap(false, .acquire)) {
+                return .{ .winsize = self.currentWinsize() };
+            }
             if (self.pending_len > self.pending_start) {
                 const slice = self.pending[self.pending_start..self.pending_len];
-                const result = self.parser.parse(slice, null) catch {
+                const result = self.parser.parse(slice, self.gpa) catch {
                     // Undecodable bytes are dropped, never echoed.
                     self.pending_start = self.pending_len;
                     continue;
@@ -253,10 +356,79 @@ pub const Term = struct {
                 self.pending_len = 0;
                 continue;
             }
-            const n = self.tty.read(self.pending[self.pending_len..]) catch
+            const n = self.tty.read(self.pending[self.pending_len..]) catch {
+                if (self.resize_pending.swap(false, .acquire)) {
+                    return .{ .winsize = self.currentWinsize() };
+                }
                 return error.ReadFailed;
+            };
             if (n == 0) return error.EndOfStream;
             self.pending_len += n;
         }
     }
+
+    fn deferEvent(self: *Term, event: Event) void {
+        if (self.deferred_len == self.deferred.len) {
+            self.releaseEvent(event);
+            return;
+        }
+        const index = (self.deferred_start + self.deferred_len) % self.deferred.len;
+        const slot = &self.deferred[index];
+        slot.event = event;
+        switch (slot.event) {
+            .key_press, .key_release => |*key| if (key.text) |text| {
+                if (text.len <= slot.key_text.len) {
+                    @memcpy(slot.key_text[0..text.len], text);
+                    key.text = slot.key_text[0..text.len];
+                } else {
+                    key.text = null;
+                }
+            },
+            else => {},
+        }
+        self.deferred_len += 1;
+    }
+
+    fn popDeferred(self: *Term) ?Event {
+        if (self.deferred_len == 0) return null;
+        const event = self.deferred[self.deferred_start].event;
+        self.deferred_start = (self.deferred_start + 1) % self.deferred.len;
+        self.deferred_len -= 1;
+        return event;
+    }
+
+    fn releaseEvent(self: *Term, event: Event) void {
+        switch (event) {
+            .paste => |bytes| self.gpa.free(bytes),
+            else => {},
+        }
+    }
+
+    fn currentWinsize(self: *Term) vaxis.Winsize {
+        return self.tty.getWinsize() catch .{
+            .rows = 24,
+            .cols = 80,
+            .x_pixel = 0,
+            .y_pixel = 0,
+        };
+    }
 };
+
+test "deferred terminal events own parser-backed key text" {
+    const testing = std.testing;
+    var terminal: Term = undefined;
+    terminal.gpa = testing.allocator;
+    terminal.deferred_start = 0;
+    terminal.deferred_len = 0;
+
+    var parser_text = [_]u8{ 0xc3, 0xa9 };
+    terminal.deferEvent(.{ .key_press = .{
+        .codepoint = 0xe9,
+        .text = &parser_text,
+    } });
+    @memset(&parser_text, 'x');
+
+    const event = terminal.popDeferred().?;
+    try testing.expectEqualStrings("é", event.key_press.text.?);
+    try testing.expect(terminal.popDeferred() == null);
+}
