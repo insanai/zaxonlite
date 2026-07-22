@@ -236,49 +236,59 @@ fn plainRemote(
         const line_bytes = raw_line orelse break;
         const line = std.mem.trim(u8, line_bytes, " \t\r");
         if (line.len == 0) continue;
-
-        var request: std.Io.Writer.Allocating = .init(gpa);
-        defer request.deinit();
-        var command: []const u8 = "query";
-        var as_json = false;
-        if (line[0] == '.') {
-            if (std.mem.eql(u8, line, ".quit") or std.mem.eql(u8, line, ".exit")) break;
-            if (std.mem.eql(u8, line, ".status")) {
-                try request.writer.writeAll("{\"op\":\"status\"}");
-                command = "status";
-                as_json = true;
-            } else {
-                try diagnostic.write(
-                    err_out,
-                    "unknown shell command",
-                    line,
-                    "Use .status or .quit, or enter a SQL statement.",
-                );
-                try err_out.flush();
-                continue;
-            }
-        } else if (isReadStatement(line)) {
-            try request.writer.writeAll("{\"op\":\"query\",\"sql\":");
-            try render.writeJsonString(&request.writer, line);
-            try request.writer.writeAll(",\"level\":\"linearizable\"}");
-        } else {
-            command = "exec";
-            try request.writer.writeAll("{\"op\":\"exec\",\"sql\":");
-            try render.writeJsonString(&request.writer, line);
-            try request.writer.writeAll("}");
-        }
-
-        var result = cluster.call(request.written(), true) catch {
-            try render.noLeaderDiagnostic(err_out, cluster.refused_leader_hint);
-            try err_out.flush();
-            continue;
-        };
-        defer result.deinit(gpa);
-        _ = try render.renderRemote(gpa, command, as_json, result.body, out, err_out);
-        try out.flush();
-        try err_out.flush();
+        if (!try plainRemoteLoopStep(gpa, cluster, line, out, err_out)) break;
     }
     return exit_ok;
+}
+
+fn plainRemoteLoopStep(
+    gpa: std.mem.Allocator,
+    cluster: *client.ClusterConnection,
+    line: []const u8,
+    out: *std.Io.Writer,
+    err_out: *std.Io.Writer,
+) !bool {
+    var request: std.Io.Writer.Allocating = .init(gpa);
+    defer request.deinit();
+    var command: []const u8 = "query";
+    var as_json = false;
+    if (line[0] == '.') {
+        if (std.mem.eql(u8, line, ".quit") or std.mem.eql(u8, line, ".exit")) return false;
+        if (std.mem.eql(u8, line, ".status")) {
+            try request.writer.writeAll("{\"op\":\"status\"}");
+            command = "status";
+            as_json = true;
+        } else {
+            try diagnostic.write(
+                err_out,
+                "unknown shell command",
+                line,
+                "Use .status or .quit, or enter a SQL statement.",
+            );
+            try err_out.flush();
+            return true;
+        }
+    } else if (isReadStatement(line)) {
+        try request.writer.writeAll("{\"op\":\"query\",\"sql\":");
+        try render.writeJsonString(&request.writer, line);
+        try request.writer.writeAll(",\"level\":\"linearizable\"}");
+    } else {
+        command = "exec";
+        try request.writer.writeAll("{\"op\":\"exec\",\"sql\":");
+        try render.writeJsonString(&request.writer, line);
+        try request.writer.writeAll("}");
+    }
+
+    var result = cluster.call(request.written(), true) catch {
+        try render.noLeaderDiagnostic(err_out, cluster.refused_leader_hint);
+        try err_out.flush();
+        return true;
+    };
+    defer result.deinit(gpa);
+    _ = try render.renderRemote(gpa, command, as_json, result.body, out, err_out);
+    try out.flush();
+    try err_out.flush();
+    return true;
 }
 
 // ----------------------------------------------------------------------
@@ -359,45 +369,7 @@ fn runRich(
     while (!shell.quit) {
         const submitted = try editLine(&shell);
         if (!submitted) break;
-        const line = std.mem.trim(u8, shell.editor.text(), " \t\r");
-        if (line.len == 0 and shell.statement.items.len == 0) continue;
-
-        if (shell.statement.items.len == 0 and line.len > 0 and line[0] == '.') {
-            try runDot(&shell, line);
-            try out.flush();
-            try err_out.flush();
-            continue;
-        }
-
-        const edited = shell.editor.text();
-        if (shell.statement.items.len + edited.len > editor_mod.capacity) {
-            try statementTooLongDiagnostic(&shell);
-            shell.statement.clearRetainingCapacity();
-            shell.history.resetNav();
-            continue;
-        }
-        try shell.statement.appendSlice(gpa, edited);
-        if (!highlight.statementComplete(shell.statement.items)) {
-            if (shell.statement.items.len == editor_mod.capacity) {
-                try statementTooLongDiagnostic(&shell);
-                shell.statement.clearRetainingCapacity();
-                shell.history.resetNav();
-                continue;
-            }
-            try shell.statement.append(gpa, '\n');
-            continue;
-        }
-        const statement = std.mem.trim(u8, shell.statement.items, " \t\r\n");
-        if (statement.len > 0) {
-            // Append before trimming so the leading-space privacy convention
-            // remains effective for the first line of a statement.
-            try shell.history.append(shell.statement.items);
-            try executeStatement(&shell, statement);
-        }
-        shell.history.resetNav();
-        shell.statement.clearRetainingCapacity();
-        try out.flush();
-        try err_out.flush();
+        try processRichLine(&shell);
     }
 
     if (shell.history_enabled) {
@@ -406,6 +378,46 @@ fn runRich(
         };
     }
     return exit_ok;
+}
+
+fn processRichLine(shell: *Shell) Shell.Error!void {
+    const line = std.mem.trim(u8, shell.editor.text(), " \t\r");
+    if (line.len == 0 and shell.statement.items.len == 0) return;
+
+    if (shell.statement.items.len == 0 and line.len > 0 and line[0] == '.') {
+        try runDot(shell, line);
+        try shell.out.flush();
+        try shell.err_out.flush();
+        return;
+    }
+
+    const edited = shell.editor.text();
+    if (shell.statement.items.len + edited.len > editor_mod.capacity) {
+        try statementTooLongDiagnostic(shell);
+        shell.statement.clearRetainingCapacity();
+        shell.history.resetNav();
+        return;
+    }
+    try shell.statement.appendSlice(shell.gpa, edited);
+    if (!highlight.statementComplete(shell.statement.items)) {
+        if (shell.statement.items.len == editor_mod.capacity) {
+            try statementTooLongDiagnostic(shell);
+            shell.statement.clearRetainingCapacity();
+            shell.history.resetNav();
+            return;
+        }
+        try shell.statement.append(shell.gpa, '\n');
+        return;
+    }
+    const statement = std.mem.trim(u8, shell.statement.items, " \t\r\n");
+    if (statement.len > 0) {
+        try shell.history.append(shell.statement.items);
+        try executeStatement(shell, statement);
+    }
+    shell.history.resetNav();
+    shell.statement.clearRetainingCapacity();
+    try shell.out.flush();
+    try shell.err_out.flush();
 }
 
 /// Edits one line in raw mode. Returns false on end of input (`ctrl+d` on
@@ -446,53 +458,10 @@ fn editLine(shell: *Shell) Shell.Error!bool {
                     }
                     continue;
                 }
-                switch (shell.editor.feed(key)) {
-                    .none => {},
-                    .redraw => try paint(shell),
-                    .submit => {
-                        try finishLine(terminal);
-                        try terminal.suspendRaw();
-                        raw_active = false;
-                        return true;
-                    },
-                    .cancel => {
-                        try terminal.writer().writeAll("^C");
-                        try finishLine(terminal);
-                        shell.editor.clear();
-                        shell.statement.clearRetainingCapacity();
-                        shell.history.resetNav();
-                        shell.painted_cursor_row = 0;
-                        try paint(shell);
-                    },
-                    .eof => {
-                        try finishLine(terminal);
-                        try terminal.suspendRaw();
-                        raw_active = false;
-                        return false;
-                    },
-                    .history_prev => {
-                        const recalled = shell.history.prev(shell.editor.text()) catch
-                            return error.OutOfMemory;
-                        if (recalled) |text| {
-                            shell.editor.setText(text);
-                            try paint(shell);
-                        }
-                    },
-                    .history_next => {
-                        if (shell.history.next()) |text| {
-                            shell.editor.setText(text);
-                            try paint(shell);
-                        }
-                    },
-                    .search => {
-                        try runSearch(shell);
-                        try paint(shell);
-                    },
-                    .clear_screen => {
-                        try terminal.writer().writeAll("\x1b[2J\x1b[H");
-                        shell.painted_cursor_row = 0;
-                        try paint(shell);
-                    },
+                if (try handleFeedAction(shell, shell.editor.feed(key))) |done| {
+                    try terminal.suspendRaw();
+                    raw_active = false;
+                    return done;
                 }
             },
             .paste_start => {
@@ -516,6 +485,54 @@ fn editLine(shell: *Shell) Shell.Error!bool {
             else => {},
         }
     }
+}
+
+fn handleFeedAction(shell: *Shell, action: editor_mod.Action) Shell.Error!?bool {
+    const terminal = shell.terminal;
+    switch (action) {
+        .none => return null,
+        .redraw => try paint(shell),
+        .submit => {
+            try finishLine(terminal);
+            return true;
+        },
+        .cancel => {
+            try terminal.writer().writeAll("^C");
+            try finishLine(terminal);
+            shell.editor.clear();
+            shell.statement.clearRetainingCapacity();
+            shell.history.resetNav();
+            shell.painted_cursor_row = 0;
+            try paint(shell);
+        },
+        .eof => {
+            try finishLine(terminal);
+            return false;
+        },
+        .history_prev => {
+            const recalled = shell.history.prev(shell.editor.text()) catch return error.OutOfMemory;
+            if (recalled) |text| {
+                shell.editor.setText(text);
+                try paint(shell);
+            }
+        },
+        .history_next => {
+            if (shell.history.next()) |text| {
+                shell.editor.setText(text);
+                try paint(shell);
+            }
+        },
+        .search => {
+            try runSearch(shell);
+            try paint(shell);
+        },
+        .clear_screen => {
+            try terminal.writer().writeAll("\x1b[2J\x1b[H");
+            shell.painted_cursor_row = 0;
+            try paint(shell);
+        },
+    }
+    return null;
 }
 
 fn pastedKeyBytes(key: Key) ?[]const u8 {
@@ -1018,25 +1035,7 @@ fn page(shell: *Shell, text: []const u8) Shell.Error!void {
         const max_top = line_count -| height;
         top = @min(top, max_top);
 
-        out.writeAll("\x1b[H\x1b[J") catch return error.WriteFailed;
-        var lines = std.mem.splitScalar(u8, text, '\n');
-        var index: usize = 0;
-        var shown: usize = 0;
-        while (lines.next()) |line| : (index += 1) {
-            if (index < top) continue;
-            if (shown == height) break;
-            try writeTruncated(out, line, width);
-            out.writeAll("\r\n") catch return error.WriteFailed;
-            shown += 1;
-        }
-        const style = term_mod.Style{ .color = terminal.caps.color };
-        style.write(out, term_mod.Style.dim) catch return error.WriteFailed;
-        out.print(
-            "-- line {d}-{d} of {d} (q quit, arrows/space scroll) --",
-            .{ top + 1, @min(top + height, line_count), line_count },
-        ) catch return error.WriteFailed;
-        style.write(out, term_mod.Style.reset) catch return error.WriteFailed;
-        out.flush() catch return error.WriteFailed;
+        try renderPageFrame(terminal, text, top, height, width, line_count);
 
         const event = terminal.nextEvent() catch return error.ReadFailed;
         const key = switch (event) {
@@ -1073,6 +1072,36 @@ fn page(shell: *Shell, text: []const u8) Shell.Error!void {
             top = max_top;
         }
     }
+}
+
+fn renderPageFrame(
+    terminal: *term_mod.Term,
+    text: []const u8,
+    top: usize,
+    height: usize,
+    width: u16,
+    line_count: usize,
+) Shell.Error!void {
+    const out = terminal.writer();
+    out.writeAll("\x1b[H\x1b[J") catch return error.WriteFailed;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var index: usize = 0;
+    var shown: usize = 0;
+    while (lines.next()) |line| : (index += 1) {
+        if (index < top) continue;
+        if (shown == height) break;
+        try writeTruncated(out, line, width);
+        out.writeAll("\r\n") catch return error.WriteFailed;
+        shown += 1;
+    }
+    const style = term_mod.Style{ .color = terminal.caps.color };
+    style.write(out, term_mod.Style.dim) catch return error.WriteFailed;
+    out.print(
+        "-- line {d}-{d} of {d} (q quit, arrows/space scroll) --",
+        .{ top + 1, @min(top + height, line_count), line_count },
+    ) catch return error.WriteFailed;
+    style.write(out, term_mod.Style.reset) catch return error.WriteFailed;
+    out.flush() catch return error.WriteFailed;
 }
 
 fn writeTruncated(out: *std.Io.Writer, line: []const u8, width: u16) Shell.Error!void {
@@ -1112,9 +1141,24 @@ const dot_commands = [_]DotCommand{
     .{ .name = "schema", .usage = "[name]", .help = "Print CREATE statements.", .run = runSchema },
     .{ .name = "status", .usage = "", .help = "Show node or cluster status.", .run = runStatus },
     .{ .name = "members", .usage = "", .help = "Show cluster membership.", .run = runMembers },
-    .{ .name = "mode", .usage = "table|expanded|auto|json|csv", .help = "Select the result display mode.", .run = runMode },
-    .{ .name = "timer", .usage = "on|off", .help = "Toggle elapsed-time display.", .run = runTimer },
-    .{ .name = "history", .usage = "[off|clear]", .help = "Show, disable, or clear history.", .run = runHistory },
+    .{
+        .name = "mode",
+        .usage = "table|expanded|auto|json|csv",
+        .help = "Select the result display mode.",
+        .run = runMode,
+    },
+    .{
+        .name = "timer",
+        .usage = "on|off",
+        .help = "Toggle elapsed-time display.",
+        .run = runTimer,
+    },
+    .{
+        .name = "history",
+        .usage = "[off|clear]",
+        .help = "Show, disable, or clear history.",
+        .run = runHistory,
+    },
     .{ .name = "quit", .usage = "", .help = "Leave the shell (also ctrl+d).", .run = runQuit },
     .{ .name = "exit", .usage = "", .help = "Leave the shell.", .run = runQuit },
 };

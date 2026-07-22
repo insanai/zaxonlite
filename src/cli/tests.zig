@@ -404,12 +404,15 @@ test "aligned unicode table matches the golden layout" {
         .caps = .{ .color = false, .unicode = true },
     });
     const expected =
-        "┌────┬────────┬─────────────────┐\n" ++
+        "┌────" ++ "┬────────┬" ++
+        "─────────────────┐\n" ++
         "│ id │ author │ body            │\n" ++
-        "├────┼────────┼─────────────────┤\n" ++
+        "├────" ++ "┼────────┼" ++
+        "─────────────────┤\n" ++
         "│  1 │ vik    │ first note      │\n" ++
         "│  2 │ NULL   │ replicated note │\n" ++
-        "└────┴────────┴─────────────────┘\n";
+        "└────" ++ "┴────────┴" ++
+        "─────────────────┘\n";
     try testing.expectEqualStrings(expected, output);
 }
 

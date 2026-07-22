@@ -242,43 +242,55 @@ pub fn renderRemote(
         const value = object.get("ok") orelse break :blk false;
         break :blk value == .bool and value.bool;
     };
-    if (!ok) {
-        const code = blk: {
-            const value = object.get("error") orelse break :blk "unknown";
-            break :blk if (value == .string) value.string else "unknown";
-        };
-        const message = blk: {
-            const value = object.get("message") orelse break :blk "";
-            break :blk if (value == .string) value.string else "";
-        };
-        // Integrity reports carry ok=false with detail fields.
-        if (std.mem.eql(u8, command, "integrity-check") and
-            object.get("sqlite_ok") != null)
-        {
-            if (json) {
-                try out.print("{s}\n", .{body});
-            } else {
-                try out.writeAll("integrity: FAIL\n");
-            }
-            return exit_integrity;
-        }
-        if (json) {
-            try out.print("{s}\n", .{body});
-        } else {
-            try diagnostic.write(err_out, code, message, remoteHint(code));
-        }
-        if (std.mem.eql(u8, code, "sql") or std.mem.eql(u8, code, "session")) {
-            return exit_sql;
-        }
-        if (std.mem.eql(u8, code, "bad_request")) return exit_usage;
-        return exit_unavailable;
-    }
+    if (!ok) return renderRemoteError(command, json, body, object, out, err_out);
 
     if (json) {
         try out.print("{s}\n", .{body});
         return exit_ok;
     }
+    return renderRemoteSuccess(command, body, object, out);
+}
 
+fn renderRemoteError(
+    command: []const u8,
+    json: bool,
+    body: []const u8,
+    object: *const std.json.ObjectMap,
+    out: *std.Io.Writer,
+    err_out: *std.Io.Writer,
+) !u8 {
+    const code = blk: {
+        const value = object.get("error") orelse break :blk "unknown";
+        break :blk if (value == .string) value.string else "unknown";
+    };
+    const message = blk: {
+        const value = object.get("message") orelse break :blk "";
+        break :blk if (value == .string) value.string else "";
+    };
+    if (std.mem.eql(u8, command, "integrity-check") and object.get("sqlite_ok") != null) {
+        if (json) {
+            try out.print("{s}\n", .{body});
+        } else {
+            try out.writeAll("integrity: FAIL\n");
+        }
+        return exit_integrity;
+    }
+    if (json) {
+        try out.print("{s}\n", .{body});
+    } else {
+        try diagnostic.write(err_out, code, message, remoteHint(code));
+    }
+    if (std.mem.eql(u8, code, "sql") or std.mem.eql(u8, code, "session")) return exit_sql;
+    if (std.mem.eql(u8, code, "bad_request")) return exit_usage;
+    return exit_unavailable;
+}
+
+fn renderRemoteSuccess(
+    command: []const u8,
+    body: []const u8,
+    object: *const std.json.ObjectMap,
+    out: *std.Io.Writer,
+) !u8 {
     if (std.mem.eql(u8, command, "exec")) {
         const changes = jsonInt(object.get("changes")) orelse 0;
         const replayed = blk: {
@@ -295,23 +307,7 @@ pub fn renderRemote(
     } else if (std.mem.eql(u8, command, "session")) {
         try out.print("session {d}\n", .{jsonInt(object.get("session_id")) orelse 0});
     } else if (std.mem.eql(u8, command, "leader")) {
-        if (object.get("leader")) |leader| switch (leader) {
-            .object => |leader_object| {
-                const id = jsonInt(leader_object.get("id")) orelse 0;
-                if (leader_object.get("host")) |host| {
-                    if (host == .string) {
-                        try out.print("leader: node {d} at {s}:{d}\n", .{
-                            id,
-                            host.string,
-                            jsonInt(leader_object.get("port")) orelse 0,
-                        });
-                        return exit_ok;
-                    }
-                }
-                try out.print("leader: node {d}\n", .{id});
-            },
-            else => try out.writeAll("leader: none\n"),
-        };
+        try renderRemoteLeader(object, out);
     } else if (std.mem.eql(u8, command, "wait")) {
         try out.print("applied {d}, leader {?d}\n", .{
             jsonInt(object.get("applied_slot")) orelse 0,
@@ -330,6 +326,26 @@ pub fn renderRemote(
         try out.print("{s}\n", .{body});
     }
     return exit_ok;
+}
+
+fn renderRemoteLeader(object: *const std.json.ObjectMap, out: *std.Io.Writer) !void {
+    if (object.get("leader")) |leader| switch (leader) {
+        .object => |leader_object| {
+            const id = jsonInt(leader_object.get("id")) orelse 0;
+            if (leader_object.get("host")) |host| {
+                if (host == .string) {
+                    try out.print("leader: node {d} at {s}:{d}\n", .{
+                        id,
+                        host.string,
+                        jsonInt(leader_object.get("port")) orelse 0,
+                    });
+                    return;
+                }
+            }
+            try out.print("leader: node {d}\n", .{id});
+        },
+        else => try out.writeAll("leader: none\n"),
+    };
 }
 
 pub fn jsonInt(value: ?std.json.Value) ?i64 {
