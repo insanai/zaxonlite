@@ -77,6 +77,16 @@ pub const Connection = struct {
         endpoint: Endpoint,
         transport: Transport,
     ) !*Connection {
+        return openWithTransportCancelable(gpa, io, endpoint, transport, null);
+    }
+
+    fn openWithTransportCancelable(
+        gpa: std.mem.Allocator,
+        io: Io,
+        endpoint: Endpoint,
+        transport: Transport,
+        cancellation: ?*Cancellation,
+    ) !*Connection {
         const self = try gpa.create(Connection);
         errdefer gpa.destroy(self);
         const read_buffer = try gpa.alloc(u8, 64 * 1024);
@@ -95,6 +105,8 @@ pub const Connection = struct {
             break :blk try address.connect(io, .{ .mode = .stream });
         };
         errdefer stream.close(io);
+        if (cancellation) |state| try state.register(io, stream);
+        defer if (cancellation) |state| state.unregister(io, stream);
 
         self.* = .{
             .gpa = gpa,
@@ -386,6 +398,7 @@ pub const ClusterConnection = struct {
     /// follow because the transport cannot authenticate node identity.
     /// Lets callers explain the policy instead of a generic failure.
     refused_leader_hint: ?RefusedLeaderHint = null,
+    cancellation: Cancellation = .{},
 
     pub fn init(
         gpa: std.mem.Allocator,
@@ -414,13 +427,21 @@ pub const ClusterConnection = struct {
 
     fn connect(self: *ClusterConnection, endpoint: Endpoint) !void {
         std.debug.assert(self.connection == null);
-        self.connection = try Connection.openWithTransport(
+        self.connection = try Connection.openWithTransportCancelable(
             self.gpa,
             self.io,
             endpoint,
             self.transport,
+            &self.cancellation,
         );
         self.endpoint = endpoint;
+    }
+
+    /// Abandons the currently active call by shutting down its socket. The
+    /// request may already have reached the server; this only cancels the
+    /// local wait. Safe to call from a different thread than `call`.
+    pub fn cancelCurrent(self: *ClusterConnection) void {
+        self.cancellation.request(self.io);
     }
 
     pub fn call(
@@ -428,7 +449,32 @@ pub const ClusterConnection = struct {
         request: []const u8,
         require_leader: bool,
     ) !CallResult {
-        if (self.endpoints.len == 0) return error.NoEndpoints;
+        return self.callInternal(request, require_leader, null);
+    }
+
+    /// `call` with a start barrier for an external interrupt waiter. Once the
+    /// event is set, `cancelCurrent` is guaranteed to apply to this call.
+    pub fn callInterruptible(
+        self: *ClusterConnection,
+        request: []const u8,
+        require_leader: bool,
+        started: *std.Io.Event,
+    ) !CallResult {
+        return self.callInternal(request, require_leader, started);
+    }
+
+    fn callInternal(
+        self: *ClusterConnection,
+        request: []const u8,
+        require_leader: bool,
+        started: ?*std.Io.Event,
+    ) !CallResult {
+        if (self.endpoints.len == 0) {
+            if (started) |event| event.set(self.io);
+            return error.NoEndpoints;
+        }
+        self.cancellation.begin(self.io);
+        if (started) |event| event.set(self.io);
         self.refused_leader_hint = null;
         var redirect: ?Endpoint = null;
         var attempt: usize = 0;
@@ -442,16 +488,22 @@ pub const ClusterConnection = struct {
                     break :blk selected;
                 };
                 redirect = null;
-                self.connect(endpoint) catch {
-                    self.io.sleep(.fromMilliseconds(150), .awake) catch {};
+                self.connect(endpoint) catch |err| {
+                    if (err == error.Canceled or self.cancellation.isRequested(self.io)) {
+                        return error.Canceled;
+                    }
+                    try self.retryDelay(.fromMilliseconds(150));
                     continue;
                 };
             }
 
             const endpoint = self.endpoint.?;
-            const body = self.connection.?.call(request) catch {
+            const body = self.callConnected(request) catch |err| {
                 self.disconnect();
-                self.io.sleep(.fromMilliseconds(150), .awake) catch {};
+                if (err == error.Canceled or self.cancellation.isRequested(self.io)) {
+                    return error.Canceled;
+                }
+                try self.retryDelay(.fromMilliseconds(150));
                 continue;
             };
             if (!require_leader) return self.result(body, endpoint);
@@ -469,17 +521,33 @@ pub const ClusterConnection = struct {
                 .rotate => {
                     self.gpa.free(body);
                     self.disconnect();
-                    self.io.sleep(.fromMilliseconds(25), .awake) catch {};
+                    try self.retryDelay(.fromMilliseconds(25));
                 },
                 .redirect => |target| {
                     self.gpa.free(body);
                     self.disconnect();
                     redirect = target;
-                    self.io.sleep(.fromMilliseconds(25), .awake) catch {};
+                    try self.retryDelay(.fromMilliseconds(25));
                 },
             }
         }
         return error.NoLeaderReachable;
+    }
+
+    fn callConnected(self: *ClusterConnection, request: []const u8) ![]u8 {
+        const connection = self.connection.?;
+        try self.cancellation.register(self.io, connection.stream);
+        defer self.cancellation.unregister(self.io, connection.stream);
+        return connection.call(request);
+    }
+
+    fn retryDelay(self: *ClusterConnection, duration: std.Io.Duration) !void {
+        self.io.sleep(duration, .awake) catch |err| {
+            if (err == error.Canceled or self.cancellation.isRequested(self.io)) {
+                return error.Canceled;
+            }
+        };
+        if (self.cancellation.isRequested(self.io)) return error.Canceled;
     }
 
     fn result(
@@ -511,6 +579,63 @@ pub const ClusterConnection = struct {
             },
             .owned_endpoint_host = host,
         };
+    }
+};
+
+/// Synchronizes a call's live socket with a cancellation request. It stores a
+/// socket value rather than a `Connection` pointer, so the canceling thread
+/// never observes or frees mutable client-owned memory.
+const Cancellation = struct {
+    mutex: std.Io.Mutex = .init,
+    requested: bool = false,
+    stream: ?std.Io.net.Stream = null,
+
+    fn begin(self: *Cancellation, io: Io) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        std.debug.assert(self.stream == null);
+        self.requested = false;
+    }
+
+    fn register(
+        self: *Cancellation,
+        io: Io,
+        stream: std.Io.net.Stream,
+    ) error{Canceled}!void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.requested) {
+            stream.shutdown(io, .both) catch {};
+            return error.Canceled;
+        }
+        std.debug.assert(self.stream == null);
+        self.stream = stream;
+    }
+
+    fn unregister(
+        self: *Cancellation,
+        io: Io,
+        stream: std.Io.net.Stream,
+    ) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.stream) |active| {
+            std.debug.assert(active.socket.handle == stream.socket.handle);
+            self.stream = null;
+        }
+    }
+
+    fn request(self: *Cancellation, io: Io) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.requested = true;
+        if (self.stream) |stream| stream.shutdown(io, .both) catch {};
+    }
+
+    fn isRequested(self: *Cancellation, io: Io) bool {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return self.requested;
     }
 };
 
@@ -701,4 +826,20 @@ test "endpoint parsing" {
     const unix = try Endpoint.parse("unix:/run/zaxon.sock");
     try std.testing.expectEqualStrings("/run/zaxon.sock", unix.unix_path.?);
     try std.testing.expectError(error.InvalidEndpoint, Endpoint.parse("unix:"));
+}
+
+test "interruptible call always releases its start barrier" {
+    var cluster = ClusterConnection.init(
+        std.testing.allocator,
+        std.testing.io,
+        &.{},
+        .{},
+    );
+    defer cluster.deinit();
+    var started: std.Io.Event = .unset;
+    try std.testing.expectError(
+        error.NoEndpoints,
+        cluster.callInterruptible("{}", true, &started),
+    );
+    try std.testing.expect(started.isSet());
 }

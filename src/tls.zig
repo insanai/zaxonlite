@@ -17,6 +17,7 @@
 //! existing watchdog and shutdown paths cancel TLS connections too.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 
 // ----------------------------------------------------------------------
@@ -412,7 +413,7 @@ pub const Stream = struct {
         ERR_clear_error();
         const ssl = SSL_new(context.handle) orelse return error.TlsInit;
         errdefer SSL_free(ssl);
-        if (SSL_set_fd(ssl, @intCast(socket.socket.handle)) != 1) {
+        if (SSL_set_fd(ssl, socketDescriptor(socket.socket.handle)) != 1) {
             return error.TlsInit;
         }
         if (step(ssl) != 1) return error.TlsHandshakeFailed;
@@ -437,6 +438,16 @@ pub const Stream = struct {
         };
         try self.readPeerCommonName(require_peer_certificate);
         return self;
+    }
+
+    /// OpenSSL's socket BIO API still accepts `int` on Windows even though
+    /// WinSock spells SOCKET as a pointer-sized handle. OpenSSL documents the
+    /// narrowing conversion as safe for current Windows socket-table indices.
+    fn socketDescriptor(handle: std.Io.net.Socket.Handle) c_int {
+        return if (builtin.os.tag == .windows)
+            @intCast(@intFromPtr(handle))
+        else
+            @intCast(handle);
     }
 
     /// SIGPIPE would kill the process when OpenSSL writes to a peer that
