@@ -117,8 +117,10 @@ pub const Editor = struct {
             self.buffer[self.cursor..self.len],
         );
         @memcpy(self.buffer[self.cursor .. self.cursor + bytes.len], bytes);
+        std.debug.assert(self.len < capacity);
         self.len += bytes.len;
         self.cursor += bytes.len;
+        std.debug.assert(self.len <= capacity);
         return .redraw;
     }
 
@@ -204,7 +206,9 @@ pub const Editor = struct {
 
     fn rememberKill(self: *Editor, start: usize, end: usize) void {
         std.debug.assert(start <= end and end <= self.len);
+        std.debug.assert(self.yank_len <= capacity);
         self.yank_len = end - start;
+        std.debug.assert(self.yank_len <= capacity);
         @memcpy(self.yank_buffer[0..self.yank_len], self.buffer[start..end]);
     }
 
@@ -215,6 +219,7 @@ pub const Editor = struct {
             self.buffer[start .. self.len - (end - start)],
             self.buffer[end..self.len],
         );
+        std.debug.assert(self.len <= capacity);
         self.len -= end - start;
         std.debug.assert(self.cursor <= capacity and self.len <= capacity);
     }

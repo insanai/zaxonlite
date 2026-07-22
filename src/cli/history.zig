@@ -51,6 +51,7 @@ pub const History = struct {
         }
         const copy = try self.gpa.dupe(u8, text);
         errdefer self.gpa.free(copy);
+        std.debug.assert(self.entries.items.len <= max_entries);
         try self.entries.append(self.gpa, copy);
         self.encoded_bytes += encodedSize(text) + 1;
         while (self.entries.items.len > max_entries or
@@ -60,6 +61,7 @@ pub const History = struct {
             self.encoded_bytes -= encodedSize(evicted) + 1;
             self.gpa.free(evicted);
         }
+        std.debug.assert(self.entries.items.len <= max_entries);
     }
 
     /// Walks backward from the in-progress line. The first call saves the

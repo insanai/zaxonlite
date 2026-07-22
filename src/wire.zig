@@ -92,7 +92,10 @@ pub const EnrollmentRequest = struct {
         std.mem.writeInt(u128, buffer[36..52], self.database_id, .little);
         std.mem.writeInt(u32, buffer[52..56], @intCast(self.csr.len), .little);
         @memcpy(buffer[56..][0..self.csr.len], self.csr);
-        return buffer[0 .. fixed_size + self.csr.len];
+        std.debug.assert(fixed_size + self.csr.len <= max_encoded_size);
+        const encoded = buffer[0 .. fixed_size + self.csr.len];
+        std.debug.assert(encoded.len <= max_encoded_size);
+        return encoded;
     }
 
     pub fn decode(body: []const u8) WireError!EnrollmentRequest {
@@ -140,7 +143,10 @@ pub const EnrollmentResponse = struct {
         }
         buffer[0] = @intFromEnum(self.status);
         @memcpy(buffer[1..][0..self.certificate.len], self.certificate);
-        return buffer[0 .. 1 + self.certificate.len];
+        std.debug.assert(1 + self.certificate.len <= max_encoded_size);
+        const encoded = buffer[0 .. 1 + self.certificate.len];
+        std.debug.assert(encoded.len <= max_encoded_size);
+        return encoded;
     }
 
     pub fn decode(body: []const u8) WireError!EnrollmentResponse {
