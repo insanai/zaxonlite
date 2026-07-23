@@ -375,7 +375,7 @@ pub fn main(init: std.process.Init) !u8 {
     // leadership mid-run, so every response is verified and a declined
     // request re-resolves the leader; the retry latency stays in the
     // sample, which is the honest cost of the failover.
-    var connection = try client.Connection.openWithTransport(
+    const connection = try client.Connection.openWithTransport(
         gpa,
         io,
         leader_endpoint,
@@ -597,7 +597,7 @@ fn spawnNode(
         try scratch.append(gpa, peer_text);
         try argv.appendSlice(gpa, &.{ "--peer", peer_text });
     }
-    try appendSpawnNodeModeArgs(gpa, argv, scratch, root, node.id, mode);
+    try appendSpawnNodeModeArgs(gpa, &argv, &scratch, root, node.id, mode);
 
     try argv.appendSlice(gpa, &.{ "--sync", sync_text });
 
@@ -618,7 +618,7 @@ fn spawnNode(
 }
 
 const BenchWriteResult = struct {
-    elapsed: u64,
+    elapsed: i96,
     stats: Stats,
 };
 
