@@ -3,10 +3,11 @@
 //! One renderer serves the one-shot commands and both shells, replacing the
 //! duplicated table writers that previously lived in `main.zig`. The plain
 //! writers here are the byte-exact legacy formats used by scripts and the
-//! CLI contract test; the rich formats live in `table.zig`.
+//! CLI contract test; the rich formats live in `zaxon_cli_ui`.
 
 const std = @import("std");
 const zaxonlite = @import("zaxonlite");
+const ui = @import("zaxon_cli_ui");
 
 const client = zaxonlite.client;
 const diagnostic = zaxonlite.diagnostic;
@@ -17,82 +18,15 @@ pub const exit_usage: u8 = 2;
 pub const exit_integrity: u8 = 3;
 pub const exit_unavailable: u8 = 4;
 
-/// A borrowed view of a query result: what both backends produce. Embedded
-/// results borrow from `zaxonlite.QueryResult`; remote results are built
-/// from the response JSON into an arena.
-pub const View = struct {
-    columns: []const []const u8,
-    rows: []const []const ?[]const u8,
-};
+/// The neutral result view and its plain writers now live in the shared
+/// `zaxon_cli_ui` module; re-exported here so callers keep one import.
+pub const View = ui.view.View;
+pub const writePlainTable = ui.view.writePlainTable;
+pub const writeJsonResult = ui.view.writeJsonResult;
+pub const writeJsonString = ui.view.writeJsonString;
 
 pub fn viewOf(result: *const zaxonlite.QueryResult) View {
     return .{ .columns = result.columns, .rows = result.rows };
-}
-
-/// The legacy `zaxon query` table: header-width rules, no alignment. Kept
-/// byte-identical for scripts and the non-TTY shell fallback.
-pub fn writePlainTable(view: View, out: *std.Io.Writer) !void {
-    for (view.columns, 0..) |column, index| {
-        if (index > 0) try out.writeAll(" | ");
-        try out.writeAll(column);
-    }
-    try out.writeAll("\n");
-    for (view.columns, 0..) |column, index| {
-        if (index > 0) try out.writeAll("-+-");
-        for (0..column.len) |_| try out.writeAll("-");
-    }
-    try out.writeAll("\n");
-    for (view.rows) |row| {
-        for (row, 0..) |cell, index| {
-            if (index > 0) try out.writeAll(" | ");
-            try out.writeAll(cell orelse "NULL");
-        }
-        try out.writeAll("\n");
-    }
-}
-
-pub fn writeJsonResult(view: View, out: *std.Io.Writer) !void {
-    try out.writeAll("{\"columns\":[");
-    for (view.columns, 0..) |column, index| {
-        if (index > 0) try out.writeAll(",");
-        try writeJsonString(out, column);
-    }
-    try out.writeAll("],\"rows\":[");
-    for (view.rows, 0..) |row, row_index| {
-        if (row_index > 0) try out.writeAll(",");
-        try out.writeAll("[");
-        for (row, 0..) |cell, index| {
-            if (index > 0) try out.writeAll(",");
-            if (cell) |text| {
-                try writeJsonString(out, text);
-            } else {
-                try out.writeAll("null");
-            }
-        }
-        try out.writeAll("]");
-    }
-    try out.writeAll("]}\n");
-}
-
-pub fn writeJsonString(out: *std.Io.Writer, text: []const u8) !void {
-    try out.writeAll("\"");
-    for (text) |byte| {
-        switch (byte) {
-            '"' => try out.writeAll("\\\""),
-            '\\' => try out.writeAll("\\\\"),
-            '\n' => try out.writeAll("\\n"),
-            '\r' => try out.writeAll("\\r"),
-            '\t' => try out.writeAll("\\t"),
-            else => {
-                if (byte < 0x20) {
-                    try out.print("\\u{x:0>4}", .{byte});
-                } else {
-                    try out.writeAll(&.{byte});
-                }
-            },
-        }
-    }
-    try out.writeAll("\"");
 }
 
 pub fn printStatus(node: *zaxonlite.Node, json: bool, out: *std.Io.Writer) !void {

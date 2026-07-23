@@ -15,18 +15,18 @@
 
 const std = @import("std");
 const zaxonlite = @import("zaxonlite");
-const term_mod = @import("term.zig");
-const editor_mod = @import("editor.zig");
-const history_mod = @import("history.zig");
-const highlight = @import("highlight.zig");
-const table = @import("table.zig");
+const ui = @import("zaxon_cli_ui");
 const render = @import("render.zig");
+
+const term_mod = ui.term;
+const editor_mod = ui.editor;
+const history_mod = ui.history;
+const highlight = ui.highlight;
+const table = ui.table;
 
 const client = zaxonlite.client;
 const diagnostic = zaxonlite.diagnostic;
 const Node = zaxonlite.Node;
-const Key = term_mod.Key;
-
 pub const exit_ok = render.exit_ok;
 
 /// The execution seam: both variants already exist and produce the same
@@ -305,14 +305,14 @@ pub const Shell = struct {
     out: *std.Io.Writer,
     err_out: *std.Io.Writer,
     history: history_mod.History,
-    editor: editor_mod.Editor = .{},
+    /// The shared line reader; points at this shell's terminal and history.
+    reader: *ui.LineReader,
     statement: std.ArrayList(u8) = .empty,
     mode: table.Mode = .auto,
     timer: bool = false,
     history_enabled: bool,
     history_configured: bool,
     history_path: ?[]const u8,
-    painted_cursor_row: u16 = 0,
     quit: bool = false,
 
     /// The explicit failure surface of the shell and every dot command.
@@ -337,6 +337,11 @@ fn runRich(
     out: *std.Io.Writer,
     err_out: *std.Io.Writer,
 ) !u8 {
+    var reader = ui.LineReader{
+        .gpa = gpa,
+        .terminal = terminal,
+        .history = undefined,
+    };
     var shell = Shell{
         .gpa = gpa,
         .io = io,
@@ -345,10 +350,14 @@ fn runRich(
         .out = out,
         .err_out = err_out,
         .history = history_mod.History.init(gpa),
+        .reader = &reader,
         .history_enabled = !config.no_history and config.history_path != null,
         .history_configured = !config.no_history and config.history_path != null,
         .history_path = config.history_path,
     };
+    // The history lives in the shell (dot commands replace it wholesale);
+    // the field address is stable for the reader once the shell exists.
+    reader.history = &shell.history;
     defer shell.history.deinit();
     defer shell.statement.deinit(gpa);
 
@@ -367,9 +376,13 @@ fn runRich(
     try out.flush();
 
     while (!shell.quit) {
-        const submitted = try editLine(&shell);
-        if (!submitted) break;
-        try processRichLine(&shell);
+        switch (try shell.reader.readLine(prompt(&shell))) {
+            .submitted => try processRichLine(&shell),
+            // The reader already cleared its editor and left history
+            // navigation; the accumulated statement is ours to drop.
+            .canceled => shell.statement.clearRetainingCapacity(),
+            .eof => break,
+        }
     }
 
     if (shell.history_enabled) {
@@ -381,7 +394,7 @@ fn runRich(
 }
 
 fn processRichLine(shell: *Shell) Shell.Error!void {
-    const line = std.mem.trim(u8, shell.editor.text(), " \t\r");
+    const line = std.mem.trim(u8, shell.reader.text(), " \t\r");
     if (line.len == 0 and shell.statement.items.len == 0) return;
 
     if (shell.statement.items.len == 0 and line.len > 0 and line[0] == '.') {
@@ -391,7 +404,7 @@ fn processRichLine(shell: *Shell) Shell.Error!void {
         return;
     }
 
-    const edited = shell.editor.text();
+    const edited = shell.reader.text();
     if (shell.statement.items.len + edited.len > editor_mod.capacity) {
         try statementTooLongDiagnostic(shell);
         shell.statement.clearRetainingCapacity();
@@ -420,129 +433,6 @@ fn processRichLine(shell: *Shell) Shell.Error!void {
     try shell.err_out.flush();
 }
 
-/// Edits one line in raw mode. Returns false on end of input (`ctrl+d` on
-/// an empty line, or a closed terminal). On return the terminal is back in
-/// cooked mode and the editor holds the submitted text.
-fn editLine(shell: *Shell) Shell.Error!bool {
-    const terminal = shell.terminal;
-    try terminal.resumeRaw();
-    var raw_active = true;
-    defer if (raw_active) terminal.suspendRaw() catch {};
-    shell.editor.clear();
-    shell.painted_cursor_row = 0;
-    try paint(shell);
-    var paste_buffer: [editor_mod.capacity]u8 = undefined;
-    var paste_len: usize = 0;
-    var paste_overflow = false;
-    var pasting = false;
-
-    while (true) {
-        const event = terminal.nextEvent() catch |err| switch (err) {
-            error.EndOfStream => {
-                try terminal.suspendRaw();
-                raw_active = false;
-                return false;
-            },
-            else => return error.ReadFailed,
-        };
-        switch (event) {
-            .key_press => |key| {
-                if (pasting) {
-                    if (pastedKeyBytes(key)) |bytes| {
-                        if (paste_len + bytes.len <= paste_buffer.len) {
-                            @memcpy(paste_buffer[paste_len .. paste_len + bytes.len], bytes);
-                            paste_len += bytes.len;
-                        } else {
-                            paste_overflow = true;
-                        }
-                    }
-                    continue;
-                }
-                if (try handleFeedAction(shell, shell.editor.feed(key))) |done| {
-                    try terminal.suspendRaw();
-                    raw_active = false;
-                    return done;
-                }
-            },
-            .paste_start => {
-                pasting = true;
-                paste_len = 0;
-                paste_overflow = false;
-            },
-            .paste_end => {
-                if (pasting and !paste_overflow) {
-                    _ = shell.editor.insertText(paste_buffer[0..paste_len]);
-                }
-                pasting = false;
-                try paint(shell);
-            },
-            .paste => |bytes| {
-                defer shell.gpa.free(bytes);
-                _ = shell.editor.insertText(bytes);
-                try paint(shell);
-            },
-            .winsize => try paint(shell),
-            else => {},
-        }
-    }
-}
-
-fn handleFeedAction(shell: *Shell, action: editor_mod.Action) Shell.Error!?bool {
-    const terminal = shell.terminal;
-    switch (action) {
-        .none => return null,
-        .redraw => try paint(shell),
-        .submit => {
-            try finishLine(terminal);
-            return true;
-        },
-        .cancel => {
-            try terminal.writer().writeAll("^C");
-            try finishLine(terminal);
-            shell.editor.clear();
-            shell.statement.clearRetainingCapacity();
-            shell.history.resetNav();
-            shell.painted_cursor_row = 0;
-            try paint(shell);
-        },
-        .eof => {
-            try finishLine(terminal);
-            return false;
-        },
-        .history_prev => {
-            const recalled = shell.history.prev(shell.editor.text()) catch return error.OutOfMemory;
-            if (recalled) |text| {
-                shell.editor.setText(text);
-                try paint(shell);
-            }
-        },
-        .history_next => {
-            if (shell.history.next()) |text| {
-                shell.editor.setText(text);
-                try paint(shell);
-            }
-        },
-        .search => {
-            try runSearch(shell);
-            try paint(shell);
-        },
-        .clear_screen => {
-            try terminal.writer().writeAll("\x1b[2J\x1b[H");
-            shell.painted_cursor_row = 0;
-            try paint(shell);
-        },
-    }
-    return null;
-}
-
-fn pastedKeyBytes(key: Key) ?[]const u8 {
-    if (key.matches(Key.enter, .{}) or key.matches('j', .{ .ctrl = true })) {
-        return "\n";
-    }
-    if (key.matches(Key.tab, .{})) return "\t";
-    return key.text;
-}
-
 fn statementTooLongDiagnostic(shell: *Shell) Shell.Error!void {
     diagnostic.write(
         shell.err_out,
@@ -566,129 +456,8 @@ fn historyIoDiagnostic(
     shell.err_out.flush() catch return error.WriteFailed;
 }
 
-fn finishLine(terminal: *term_mod.Term) Shell.Error!void {
-    terminal.writer().writeAll("\r\n") catch return error.WriteFailed;
-    terminal.writer().flush() catch return error.WriteFailed;
-}
-
 fn prompt(shell: *const Shell) []const u8 {
     return if (shell.statement.items.len == 0) "zaxon> " else "  ...> ";
-}
-
-/// Repaints the edited line: return to the paint origin, clear, write the
-/// prompt and the highlighted buffer, then park the cursor. The simplest
-/// correct strategy — full repaint per keystroke — keeps the math easy to
-/// verify; wrapped lines are handled by tracking the cursor's row.
-fn paint(shell: *Shell) Shell.Error!void {
-    const terminal = shell.terminal;
-    const out = terminal.writer();
-    const width = terminal.width();
-    const style = term_mod.Style{ .color = terminal.caps.color };
-    const prompt_text = prompt(shell);
-    const prompt_width = table.sanitizedWidth(prompt_text);
-    const text = shell.editor.text();
-
-    out.writeAll("\r") catch return error.WriteFailed;
-    if (shell.painted_cursor_row > 0) {
-        out.print("\x1b[{d}A", .{shell.painted_cursor_row}) catch
-            return error.WriteFailed;
-    }
-    out.writeAll("\x1b[J") catch return error.WriteFailed;
-
-    style.write(out, term_mod.Style.bold) catch return error.WriteFailed;
-    out.writeAll(prompt_text) catch return error.WriteFailed;
-    style.write(out, term_mod.Style.reset) catch return error.WriteFailed;
-    writeHighlighted(out, text, style) catch return error.WriteFailed;
-
-    const total = prompt_width +| table.sanitizedWidth(text);
-    const before = prompt_width +| table.sanitizedWidth(text[0..shell.editor.cursor]);
-    const end_row = total / width;
-    const cursor_row = before / width;
-    const cursor_col = before % width;
-    if (end_row > cursor_row) {
-        out.print("\x1b[{d}A", .{end_row - cursor_row}) catch
-            return error.WriteFailed;
-    }
-    out.print("\r\x1b[{d}G", .{cursor_col + 1}) catch return error.WriteFailed;
-    shell.painted_cursor_row = cursor_row;
-    out.flush() catch return error.WriteFailed;
-}
-
-fn writeHighlighted(
-    out: *std.Io.Writer,
-    text: []const u8,
-    style: term_mod.Style,
-) !void {
-    var tokenizer = highlight.Tokenizer.init(text);
-    while (tokenizer.next()) |span| {
-        const sequence: ?[]const u8 = switch (span.kind) {
-            .keyword => term_mod.Style.fg_keyword,
-            .string => term_mod.Style.fg_string,
-            .number => term_mod.Style.fg_number,
-            .comment => term_mod.Style.fg_comment,
-            .dot => term_mod.Style.fg_dot,
-            .text, .identifier, .operator => null,
-        };
-        if (sequence) |escape| try style.write(out, escape);
-        try table.writeSanitized(out, span.bytes(text));
-        if (sequence != null) try style.write(out, term_mod.Style.reset);
-    }
-}
-
-/// `ctrl+r` reverse incremental search: a bounded sub-mode of the editor.
-/// Accepting copies the match into the editor; cancel restores nothing.
-fn runSearch(shell: *Shell) Shell.Error!void {
-    const terminal = shell.terminal;
-    const out = terminal.writer();
-    var query: [256]u8 = undefined;
-    var query_len: usize = 0;
-    var match: ?usize = null;
-
-    while (true) {
-        const match_text: []const u8 =
-            if (match) |index| shell.history.entry(index) else "";
-        out.writeAll("\r\x1b[J(reverse-i-search)`") catch return error.WriteFailed;
-        table.writeSanitized(out, query[0..query_len]) catch return error.WriteFailed;
-        out.writeAll("': ") catch return error.WriteFailed;
-        table.writeSanitized(out, match_text) catch return error.WriteFailed;
-        out.flush() catch return error.WriteFailed;
-
-        const event = terminal.nextEvent() catch return error.ReadFailed;
-        const key = switch (event) {
-            .key_press => |key| key,
-            .paste => |bytes| {
-                shell.gpa.free(bytes);
-                continue;
-            },
-            else => continue,
-        };
-        if (key.matches(Key.enter, .{}) or key.matches('j', .{ .ctrl = true })) {
-            if (match) |index| shell.editor.setText(shell.history.entry(index));
-            return;
-        }
-        if (key.matches(Key.escape, .{}) or key.matches('g', .{ .ctrl = true }) or
-            key.matches('c', .{ .ctrl = true }))
-        {
-            return;
-        }
-        if (key.matches('r', .{ .ctrl = true })) {
-            match = shell.history.searchBefore(query[0..query_len], match) orelse match;
-            continue;
-        }
-        if (key.matches(Key.backspace, .{})) {
-            if (query_len > 0) {
-                query_len = editor_mod.prevBoundary(query[0..query_len], query_len);
-                match = shell.history.searchBefore(query[0..query_len], null);
-            }
-            continue;
-        }
-        const key_text = key.text orelse continue;
-        if (key.mods.ctrl or key.mods.alt) continue;
-        if (query_len + key_text.len > query.len) continue;
-        @memcpy(query[query_len .. query_len + key_text.len], key_text);
-        query_len += key_text.len;
-        match = shell.history.searchBefore(query[0..query_len], null);
-    }
 }
 
 // ----------------------------------------------------------------------
@@ -996,7 +765,7 @@ fn renderView(shell: *Shell, view: table.View) Shell.Error!void {
     };
 
     if (paged) {
-        try page(shell, buffer.written());
+        try ui.pager.page(shell.gpa, shell.terminal, buffer.written());
     } else {
         shell.out.writeAll(buffer.written()) catch return error.WriteFailed;
     }
@@ -1006,119 +775,6 @@ fn renderView(shell: *Shell, view: table.View) Shell.Error!void {
             if (rows == 1) "" else "s",
         }) catch return error.WriteFailed;
     }
-}
-
-/// The minimal alternate-screen pager (ZDS 0005, M5): arrows and page keys
-/// scroll, `q` returns. Renders from the already-materialized text; lines
-/// wider than the terminal are truncated by display width.
-fn page(shell: *Shell, text: []const u8) Shell.Error!void {
-    const terminal = shell.terminal;
-    const out = terminal.writer();
-    try terminal.resumeRaw();
-    var raw_active = true;
-    defer if (raw_active) terminal.suspendRaw() catch {};
-
-    var line_count: usize = 0;
-    var lines_iterator = std.mem.splitScalar(u8, text, '\n');
-    while (lines_iterator.next()) |_| line_count += 1;
-
-    var top: usize = 0;
-    out.writeAll("\x1b[?1049h") catch return error.WriteFailed;
-    defer {
-        out.writeAll("\x1b[?1049l") catch {};
-        out.flush() catch {};
-    }
-
-    while (true) {
-        const height: usize = @max(terminal.height(), 2) - 1;
-        const width = terminal.width();
-        const max_top = line_count -| height;
-        top = @min(top, max_top);
-
-        try renderPageFrame(terminal, text, top, height, width, line_count);
-
-        const event = terminal.nextEvent() catch return error.ReadFailed;
-        const key = switch (event) {
-            .key_press => |key| key,
-            .paste => |bytes| {
-                shell.gpa.free(bytes);
-                continue;
-            },
-            .winsize => continue,
-            else => continue,
-        };
-        if (key.matches('q', .{}) or key.matches(Key.escape, .{}) or
-            key.matches('c', .{ .ctrl = true }))
-        {
-            try terminal.suspendRaw();
-            raw_active = false;
-            return;
-        }
-        if (key.matches(Key.up, .{}) or key.matches('k', .{})) {
-            top -|= 1;
-        } else if (key.matches(Key.down, .{}) or key.matches('j', .{}) or
-            key.matches(Key.enter, .{}))
-        {
-            top = @min(top + 1, max_top);
-        } else if (key.matches(Key.page_up, .{}) or key.matches('b', .{})) {
-            top -|= height;
-        } else if (key.matches(Key.page_down, .{}) or
-            key.matches(' ', .{}) or key.matches('f', .{ .ctrl = true }))
-        {
-            top = @min(top + height, max_top);
-        } else if (key.matches('g', .{})) {
-            top = 0;
-        } else if (key.matches('G', .{ .shift = true }) or key.matches('G', .{})) {
-            top = max_top;
-        }
-    }
-}
-
-fn renderPageFrame(
-    terminal: *term_mod.Term,
-    text: []const u8,
-    top: usize,
-    height: usize,
-    width: u16,
-    line_count: usize,
-) Shell.Error!void {
-    const out = terminal.writer();
-    out.writeAll("\x1b[H\x1b[J") catch return error.WriteFailed;
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    var index: usize = 0;
-    var shown: usize = 0;
-    while (lines.next()) |line| : (index += 1) {
-        if (index < top) continue;
-        if (shown == height) break;
-        try writeTruncated(out, line, width);
-        out.writeAll("\r\n") catch return error.WriteFailed;
-        shown += 1;
-    }
-    const style = term_mod.Style{ .color = terminal.caps.color };
-    style.write(out, term_mod.Style.dim) catch return error.WriteFailed;
-    out.print(
-        "-- line {d}-{d} of {d} (q quit, arrows/space scroll) --",
-        .{ top + 1, @min(top + height, line_count), line_count },
-    ) catch return error.WriteFailed;
-    style.write(out, term_mod.Style.reset) catch return error.WriteFailed;
-    out.flush() catch return error.WriteFailed;
-}
-
-fn writeTruncated(out: *std.Io.Writer, line: []const u8, width: u16) Shell.Error!void {
-    if (table.sanitizedWidth(line) <= width) {
-        table.writeSanitized(out, line) catch return error.WriteFailed;
-        return;
-    }
-    var written: u32 = 0;
-    var iterator = term_mod.GraphemeIterator.init(line);
-    while (iterator.next()) |grapheme| {
-        const bytes = grapheme.bytes(line);
-        const grapheme_width = table.sanitizedWidth(bytes);
-        if (written + grapheme_width >= width) break;
-        table.writeSanitized(out, bytes) catch return error.WriteFailed;
-        written += grapheme_width;
-    }
-    out.writeAll("\u{2026}") catch return error.WriteFailed;
 }
 
 // ----------------------------------------------------------------------

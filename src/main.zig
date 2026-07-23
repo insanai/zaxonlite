@@ -14,7 +14,7 @@ const std = @import("std");
 const zaxonlite = @import("zaxonlite");
 const cli_shell = @import("cli/shell.zig");
 const cli_render = @import("cli/render.zig");
-const cli_term = @import("cli/term.zig");
+const cli_term = @import("zaxon_cli_ui").term;
 
 /// The terminal layer's panic handler restores the operator's terminal
 /// before the default panic runs; a no-op unless the rich shell is active.
