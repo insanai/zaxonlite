@@ -52,6 +52,18 @@ fn linkOpenSsl(
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    // Embedded-only consumers (`Node`, no transport) can drop the OpenSSL
+    // link entirely: `node.zig` never imports `tls.zig`, and Zig's lazy
+    // analysis emits no OpenSSL externs unless the TLS transport is
+    // referenced. With `-Dtls=false` nothing in the build graph links
+    // libssl/libcrypto, so the consumer's binary carries no OpenSSL
+    // dependency. The `zaxon` executable and the transport hosts require
+    // TLS and are only built with the default `-Dtls=true`.
+    const tls_enabled = b.option(
+        bool,
+        "tls",
+        "Link OpenSSL 3 for the mTLS transport (false: embedded Node only)",
+    ) orelse true;
     const openssl_prefix = b.option(
         []const u8,
         "openssl-prefix",
@@ -93,7 +105,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     zaxonlite.linkLibrary(sqlite_lib);
-    linkOpenSsl(b, zaxonlite, target, openssl_prefix);
+    if (tls_enabled) linkOpenSsl(b, zaxonlite, target, openssl_prefix);
 
     const zaxon = b.addExecutable(.{
         .name = "zaxon",
@@ -324,7 +336,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     bench_zaxonlite.linkLibrary(bench_sqlite);
-    linkOpenSsl(b, bench_zaxonlite, target, openssl_prefix);
+    if (tls_enabled) linkOpenSsl(b, bench_zaxonlite, target, openssl_prefix);
     const bench_exe = b.addExecutable(.{
         .name = "zaxon-bench",
         .root_module = b.createModule(.{
