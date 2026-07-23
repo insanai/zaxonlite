@@ -167,7 +167,6 @@ export fn zaxonlite_cluster_open(
     const out = out_handle orelse return misuse_code;
     out.* = null;
     const directory = options.directory orelse return misuse_code;
-    const raw_members = options.members orelse return misuse_code;
     // Every declared count is reduced to the product limit before any
     // slice is formed or allocation sized from it.
     if (options.member_count == 0 or
@@ -180,7 +179,6 @@ export fn zaxonlite_cluster_open(
     const members = parseClusterMembers(options) catch |err| switch (err) {
         error.Misuse => return misuse_code,
         error.Unavailable => return unavailable_code,
-        else => return unavailable_code,
     };
     defer gpa.free(members);
 
