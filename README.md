@@ -252,3 +252,7 @@ data/
   CURRENT                  # installed snapshot pointer
   current.db               # materialized SQLite image (rebuildable)
 ```
+
+## License
+
+MIT © 2026 Vikrant Rathore and Ronak Rathore. See [LICENSE](LICENSE).
