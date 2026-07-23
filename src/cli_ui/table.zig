@@ -5,13 +5,13 @@
 //! through sanitization before it reaches the terminal: query results are
 //! untrusted bytes, and a hostile row must not be able to inject escape
 //! sequences into an operator's session. The legacy unaligned format used
-//! by scripts lives in `render.zig` and is not touched here.
+//! by scripts lives in `view.zig` and is not touched here.
 
 const std = @import("std");
 const term = @import("term.zig");
-const render = @import("render.zig");
+const view_mod = @import("view.zig");
 
-pub const View = render.View;
+pub const View = view_mod.View;
 
 pub const Mode = enum {
     table,
@@ -179,7 +179,7 @@ pub fn write(view: View, options: Options, out: *std.Io.Writer) !usize {
         },
         .expanded => try writeExpanded(view, options, out),
         .csv => try writeCsv(view, out),
-        .json => try render.writeJsonResult(view, out),
+        .json => try view_mod.writeJsonResult(view, out),
         .auto => unreachable,
     }
     return view.rows.len;

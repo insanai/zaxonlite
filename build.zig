@@ -88,6 +88,19 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }).module("vaxis");
 
+    // The shared, domain-neutral terminal UI (ZDS 0005; Kynetica KDS
+    // 0016): editor, history, highlighter, renderers, line reader, pager.
+    // Public so downstream consumers (Kynetica) can import it; it never
+    // imports zaxonlite, so `-Dtls=false` embedded builds stay clean.
+    const cli_ui = b.addModule("zaxon_cli_ui", .{
+        .root_source_file = b.path("src/cli_ui/ui.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vaxis", .module = vaxis },
+        },
+    });
+
     const translate_c = b.addTranslateC(.{
         .root_source_file = sqlite_dep.path("sqlite3.h"),
         .target = target,
@@ -115,7 +128,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "zaxonlite", .module = zaxonlite },
-                .{ .name = "vaxis", .module = vaxis },
+                .{ .name = "zaxon_cli_ui", .module = cli_ui },
             },
         }),
     });
@@ -133,15 +146,26 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run the zaxonlite test suite");
     test_step.dependOn(&run_unit_tests.step);
 
-    // Pure state machines of the interactive shell: editor, history,
-    // highlighter, renderer. No TTY or node is spawned.
+    // Pure state machines of the shared terminal UI: editor, history,
+    // highlighter, renderers. No TTY or node is spawned.
+    const cli_ui_tests = b.addTest(.{ .root_module = cli_ui });
+    const run_cli_ui_tests = b.addRunArtifact(cli_ui_tests);
+    const cli_ui_step = b.step(
+        "test-cli-ui",
+        "Run the shared terminal UI unit tests",
+    );
+    cli_ui_step.dependOn(&run_cli_ui_tests.step);
+    test_step.dependOn(&run_cli_ui_tests.step);
+
+    // What stayed zaxon-specific: statement routing, the dot-command
+    // registry, and remote result conversion.
     const cli_unit_mod = b.createModule(.{
         .root_source_file = b.path("src/cli/tests.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "zaxonlite", .module = zaxonlite },
-            .{ .name = "vaxis", .module = vaxis },
+            .{ .name = "zaxon_cli_ui", .module = cli_ui },
         },
     });
     const cli_unit_tests = b.addTest(.{ .root_module = cli_unit_mod });
@@ -360,6 +384,14 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = std.builtin.OptimizeMode.ReleaseFast,
     }).module("vaxis");
+    const cli_ui_fast = b.createModule(.{
+        .root_source_file = b.path("src/cli_ui/ui.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{
+            .{ .name = "vaxis", .module = vaxis_fast },
+        },
+    });
     const zaxon_fast = b.addExecutable(.{
         .name = "zaxon-fast",
         .root_module = b.createModule(.{
@@ -368,7 +400,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseFast,
             .imports = &.{
                 .{ .name = "zaxonlite", .module = bench_zaxonlite },
-                .{ .name = "vaxis", .module = vaxis_fast },
+                .{ .name = "zaxon_cli_ui", .module = cli_ui_fast },
             },
         }),
     });
