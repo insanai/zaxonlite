@@ -67,11 +67,13 @@ pub fn syncDirectory(dir: Io.Dir) !void {
     if (comptime builtin.os.tag.isDarwin()) {
         if (sync_mode == .full and fullFsync(dir.handle)) return;
     }
-    if (std.c.fsync(dir.handle) != 0) return error.DirectorySyncFailed;
+    try directoryFsync(dir);
 }
 
 pub fn syncChildDirectory(io: Io, parent: Io.Dir, path: []const u8) !void {
-    var child = try parent.openDir(io, path, .{});
+    // Iterating opens carry a real descriptor on every platform, so the
+    // fsync below is one syscall instead of the `O_PATH` reopen fallback.
+    var child = try parent.openDir(io, path, .{ .iterate = true });
     defer child.close(io);
     try syncDirectory(child);
 }
@@ -89,7 +91,7 @@ pub fn syncDirectoryBeforeBarrier(dir: Io.Dir) !void {
     if (comptime builtin.os.tag == .windows) {
         return error.UnsupportedDurabilityPlatform;
     }
-    if (std.c.fsync(dir.handle) != 0) return error.DirectorySyncFailed;
+    try directoryFsync(dir);
 }
 
 pub fn syncChildDirectoryBeforeBarrier(
@@ -97,9 +99,43 @@ pub fn syncChildDirectoryBeforeBarrier(
     parent: Io.Dir,
     path: []const u8,
 ) !void {
-    var child = try parent.openDir(io, path, .{});
+    // See syncChildDirectory: a real descriptor keeps this one syscall.
+    var child = try parent.openDir(io, path, .{ .iterate = true });
     defer child.close(io);
     try syncDirectoryBeforeBarrier(child);
+}
+
+/// `fsync(2)` for a directory handle. `Io.Dir` opens non-iterating
+/// directory handles with `O_PATH` where the platform has it (Linux),
+/// and the kernel rejects `fsync` on such descriptors with `EBADF`;
+/// reopening `"."` through the handle yields a syncable descriptor
+/// (`openat` accepts an `O_PATH` base). The fallback triggers only on
+/// `EBADF`: retrying a failed sync on a fresh descriptor after `EIO`
+/// could report success for writes the kernel already dropped.
+fn directoryFsync(dir: Io.Dir) error{DirectorySyncFailed}!void {
+    switch (fsyncErrno(dir.handle)) {
+        .SUCCESS => return,
+        .BADF => {},
+        else => return error.DirectorySyncFailed,
+    }
+    if (comptime !@hasField(std.posix.O, "PATH")) return error.DirectorySyncFailed;
+    const fd = std.posix.openat(dir.handle, ".", .{
+        .ACCMODE = .RDONLY,
+        .DIRECTORY = true,
+        .CLOEXEC = true,
+    }, 0) catch return error.DirectorySyncFailed;
+    defer std.posix.close(fd);
+    if (fsyncErrno(fd) != .SUCCESS) return error.DirectorySyncFailed;
+}
+
+fn fsyncErrno(handle: std.posix.fd_t) std.posix.E {
+    while (true) {
+        const rc = std.c.fsync(handle);
+        if (rc == 0) return .SUCCESS;
+        const err = std.posix.errno(rc);
+        if (err == .INTR) continue;
+        return err;
+    }
 }
 
 /// True when the full flush succeeded; false directs the caller to fall
