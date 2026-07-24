@@ -1,0 +1,55 @@
+# Temporary debugging workflow: the C ABI smoke test hangs on Linux.
+# Runs test-cabi under strace with a hard timeout and prints the tail of
+# the trace, which shows the last checks that ran (write() calls to
+# stdout) and the syscall every thread is blocked in. Delete this file
+# once the hang is fixed.
+name: Debug C ABI hang
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  strace:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: zaxonlite
+    steps:
+      - name: Checkout paxos-zig (path dependency parent)
+        uses: actions/checkout@v4
+        with:
+          repository: insanai/paxos-zig
+          path: .
+
+      - name: Checkout zaxonlite
+        uses: actions/checkout@v4
+        with:
+          path: zaxonlite
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install OpenSSL 3 and strace
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev strace
+
+      - name: Prepare Zig package cache
+        run: mkdir -p "${ZIG_GLOBAL_CACHE_DIR:-$HOME/.cache/zig}/tmp"
+
+      - name: Build the smoke test without running it
+        run: zig build check
+
+      - name: Run test-cabi under strace with a timeout
+        run: |
+          set -x
+          timeout -k 10 240 strace -f -tt -s 120 -o /tmp/cabi-trace.log \
+            zig build test-cabi || echo "exit=$?"
+          echo "=== smoke progress: writes to stdout ==="
+          grep 'write(1' /tmp/cabi-trace.log | tail -n 40 || true
+          echo "=== final 120 trace lines (blocked syscalls) ==="
+          tail -n 120 /tmp/cabi-trace.log

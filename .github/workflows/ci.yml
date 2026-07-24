@@ -30,6 +30,8 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    # A hung test should fail the run, not sit until the 6-hour default.
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: zaxonlite
