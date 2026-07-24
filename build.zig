@@ -40,11 +40,15 @@ fn linkOpenSsl(
     if (prefix.len > 0) {
         module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{prefix}) });
     }
-    const windows = target.result.os.tag == .windows;
-    module.linkSystemLibrary(if (windows) "libssl" else "ssl", .{
+    // MSVC import libraries are named libssl.lib/libcrypto.lib; the
+    // windows-gnu (mingw-style) static build produces libssl.a, which the
+    // posix names resolve.
+    const msvc = target.result.os.tag == .windows and
+        target.result.abi == .msvc;
+    module.linkSystemLibrary(if (msvc) "libssl" else "ssl", .{
         .use_pkg_config = .no,
     });
-    module.linkSystemLibrary(if (windows) "libcrypto" else "crypto", .{
+    module.linkSystemLibrary(if (msvc) "libcrypto" else "crypto", .{
         .use_pkg_config = .no,
     });
 }
