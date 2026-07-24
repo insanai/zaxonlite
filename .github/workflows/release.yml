@@ -60,6 +60,18 @@ jobs:
       - name: Prepare Zig package cache
         run: mkdir -p "${ZIG_GLOBAL_CACHE_DIR:-$HOME/.cache/zig}/tmp"
 
+      # Fetch once, with retries, so a transient DNS or mirror failure
+      # cannot abort the cross-compile loop halfway through.
+      - name: Fetch package dependencies
+        working-directory: zaxonlite
+        run: |
+          for attempt in 1 2 3 4 5; do
+            zig build --fetch && exit 0
+            echo "fetch attempt ${attempt} failed; retrying"
+            sleep 15
+          done
+          exit 1
+
       - name: Cache cross-compiled OpenSSL
         id: openssl-cache
         uses: actions/cache@v4
