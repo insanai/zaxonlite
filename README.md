@@ -1,151 +1,111 @@
 # zaxonlite
 
-An embeddable SQLite service replicated by the [paxos-zig](..) Multi-Paxos
-library. Link one Zig library (or the C ABI), open one data directory, and
-get a durable SQL store as one node or a transport-owning cluster. The
-`zaxon serve` reference host, Zig `Embedded` facade, and C cluster facade all
-run the same Paxos/SQLite node and on-disk layout. The companion CLI is `zaxon`.
+SQLite that several machines keep identical.
 
-Product plan and safety argument:
-[`../docs/zds/records/0002-zaxonlite-product-plan.typ`](../docs/zds/records/0002-zaxonlite-product-plan.typ).
-The full book (architecture, formats, operations, verification):
-`zig build book-zaxonlite` at the repository root →
-`docs/zaxonlite/zaxonlite.pdf`.
+**Read the book:**
+[The Zaxonlite book (PDF)](https://insanai.github.io/zxdocs/zaxonlite.pdf)
+-- architecture, formats, operations, verification, and conformance,
+rebuilt on every change by the
+[zxdocs](https://github.com/insanai/zxdocs) workflow.
 
-## What is implemented
+## The problem
 
-- **WAL frame replication, not SQL replay.** The leader executes each
-  transaction once; `sqlite3_wal_hook` plus direct `-wal` reads capture
-  exactly the committed frames, and consensus decides the page images.
-  Nondeterministic SQL is safe by construction; replicas converge to
-  byte-identical files (verified by digest across cluster members).
-- **Journal is authoritative.** Every protocol write is framed,
-  checksummed, appended, and fsynced before `confirmWritesDurable()`; a
-  write is acknowledged only after its slot commits *and* carries the
-  client's own batch. The SQLite image is materialized state: delete
-  `current.db` and the node rebuilds it from snapshot plus suffix.
-  Rebuild always discards the working image and validates the snapshot digest;
-  interrupted epoch rollover and snapshot installation are resumable.
-- **Voters and learners over TCP.** One to nine configured voters run Paxos;
-  an allocator-backed registry can also contain standbys and read replicas,
-  which learn chosen entries without changing quorum size. `zaxon serve` runs
-  peer handshake with mutual TLS 1.3 for production, canonical per-node identities,
-  optional in-TLS PSK/HMAC, identity/epoch checks, ordered durable payload
-  prestaging with a bounded missing-value gate (including Phase-1 recovery),
-  follower offline apply, leadership-change image resync, in-epoch
-  catch-up, and cross-epoch snapshot transfer with digest-verified
-  install.
-- **Exactly-once sessions.** Session state rides inside the captured
-  transaction; retries replay recorded results across restarts and
-  leader failover. Idle sessions expire over a replicated activity
-  window.
-- **Read levels.** `any` (local, possibly stale, labeled), `leader`, and
-  `linearizable` via a quorum read fence — ballot-equality probes with no
-  log append and no disk sync per read.
-- **Snapshots and epoch rollover.** Online checkpoints seal 2,048-slot
-  epochs via decided stop signs; every member builds a byte-identical
-  generation; rollover is crash-resumable; GC keeps bounded state.
-- **Crash matrix automation.** Failpoints (`_exit` at chosen write-path
-  points, armed by environment or RPC in test mode) cover five real one-node
-  process crashes; the cluster scenario kills the leader after quorum choice.
-- **Prepared/explicit transactions.** Zig and C APIs bind null, integer, real,
-  text, and BLOB values. A copied, bounded multi-call builder commits as one
-  replicated SQLite transaction.
-- **Operations.** Authenticated remote backup streams ordered chunks with an
-  end-to-end digest. JSON configuration follows CLI > environment > file
-  precedence; membership inspection and journal-authoritative recovery are CLI
-  commands. Human failures use Elm-style boundary, explanation, and `Hint:`
-  diagnostics; machine RPC failures retain stable JSON codes.
-- **C ABI.** `libzaxonlite.a` + `include/zaxonlite.h` with a compiled smoke test.
-- **Explicit node types.** `data-voter` proposes/votes/serves SQL; `witness`
-  votes but cannot campaign or serve SQL; `standby` keeps a promotion-eligible
-  SQLite copy; `read-replica` keeps a read copy; `gateway` is a stateless,
-  end-to-end TCP router with no Paxos or SQLite state.
-- **Bounded local reads.** A learner receives leader progress heartbeats;
-  `--level any --freshness-ms N` refuses a local snapshot when leader contact
-  is older than `N` or the reported decided slot is not yet applied.
-- **Adverse schedules.** A real TCP test combines frame loss, semantic
-  duplication, pair reordering, seven-byte fragmentation, and delayed journal
-  sync. A separate role test drives voters, witness, and both learner types.
-- **Fair comparison harnesses.** `benchmarks/compare-rqlite-3node.sh` uses the
-  system-installed rqlite v10 tools and `compare-dqlite-3node.sh` retains the
-  pinned Linux fixture. Both compare three durable voters per system with equal
-  payloads, excluded warmup, verified results, persistent client connections,
-  percentile latency, and JSON output.
-- **Failure/recovery product simulation.** The deterministic order-processing
-  harness runs four clients with linearizable reads and idempotent writes,
-  crashes a follower and leader under traffic, catches each up, restarts the
-  full three-node cluster, and proves inventory, revenue, ledger, uniqueness,
-  per-node convergence, and integrity for Zaxonlite and installed rqlite.
+SQLite is a wonderful thing. It is one file, one library, no server. You
+link it, you open a path, and you have a real SQL database. Then the disk
+that holds the file dies, and you have nothing.
 
-Security boundary: protocol v6 requires mutual TLS 1.3 for every production TCP
-listener. Peer certificate common names bind configured node IDs and TLS
-encrypts SQL, results, payloads, and snapshots. The optional provider-file PSK
-adds sequenced HMAC protection inside TLS. For a one-machine quickstart,
-`--dev-psk` explicitly permits PSK-only TCP only when the listener and every
-peer are numeric loopback; it has no confidentiality or unique node identity.
-Plaintext TCP remains failpoint-gated. Local single-node service uses an
-owner-only Unix-domain socket. An authenticated operator can
-ask a deliberately configured issuer for a short-lived, single-use bundle;
-`zaxon enroll` generates the node's P-256 key and CSR locally and atomically
-installs the returned certificate. Static membership remains the transport
-authorization boundary. Database, WAL, journal, snapshot, and backup files are
-plaintext; deployments that need protection from offline media access use OS
-full-disk or filesystem encryption.
+So you want copies. Three machines, one database, and every copy exactly
+the same, even while machines crash and restart and the network misbehaves.
+The moment you say "exactly the same", you have a consensus problem. This
+project solves it with [paxos-zig](https://github.com/insanai/paxos-zig),
+a Multi-Paxos library, and it stays embeddable: link one Zig library (or
+the C ABI), open one data directory, and you get a durable SQL store as a
+single node or as a transport-owning cluster. The companion CLI is `zaxon`.
 
-Current limits: one logical writer, one to nine statically configured voters,
-runtime-sized non-voting nodes, no automatic voter replacement, and a maximum
-transaction payload of 64 MiB minus authenticated framing. The current
-durability path is POSIX-only because it requires parent-directory `fsync`;
-Windows returns an unsupported-durability error rather than weakening the
-guarantee. The exhaustive
-10,000-crash/100-run stress gates and 1 GiB recovery target are explicitly
-deferred; the checked recovery fixture is 1 MiB.
+## Two ideas worth understanding
 
-## Build and test
+Everything else in this repository follows from two decisions.
 
-Requires Zig 0.16, system OpenSSL 3, and (for the book) Typst. SQLite 3.50.4
-is a pinned `build.zig.zon` dependency; the parent Paxos library is a path
-dependency. Cross-builds pass `-Dopenssl-prefix` for the target OpenSSL SDK.
+**Replicate the bytes, not the SQL.** Most replicated SQL systems send the
+SQL text to every node and execute it everywhere. That is a trap. Run
+`insert ... values (random())` on three machines and you get three different
+databases, each one convinced it is right. Zaxonlite executes each
+transaction once, on the leader. SQLite's own write-ahead log tells us
+exactly which pages that transaction committed, and those page images are
+what Paxos replicates. Nondeterministic SQL is safe by construction, because
+nothing is ever executed twice. Replicas converge to byte-identical files,
+and the tests verify that with digests across cluster members.
+
+**The journal is the truth; the database file is a cache.** Every protocol
+write is framed, checksummed, appended, and fsynced before the consensus
+layer is allowed to proceed. A write is acknowledged only after its slot
+commits and carries the client's own batch. The SQLite file is just
+materialized state: delete `current.db` and the node rebuilds it from the
+last snapshot plus the journal suffix. If you remember one thing about
+operating zaxonlite, remember this one.
+
+## What you get
+
+- One writer, one to nine voters, and any number of non-voting nodes:
+  `standby` (promotion-eligible copy), `read-replica` (read copy),
+  `witness` (votes, holds no SQL), and `gateway` (a stateless router).
+- Exactly-once sessions. Session state rides inside the replicated
+  transaction, so retries replay recorded results across restarts and
+  leader failover.
+- Three read levels: `any` (local, possibly stale, labeled, with a
+  freshness bound), `leader`, and `linearizable` (a quorum read fence with
+  no log append and no disk sync per read).
+- Snapshots and epoch rollover: online checkpoints seal 2,048-slot epochs,
+  every member builds a byte-identical generation, and rollover is
+  crash-resumable.
+- Mutual TLS 1.3 on every production TCP listener, with short-lived
+  single-use certificate enrollment (`zaxon enroll`).
+- A C ABI: `libzaxonlite.a` plus `include/zaxonlite.h`.
+- A crash matrix that kills real processes at chosen write-path points and
+  proves recovery, plus fuzzing, soak, and network-fault suites.
+
+## Quick start
+
+One durable local node, authorized by owner-only socket permissions:
 
 ```sh
-cd zaxonlite
-zig build test            # unit + single-process integration suites
-zig build test-single     # durability integration tests only
-zig build test-crash      # spawned-process crash matrix
-zig build test-cluster    # 3-process scenario (-Dcluster-runs=N)
-zig build test-roles      # voters, witness, standby, read replica
-zig build test-gateway    # stateless end-to-end gateway
-zig build test-fault-network # loss/duplicate/reorder/partial/slow sync
-zig build test-cli        # CLI contract
-zig build test-cabi       # C ABI smoke test
-zig build fuzz            # seeded property fuzzing (-Dfuzz-iterations, -Dfuzz-seed)
-zig build soak            # sustained mixed load (-Dsoak-seconds)
-zig build benchmark       # ReleaseFast write/read/recovery benchmarks
-zig build                 # produces zig-out/bin/zaxon and libzaxonlite.a
+zaxon serve --data ./d1 --node 1 --listen unix:./zaxon.sock
+zaxon sql   --data ./d1        # interactive shell, embedded mode
 ```
 
-From the repository root: `zig build test-zaxonlite`, `zig build zaxon`,
-`zig build book-zaxonlite`.
-
-API documentation: `zig build docs` (in this directory) writes the generated
-reference to `zig-out/docs/api`; because the output is a WASM application that
-browsers refuse to load from `file://`, use `zig build docs-serve` and open
-<http://localhost:8000>.
-
-The rqlite comparisons run with installed `rqlited` and `rqlite` binaries. The
-dqlite execution is deferred and remains Linux-only. See
-[`benchmarks/README.md`](benchmarks/README.md) for exact commands and limits.
-
-Remote role-aware local read:
+A three-voter cluster (repeat symmetrically on nodes 2 and 3):
 
 ```sh
-zaxon query --connect 127.0.0.1:9904 --sql 'select * from items' \
-  --level any --freshness-ms 2000 --tls-cert client.crt \
-  --tls-key client.key --tls-ca ca.crt
+zaxon serve --data ./n1 --node 1 --listen 127.0.0.1:9901 \
+    --peer 2@127.0.0.1:9902/data-voter \
+    --peer 3@127.0.0.1:9903/data-voter \
+    --tls-cert n1.crt --tls-key n1.key --tls-ca ca.crt
 ```
 
-## Library
+Then talk to it. The client follows leader redirects:
+
+```sh
+zaxon wait   --connect 127.0.0.1:9901 --leader
+zaxon exec   --connect 127.0.0.1:9901,127.0.0.1:9902 --sql "insert ..."
+zaxon query  --connect ... --sql "select count(*) from t" --level linearizable
+zaxon status --connect 127.0.0.1:9902 --json
+zaxon backup --data ./d1 --to ./backup.db
+```
+
+Every client TCP command supplies its identity with `--tls-cert`,
+`--tls-key`, and `--tls-ca`. For a one-machine experiment, `--dev-psk`
+permits PSK-only TCP on loopback addresses only.
+
+`zaxon sql` on a terminal is a rich REPL: readline-style editing, arrow-key
+history with `ctrl+r` search, SQL highlighting, aligned tables, and a pager.
+It is built on the shared
+[zaxon-cli-ui](https://github.com/insanai/zaxon-cli-ui) module. Piped or
+scripted invocations keep plain, byte-for-byte stable output.
+
+Exit codes: `0` ok, `1` SQL/session error, `2` usage, `3` integrity
+failure, `4` unavailable.
+
+## The library
 
 ```zig
 const zaxonlite = @import("zaxonlite");
@@ -160,14 +120,9 @@ _ = try node.execIdempotent(session, 1, "insert into items(v) values ('tea')");
 
 var rows = try node.query(gpa, "select id, v from items order by id");
 defer rows.deinit();
-
-var transaction = zaxonlite.Transaction.init(gpa);
-defer transaction.deinit();
-try transaction.exec("insert into items(v) values (?1)", &.{.{ .text = "tea" }});
-_ = try node.execTransaction(&transaction);
 ```
 
-C:
+And from C:
 
 ```c
 #include <zaxonlite.h>
@@ -178,67 +133,108 @@ zaxonlite_exec(db, "insert into items(v) values ('tea')", &changes);
 zaxonlite_close(db);
 ```
 
-## CLI
+## Benchmarks
 
-Embedded mode (`--data`) or client mode (`--connect`, follows leader
-redirects):
+The comparison harnesses live in [`benchmarks/`](benchmarks/), and every
+recorded run, with environment metadata, is in
+[`benchmarks/results/`](benchmarks/results/). The systems compared are
+[rqlite](https://github.com/rqlite/rqlite) (v10.2.7, installed binaries)
+and [dqlite](https://github.com/canonical/dqlite) (harness present,
+execution deferred, Linux-only). Both harnesses run three durable voters
+per system with equal payloads, excluded warmup, verified results, and
+percentile latency.
+
+First, the boring benchmark: one client, sequential single-row writes, each
+waiting for full durability. macOS arm64, three local voters, 256-byte rows.
+
+| System            | Writes/s | p50 latency | p99 latency |
+| ----------------- | -------: | ----------: | ----------: |
+| zaxonlite         |     28.0 |     35.1 ms |     45.9 ms |
+| rqlite v10.2.7    |     44.5 |     22.0 ms |     33.7 ms |
+
+rqlite wins this one, and honesty requires printing it. Both systems are
+paying for fsync on every write; the difference is bookkeeping around the
+disk, not the disk itself. If a benchmark table only shows the rows its
+author likes, you should not trust the other rows either.
+
+Second, the benchmark that looks like a product: a deterministic
+order-processing simulation. Four clients, idempotent writes, linearizable
+reads, and a fixed crash schedule: kill a follower under traffic, kill the
+leader under traffic, catch each up, then restart the whole three-node
+cluster. Both systems must pass correctness checks at the end: inventory,
+revenue, ledger, uniqueness, and per-node convergence.
+
+| Measure                        | zaxonlite | rqlite v10.2.7 |
+| ------------------------------ | --------: | -------------: |
+| Healthy throughput             |  1,783/s  |        177/s   |
+| Throughput, follower down      |  1,073/s  |        222/s   |
+| Throughput, leader down        |    387/s  |         94/s   |
+| Leader crash to first success  |    591 ms |       2,190 ms |
+| Follower catch-up              |    112 ms |        949 ms  |
+| Full cluster restart           |    446 ms |      1,626 ms  |
+
+Why does the same system lose the first table and win the second? Because
+the first table measures one client waiting on one disk, and the second
+measures a cluster doing concurrent work and recovering from failures.
+The workload shape decides the winner. Run the harnesses yourself before
+believing anyone's table, including this one:
 
 ```sh
-# one durable local node, authorized by owner-only socket permissions
-zaxon serve --data ./d1 --node 1 --listen unix:./zaxon.sock
-
-# quickstart-only three-voter transport (repeat symmetrically for n2/n3)
-openssl rand -hex 32 > demo.psk && chmod 600 demo.psk
-zaxon serve --data ./n1 --node 1 --listen 127.0.0.1:9901 \
-    --peer 2@127.0.0.1:9902 --peer 3@127.0.0.1:9903 \
-    --auth-file ./demo.psk --dev-psk
-
-# three voters (repeat with n2/n3 identities on the other members)
-zaxon serve --data ./n1 --node 1 --listen 127.0.0.1:9901 \
-    --peer 2@127.0.0.1:9902/data-voter \
-    --peer 3@127.0.0.1:9903/data-voter \
-    --tls-cert n1.crt --tls-key n1.key --tls-ca ca.crt
-# ... and symmetrically for nodes 2 and 3
-
-# add a non-voting read replica to every node's bootstrap registry
-zaxon serve --data ./r4 --node 4 --role read-replica \
-    --listen 127.0.0.1:9904 \
-    --peer 1@127.0.0.1:9901/data-voter \
-    --peer 2@127.0.0.1:9902/data-voter \
-    --peer 3@127.0.0.1:9903/data-voter \
-    --tls-cert n4.crt --tls-key n4.key --tls-ca ca.crt
-
-# Every client TCP command likewise supplies its client identity:
-#   --tls-cert client.crt --tls-key client.key --tls-ca ca.crt
-
-zaxon wait   --connect 127.0.0.1:9901 --leader
-zaxon exec   --connect 127.0.0.1:9901,127.0.0.1:9902 --sql "insert ..."
-zaxon exec   --connect ... --session 1 --sequence 7 --sql "insert ..."
-zaxon query  --connect ... --sql "select count(*) from t" --level linearizable
-zaxon status --connect 127.0.0.1:9902 --json
-zaxon snapshot --connect ...
-zaxon integrity-check --data ./d1
-zaxon backup --data ./d1 --to ./backup.db
-zaxon backup --connect ... --tls-cert client.crt --tls-key client.key \
-    --tls-ca ca.crt --to ./backup.db
-zaxon members --connect ...
-zaxon recover --data ./d1
+zig build benchmark                       # write/read/recovery microbenchmarks
+zig build bench-cluster -- tls 2000 2000  # three-node transport benchmark
+sh benchmarks/compare-rqlite-3node.sh     # needs installed rqlited/rqlite
 ```
 
-See [`../docs/zds/records/0004-zaxonlite-format.typ`](../docs/zds/records/0004-zaxonlite-format.typ) for the
-wire/disk compatibility policy and upgrade procedure.
+## The security boundary, plainly
 
-`zaxon sql` opens the interactive shell (embedded or client mode). On a
-terminal it is a rich REPL — readline-style editing, arrow-key history with
-`ctrl+r` search, SQL keyword highlighting, aligned tables with an expanded
-mode and a pager, `.help` for the command list — built on the
-[libvaxis](https://github.com/rockorager/libvaxis) terminal layer per
-[ZDS 0005](../docs/zds/records/0005-zaxon-interactive-shell.typ). Piped or
-scripted invocations keep the historical plain line-reader output
-byte-for-byte.
+Production TCP requires mutual TLS 1.3. Peer certificate common names are
+bound to configured node IDs, and TLS covers SQL, results, payloads, and
+snapshots. An optional provider-file PSK adds sequenced HMAC protection
+inside TLS. `--dev-psk` is for loopback experiments only; plaintext TCP is
+gated behind test failpoints; local single-node service uses an owner-only
+Unix socket. Static membership is the authorization boundary.
 
-Exit codes: `0` ok, `1` SQL/session error, `2` usage, `3` integrity
-failure, `4` unavailable (locked, corrupt, or no reachable leader).
+Files on disk (database, WAL, journal, snapshots, backups) are plaintext.
+If you need protection from someone holding the disk, use full-disk or
+filesystem encryption. We would rather tell you that than have you assume
+otherwise.
+
+## Current limits
+
+One logical writer. One to nine statically configured voters, and no
+automatic voter replacement yet. Transactions are capped at 64 MiB minus
+framing. The durability path is POSIX-only, because it requires
+parent-directory fsync; on Windows the server returns an
+unsupported-durability error instead of quietly weakening the guarantee.
+The 10,000-crash stress gates and the 1 GiB recovery target are deferred;
+the checked recovery fixture is 1 MiB.
+
+## Build and test
+
+Requires Zig 0.16 and system OpenSSL 3. SQLite 3.50.4 is a pinned
+`build.zig.zon` dependency. The [paxos-zig](https://github.com/insanai/paxos-zig)
+library is a path dependency in the monorepo; released builds pin it by
+content hash with `zig fetch`. Cross-builds pass `-Dopenssl-prefix` for the
+target OpenSSL SDK.
+
+```sh
+zig build                    # zig-out/bin/zaxon and libzaxonlite.a
+zig build check              # compile every binary without running
+zig build test               # unit + shell + single-process integration
+zig build test-crash         # spawned-process crash matrix
+zig build test-cluster       # three-process scenario (-Dcluster-runs=N)
+zig build test-roles         # voters, witness, standby, read replica
+zig build test-gateway       # stateless end-to-end gateway
+zig build test-fault-network # loss/duplication/reorder/fragmentation
+zig build test-cli           # CLI contract
+zig build test-cabi          # C ABI smoke test
+zig build fuzz               # seeded property fuzzing
+zig build soak               # sustained mixed load
+```
+
+API documentation: `zig build docs`, then `zig build docs-serve` and open
+http://localhost:8000 (the autodoc output is a WASM application that
+browsers refuse to load from `file://`).
 
 ## Data directory layout
 
@@ -253,6 +249,27 @@ data/
   current.db               # materialized SQLite image (rebuildable)
 ```
 
+## Where the deep answers live
+
+The full book (architecture, on-disk and wire formats, operations,
+verification, conformance) and the design records are in the separate
+[insanai/zxdocs](https://github.com/insanai/zxdocs) repository; the
+compiled PDF is always at
+[insanai.github.io/zxdocs/zaxonlite.pdf](https://insanai.github.io/zxdocs/zaxonlite.pdf).
+Start with
+the product plan and safety argument (ZDS 0002), the wire/disk
+compatibility policy (ZDS 0004), and the interactive shell design
+(ZDS 0005).
+
+## Related projects
+
+- [paxos-zig](https://github.com/insanai/paxos-zig): the consensus library
+  underneath.
+- [zaxon-cli-ui](https://github.com/insanai/zaxon-cli-ui): the shared
+  terminal UI behind the `zaxon sql` shell.
+- [zxdocs](https://github.com/insanai/zxdocs): books and design records.
+
 ## License
 
-MIT © 2026 Vikrant Rathore and Ronak Rathore. See [LICENSE](LICENSE).
+MIT. Copyright 2026 Vikrant Rathore and Ronak Rathore. See
+[LICENSE](LICENSE).
