@@ -252,8 +252,13 @@ pub const Node = struct {
         if (found_self != capabilities.votes) return error.RoleMembershipMismatch;
         const single = capabilities.votes and members.len == 1;
 
+        // Iterating opens carry a real descriptor on every platform; a
+        // non-iterating open is `O_PATH` on Linux, which `fchmod` and
+        // `fsync` reject. This handle is chmodded here and synced on
+        // every storage barrier.
         var dir = try Io.Dir.cwd().createDirPathOpen(io, options.directory, .{
             .permissions = @enumFromInt(0o700),
+            .open_options = .{ .iterate = true },
         });
         errdefer dir.close(io);
         try dir.setPermissions(io, @enumFromInt(0o700));

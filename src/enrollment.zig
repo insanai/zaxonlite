@@ -216,7 +216,9 @@ pub fn issueTokenAt(
         store_directory,
         @enumFromInt(0o700),
     );
-    var directory = try root.openDir(io, store_directory, .{});
+    // Iterate so the handle is a real descriptor: `fchmod` and `fsync`
+    // reject the `O_PATH` handles Linux gets from non-iterating opens.
+    var directory = try root.openDir(io, store_directory, .{ .iterate = true });
     defer directory.close(io);
     try directory.setPermissions(io, @enumFromInt(0o700));
 

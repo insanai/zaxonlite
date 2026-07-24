@@ -33,7 +33,12 @@ pub const PayloadStore = struct {
     dir: Io.Dir,
 
     pub fn init(io: Io, parent: Io.Dir) !PayloadStore {
-        const dir = try parent.createDirPathOpen(io, "payloads", .{});
+        // Iterate so the long-lived handle is a real descriptor: it is
+        // fsynced on the write path, and Linux non-iterating opens are
+        // `O_PATH`, which `fsync` rejects.
+        const dir = try parent.createDirPathOpen(io, "payloads", .{
+            .open_options = .{ .iterate = true },
+        });
         errdefer dir.close(io);
         try durability.syncDirectory(parent);
         try durability.syncDirectory(dir);
