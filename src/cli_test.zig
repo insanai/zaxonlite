@@ -213,7 +213,7 @@ pub fn main(init: std.process.Init) !u8 {
         null,
         2,
         null,
-        "-- UNKNOWN OPTION --",
+        "-- INVALID OPTIONS --",
     );
     try expect(
         gpa,
@@ -931,7 +931,7 @@ pub fn main(init: std.process.Init) !u8 {
             },
             null,
             0,
-            "enrollment token for node 2 written",
+            "enrollment token bundle written to",
             null,
         );
         const token_copy = try Io.Dir.cwd().readFileAlloc(
@@ -1053,17 +1053,28 @@ pub fn main(init: std.process.Init) !u8 {
             .sub_path = revocation_path,
             .data = "2\n",
         });
-        io.sleep(.fromMilliseconds(1500), .awake) catch {};
+        // The server reloads the revocation file every 40 ticks; under CI
+        // load that cadence can exceed any fixed sleep. Poll until the
+        // denylist takes effect, then assert the exact contract once.
+        const revoked_argv = [_][]const u8{
+            "status",     "--connect", listen,
+            "--tls-cert", node2_cert,  "--tls-key",
+            node2_key,    "--tls-ca",  node2_ca,
+            "--json",
+        };
+        var revocation_attempts: usize = 0;
+        while (revocation_attempts < 40) : (revocation_attempts += 1) {
+            var probe = try runCli(gpa, io, &revoked_argv, null);
+            const refused = probe.code == 4;
+            probe.deinit(gpa);
+            if (refused) break;
+            io.sleep(.fromMilliseconds(250), .awake) catch {};
+        }
         try expect(
             gpa,
             io,
             "revoked node credential is refused as a client",
-            &.{
-                "status",     "--connect", listen,
-                "--tls-cert", node2_cert,  "--tls-key",
-                node2_key,    "--tls-ca",  node2_ca,
-                "--json",
-            },
+            &revoked_argv,
             null,
             4,
             null,
