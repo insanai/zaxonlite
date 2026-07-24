@@ -124,7 +124,7 @@ fn directoryFsync(dir: Io.Dir) error{DirectorySyncFailed}!void {
         .DIRECTORY = true,
         .CLOEXEC = true,
     }, 0) catch return error.DirectorySyncFailed;
-    defer std.posix.close(fd);
+    defer _ = std.c.close(fd);
     if (fsyncErrno(fd) != .SUCCESS) return error.DirectorySyncFailed;
 }
 
