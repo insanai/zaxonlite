@@ -481,8 +481,9 @@ pub fn serve(
     }
     const ticker = try std.Thread.spawn(.{}, Server.tickLoop, .{&server});
 
-    // Accept loop. The local copy shares the socket handle; the `stop`
-    // RPC closes it, which unblocks `accept`.
+    // Accept loop. The `stop` RPC sets the shutdown flag and then dials
+    // the listener once (`wakeAcceptLoop`) so a blocked `accept` returns
+    // on every platform; the admission gate refuses that connection.
     var listener = server.listener.?;
     while (!server.isShutdown()) {
         const stream = listener.accept(io) catch |err| switch (err) {
@@ -850,6 +851,28 @@ pub const Server = struct {
         if (self.write_waiter) |waiter| waiter.cond.signal(self.io);
         for (self.fences.items) |fence| fence.cond.signal(self.io);
         for (self.waiters.items) |waiter| waiter.cond.signal(self.io);
+    }
+
+    /// Wakes the serve thread out of a blocked `accept`. Closing the
+    /// listening socket interrupts `accept` only on BSD kernels; Linux
+    /// leaves the thread blocked forever. Connecting to our own listener
+    /// and hanging up wakes it everywhere: the admission gate refuses the
+    /// connection during shutdown and the serve loop re-checks the flag
+    /// before the next accept. The listener itself is closed by `deinit`
+    /// after the serve loop exits, so no thread races the descriptor.
+    fn wakeAcceptLoop(self: *Server) void {
+        if (self.options.listen_unix) |path| {
+            const address = std.Io.net.UnixAddress.init(path) catch return;
+            var stream = address.connect(self.io) catch return;
+            stream.close(self.io);
+            return;
+        }
+        const address = std.Io.net.IpAddress.parse(
+            self.options.listen_host,
+            self.options.listen_port,
+        ) catch return;
+        var stream = address.connect(self.io, .{ .mode = .stream }) catch return;
+        stream.close(self.io);
     }
 
     fn shutdown(self: *Server) void {
@@ -2377,10 +2400,7 @@ pub const Server = struct {
             return self.opFailpoint(request, out);
         } else if (std.mem.eql(u8, request.op, "stop")) {
             self.shutdown_flag.store(true, .release);
-            if (self.listener) |*listener| {
-                listener.socket.close(self.io);
-                self.listener = null;
-            }
+            self.wakeAcceptLoop();
             return out.writeAll("{\"ok\":true}");
         }
         return writeErrorResponse(out, "bad_request", "unknown op");
