@@ -63,8 +63,12 @@ jobs:
 
       # Zig's zip fetch (the SQLite amalgamation) writes its temporary file
       # under the global cache's tmp/ directory but does not create it.
+      # Smoke-test data directories must never survive in the shared cache:
+      # the journal is authoritative and replays old state into new runs.
       - name: Prepare Zig package cache
-        run: mkdir -p "${ZIG_GLOBAL_CACHE_DIR:-$HOME/.cache/zig}/tmp"
+        run: |
+          mkdir -p "${ZIG_GLOBAL_CACHE_DIR:-$HOME/.cache/zig}/tmp"
+          rm -rf "${ZIG_LOCAL_CACHE_DIR:-.zig-cache}/zx-capi-smoke"
 
       - name: Compile every binary
         run: zig build check

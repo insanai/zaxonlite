@@ -5,6 +5,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 static int failures = 0;
@@ -24,8 +25,12 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: capi_smoke <data-dir>\n");
         return 2;
     }
+    /* The pid alone is not unique across CI runs: fresh runners assign
+     * near-identical pids and the cache preserves old data directories,
+     * which the journal then faithfully replays. */
     char dir[1024];
-    snprintf(dir, sizeof dir, "%s-%d", argv[1], (int)getpid());
+    snprintf(dir, sizeof dir, "%s-%d-%ld", argv[1], (int)getpid(),
+             (long)time(NULL));
 
     CHECK("version string", strlen(zaxonlite_version()) >= 5);
 
