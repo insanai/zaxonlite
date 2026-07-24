@@ -47,9 +47,11 @@ jobs:
       - name: Run test-cabi under strace with a timeout
         run: |
           set -x
-          timeout -k 10 240 strace -f -tt -s 120 -o /tmp/cabi-trace.log \
+          timeout -k 10 180 strace -f -tt -s 160 -o /tmp/cabi-trace.log \
             zig build test-cabi || echo "exit=$?"
-          echo "=== smoke progress: writes to stdout ==="
-          grep 'write(1' /tmp/cabi-trace.log | tail -n 40 || true
-          echo "=== final 120 trace lines (blocked syscalls) ==="
-          tail -n 120 /tmp/cabi-trace.log
+          echo "=== process map (execve) ==="
+          grep 'execve(' /tmp/cabi-trace.log | grep -v ENOENT | tail -n 10 || true
+          echo "=== network syscalls ==="
+          grep -E 'bind\(|listen\(|accept|connect\(' /tmp/cabi-trace.log | tail -n 60 || true
+          echo "=== last syscall per thread (blocked state at timeout) ==="
+          awk '{last[$1]=$0} END{for (p in last) print last[p]}' /tmp/cabi-trace.log | sort -k2 | tail -n 40
