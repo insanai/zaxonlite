@@ -35,10 +35,14 @@ jobs:
     steps:
       # Recreate the monorepo shape so the `.path = ".."` paxos dependency
       # resolves: paxos-zig at the workspace root, this repo in zaxonlite/.
+      # While insanai/paxos-zig is private, add a CROSS_REPO_TOKEN secret
+      # (fine-grained PAT with read access to it); once public, the
+      # default token fallback is enough.
       - name: Checkout paxos-zig (path dependency parent)
         uses: actions/checkout@v4
         with:
           repository: insanai/paxos-zig
+          token: ${{ secrets.CROSS_REPO_TOKEN || github.token }}
           path: .
 
       - name: Checkout zaxonlite
