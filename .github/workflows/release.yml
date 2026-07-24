@@ -12,9 +12,11 @@
 # string so `zaxon version` reports the tag.
 #
 # Linux binaries target musl, so they are fully static and run on any
-# distribution. The Windows build serves client and embedded use; the
-# server durability path is POSIX-only and reports an unsupported-
-# durability error on Windows rather than weakening the guarantee.
+# distribution. Windows is not in the release matrix yet: the source is
+# POSIX-only today (failpoints, fchmodat, args parsing, terminal reader
+# all fail to compile for windows-gnu) and the port deserves its own
+# reviewed change set. The durability path additionally remains
+# POSIX-only by design.
 name: Release
 
 on:
@@ -115,7 +117,6 @@ jobs:
           build_openssl aarch64-linux-musl  linux-aarch64
           build_openssl x86_64-macos        darwin64-x86_64-cc
           build_openssl aarch64-macos       darwin64-arm64-cc
-          build_openssl x86_64-windows-gnu  mingw64
 
       - name: Save cross-compiled OpenSSL
         if: always() && steps.openssl-build.outcome == 'success'
@@ -150,7 +151,6 @@ jobs:
           package aarch64-linux-musl zaxon
           package x86_64-macos       zaxon
           package aarch64-macos      zaxon
-          package x86_64-windows-gnu zaxon.exe
 
       - name: Checksums
         working-directory: release
