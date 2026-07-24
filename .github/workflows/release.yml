@@ -74,14 +74,17 @@ jobs:
           done
           exit 1
 
-      - name: Cache cross-compiled OpenSSL
+      # restore/save are split so a packaging failure later in the job
+      # still preserves the expensive OpenSSL builds for the next attempt.
+      - name: Restore cross-compiled OpenSSL
         id: openssl-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: openssl-dist
           key: openssl-${{ env.OPENSSL_VERSION }}-zig${{ env.ZIG_VERSION }}-v2
 
       - name: Build static OpenSSL for every target
+        id: openssl-build
         if: steps.openssl-cache.outputs.cache-hit != 'true'
         run: |
           set -eux
@@ -113,6 +116,13 @@ jobs:
           build_openssl x86_64-macos        darwin64-x86_64-cc
           build_openssl aarch64-macos       darwin64-arm64-cc
           build_openssl x86_64-windows-gnu  mingw64
+
+      - name: Save cross-compiled OpenSSL
+        if: always() && steps.openssl-build.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: openssl-dist
+          key: openssl-${{ env.OPENSSL_VERSION }}-zig${{ env.ZIG_VERSION }}-v2
 
       - name: Cross-compile zaxon for every target
         working-directory: zaxonlite
