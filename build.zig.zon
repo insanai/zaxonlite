@@ -14,10 +14,15 @@
             .hash = "vaxis-0.6.0-BWNV_DsLCgCcKudOoFkyrSgjxUeLAOSf1LxwezEeVieH",
         },
     },
+    // `include` ships the C ABI header that build.zig installs, and `test`
+    // ships the C smoke test it compiles; both must travel with the package
+    // or dependency builds cannot construct the build graph.
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
+        "include",
+        "test",
         "README.md",
         "LICENSE",
     },
