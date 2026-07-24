@@ -1,0 +1,75 @@
+# CI for the zaxonlite repository (insanai/zaxonlite).
+#
+# This workflow is staged inside zaxonlite/.github/ while the code still
+# lives in the paxos-zig monorepo; GitHub only runs workflows from the
+# repository root, so it activates when zaxonlite becomes its own repo.
+#
+# build.zig.zon declares paxos as `.path = ".."`. The two checkouts below
+# recreate the monorepo shape: paxos-zig at the workspace root, this
+# repository in zaxonlite/. That keeps one manifest working both before
+# and after the split.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: zaxonlite
+    steps:
+      - name: Checkout paxos-zig (path dependency parent)
+        uses: actions/checkout@v4
+        with:
+          repository: insanai/paxos-zig
+          path: .
+
+      - name: Checkout zaxonlite
+        uses: actions/checkout@v4
+        with:
+          path: zaxonlite
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # macOS runners ship Homebrew openssl@3 at the build's default prefix.
+      - name: Install OpenSSL 3 (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+
+      - name: Compile every binary
+        run: zig build check
+
+      - name: Unit and single-process integration tests
+        run: zig build test
+
+      - name: Crash matrix
+        run: zig build test-crash
+
+      - name: C ABI smoke test
+        run: zig build test-cabi
+
+      - name: CLI contract test
+        run: zig build test-cli
+
+      - name: Cluster scenario
+        if: runner.os == 'Linux'
+        run: zig build test-cluster

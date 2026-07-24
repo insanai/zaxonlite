@@ -1,0 +1,126 @@
+# Release workflow for zaxonlite (insanai/zaxonlite).
+#
+# One Ubuntu container cross-compiles the self-contained `zaxon` CLI for
+# Linux, Windows, and macOS with Zig. The binary links OpenSSL 3 for the
+# mTLS transport, so the job first builds a static OpenSSL per target,
+# using `zig cc` as the cross C compiler, and caches the result. No
+# target-native machines are involved.
+#
+# Cut a release by pushing a tag:
+#   git tag v0.1.0 && git push origin v0.1.0
+# Before tagging, bump `.version` in build.zig.zon and the library version
+# string so `zaxon version` reports the tag.
+#
+# Linux binaries target musl, so they are fully static and run on any
+# distribution. The Windows build serves client and embedded use; the
+# server durability path is POSIX-only and reports an unsupported-
+# durability error on Windows rather than weakening the guarantee.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  ZIG_VERSION: 0.16.0
+  OPENSSL_VERSION: 3.5.0
+
+jobs:
+  build:
+    name: Cross-compile and publish
+    runs-on: ubuntu-latest
+    steps:
+      # Recreate the monorepo shape so the `.path = ".."` paxos dependency
+      # resolves: paxos-zig at the workspace root, this repo in zaxonlite/.
+      - name: Checkout paxos-zig (path dependency parent)
+        uses: actions/checkout@v4
+        with:
+          repository: insanai/paxos-zig
+          path: .
+
+      - name: Checkout zaxonlite
+        uses: actions/checkout@v4
+        with:
+          path: zaxonlite
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Cache cross-compiled OpenSSL
+        id: openssl-cache
+        uses: actions/cache@v4
+        with:
+          path: openssl-dist
+          key: openssl-${{ env.OPENSSL_VERSION }}-zig${{ env.ZIG_VERSION }}-v1
+
+      - name: Build static OpenSSL for every target
+        if: steps.openssl-cache.outputs.cache-hit != 'true'
+        run: |
+          set -eux
+          curl -fsSLO "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
+          tar xf "openssl-${OPENSSL_VERSION}.tar.gz"
+          build_openssl() {
+            zig_target="$1"; openssl_target="$2"
+            src="openssl-build-${zig_target}"
+            rm -rf "$src"
+            cp -R "openssl-${OPENSSL_VERSION}" "$src"
+            (
+              cd "$src"
+              ./Configure "$openssl_target" \
+                no-shared no-apps no-tests no-docs no-legacy \
+                --prefix="${GITHUB_WORKSPACE}/openssl-dist/${zig_target}" \
+                CC="zig cc -target ${zig_target}" \
+                AR="zig ar" RANLIB="zig ranlib"
+              make -j"$(nproc)" build_libs
+              make install_dev
+            )
+            rm -rf "$src"
+          }
+          build_openssl x86_64-linux-musl   linux-x86_64
+          build_openssl aarch64-linux-musl  linux-aarch64
+          build_openssl x86_64-macos        darwin64-x86_64-cc
+          build_openssl aarch64-macos       darwin64-arm64-cc
+          build_openssl x86_64-windows-gnu  mingw64
+
+      - name: Cross-compile zaxon for every target
+        working-directory: zaxonlite
+        run: |
+          set -eux
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p ../release
+          package() {
+            zig_target="$1"; exe="$2"
+            zig build -Dtarget="${zig_target}" -Doptimize=ReleaseSafe \
+              -Dopenssl-prefix="${GITHUB_WORKSPACE}/openssl-dist/${zig_target}" \
+              --prefix "zig-out/${zig_target}"
+            staging="zaxon-${version}-${zig_target}"
+            rm -rf "$staging"
+            mkdir "$staging"
+            cp "zig-out/${zig_target}/bin/${exe}" "$staging/"
+            cp README.md LICENSE "$staging/"
+            case "$exe" in
+              *.exe) zip -r "../release/${staging}.zip" "$staging" ;;
+              *)     tar czf "../release/${staging}.tar.gz" "$staging" ;;
+            esac
+            rm -rf "$staging"
+          }
+          package x86_64-linux-musl  zaxon
+          package aarch64-linux-musl zaxon
+          package x86_64-macos       zaxon
+          package aarch64-macos      zaxon
+          package x86_64-windows-gnu zaxon.exe
+
+      - name: Checksums
+        working-directory: release
+        run: sha256sum * > SHA256SUMS
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
