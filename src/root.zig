@@ -9,7 +9,7 @@
 const std = @import("std");
 
 /// Human-readable library version; replaced by the release tag when one exists.
-pub const version = "unreleased";
+pub const version = "0.1.0";
 
 /// Fixed-size replicated command descriptor and its canonical wire codec.
 pub const command = @import("command.zig");
