@@ -55,6 +55,11 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
 
+      # Zig's zip fetch (the SQLite amalgamation) writes its temporary file
+      # under the global cache's tmp/ directory but does not create it.
+      - name: Prepare Zig package cache
+        run: mkdir -p "${ZIG_GLOBAL_CACHE_DIR:-$HOME/.cache/zig}/tmp"
+
       - name: Cache cross-compiled OpenSSL
         id: openssl-cache
         uses: actions/cache@v4
