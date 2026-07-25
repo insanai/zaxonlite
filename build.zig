@@ -51,6 +51,13 @@ fn linkOpenSsl(
     module.linkSystemLibrary(if (msvc) "libcrypto" else "crypto", .{
         .use_pkg_config = .no,
     });
+    if (target.result.os.tag != .windows) return;
+    // A static OpenSSL leaves its platform dependencies to the caller:
+    // sockets and name lookup, the certificate and CSP stores, and the
+    // registry reads behind RAND_poll.
+    for ([_][]const u8{ "ws2_32", "crypt32", "advapi32", "user32" }) |name| {
+        module.linkSystemLibrary(name, .{ .use_pkg_config = .no });
+    }
 }
 
 pub fn build(b: *std.Build) void {
