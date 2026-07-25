@@ -203,11 +203,14 @@ otherwise.
 
 One logical writer. One to nine statically configured voters, and no
 automatic voter replacement yet. Transactions are capped at 64 MiB minus
-framing. The durability path is POSIX-only, because it requires
-parent-directory fsync; on Windows the server returns an
-unsupported-durability error instead of quietly weakening the guarantee.
-The 10,000-crash stress gates and the 1 GiB recovery target are deferred;
-the checked recovery fixture is 1 MiB.
+framing. Windows needs release 1809 or Server 2019 and newer, on NTFS:
+the storage layer relies on POSIX rename semantics and on the NTFS
+metadata log to persist directory entries, and a node refuses to start
+where a probe shows they are missing rather than quietly weakening the
+guarantee. Unix socket listeners are POSIX-only; use loopback TCP on
+Windows. Nothing on Windows is covered by a running test suite yet, only
+by a cross-compile gate. The 10,000-crash stress gates and the 1 GiB
+recovery target are deferred; the checked recovery fixture is 1 MiB.
 
 ## Build and test
 

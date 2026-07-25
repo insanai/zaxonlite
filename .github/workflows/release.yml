@@ -12,11 +12,10 @@
 # string so `zaxon version` reports the tag.
 #
 # Linux binaries target musl, so they are fully static and run on any
-# distribution. Windows is not in the release matrix yet: the source is
-# POSIX-only today (failpoints, fchmodat, args parsing, terminal reader
-# all fail to compile for windows-gnu) and the port deserves its own
-# reviewed change set. The durability path additionally remains
-# POSIX-only by design.
+# distribution. Windows binaries need Windows 10 1809 or Server 2019 and
+# newer, on NTFS: the storage layer relies on POSIX rename semantics and on
+# the NTFS metadata log, and `zaxon` refuses to start where they are
+# missing. Unix socket listeners are POSIX-only.
 name: Release
 
 on:
@@ -83,7 +82,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: openssl-dist
-          key: openssl-${{ env.OPENSSL_VERSION }}-zig${{ env.ZIG_VERSION }}-v2
+          key: openssl-${{ env.OPENSSL_VERSION }}-zig${{ env.ZIG_VERSION }}-v3
 
       - name: Build static OpenSSL for every target
         id: openssl-build
@@ -117,13 +116,14 @@ jobs:
           build_openssl aarch64-linux-musl  linux-aarch64
           build_openssl x86_64-macos        darwin64-x86_64-cc
           build_openssl aarch64-macos       darwin64-arm64-cc
+          build_openssl x86_64-windows-gnu  mingw64
 
       - name: Save cross-compiled OpenSSL
         if: always() && steps.openssl-build.outcome == 'success'
         uses: actions/cache/save@v4
         with:
           path: openssl-dist
-          key: openssl-${{ env.OPENSSL_VERSION }}-zig${{ env.ZIG_VERSION }}-v2
+          key: openssl-${{ env.OPENSSL_VERSION }}-zig${{ env.ZIG_VERSION }}-v3
 
       - name: Cross-compile zaxon for every target
         working-directory: zaxonlite
@@ -151,6 +151,7 @@ jobs:
           package aarch64-linux-musl zaxon
           package x86_64-macos       zaxon
           package aarch64-macos      zaxon
+          package x86_64-windows-gnu zaxon.exe
 
       - name: Checksums
         working-directory: release

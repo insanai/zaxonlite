@@ -88,3 +88,75 @@ jobs:
       - name: Cluster scenario
         if: runner.os == 'Linux'
         run: zig build test-cluster
+
+  # Cross-compiling is not proof that Windows works, but it is proof that
+  # the port still builds. Without this the POSIX-only assumptions creep
+  # back in unnoticed, which is how the target was lost the first time.
+  windows-cross:
+    name: cross-compile (x86_64-windows-gnu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      OPENSSL_VERSION: 3.5.0
+      ZIG_VERSION: 0.16.0
+    steps:
+      - name: Checkout paxos-zig (path dependency parent)
+        uses: actions/checkout@v4
+        with:
+          repository: insanai/paxos-zig
+          token: ${{ secrets.CROSS_REPO_TOKEN || github.token }}
+          path: .
+
+      - name: Checkout zaxonlite
+        uses: actions/checkout@v4
+        with:
+          path: zaxonlite
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Prepare Zig package cache
+        run: mkdir -p "${ZIG_GLOBAL_CACHE_DIR:-$HOME/.cache/zig}/tmp"
+
+      # `zaxon` always links OpenSSL, so a Windows build needs a Windows
+      # OpenSSL. This cache holds only that one target, which is why its key
+      # differs from the release workflow's five-target entry; the first run
+      # pays for the build and later runs restore it.
+      - name: Restore cross-compiled OpenSSL
+        id: openssl-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: openssl-dist
+          key: openssl-win-${{ env.OPENSSL_VERSION }}-zig${{ env.ZIG_VERSION }}-v3
+
+      - name: Build static OpenSSL for Windows
+        id: openssl-build
+        if: steps.openssl-cache.outputs.cache-hit != 'true'
+        run: |
+          set -eux
+          curl -fsSLO "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
+          tar xf "openssl-${OPENSSL_VERSION}.tar.gz"
+          cd "openssl-${OPENSSL_VERSION}"
+          ./Configure mingw64 \
+            no-shared no-apps no-tests no-docs no-legacy \
+            --prefix="${GITHUB_WORKSPACE}/openssl-dist/x86_64-windows-gnu" \
+            --libdir=lib \
+            CC="zig cc -target x86_64-windows-gnu" \
+            AR="zig ar" RANLIB="zig ranlib"
+          make -j"$(nproc)" build_libs
+          make install_dev
+
+      - name: Save cross-compiled OpenSSL
+        if: always() && steps.openssl-build.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: openssl-dist
+          key: openssl-win-${{ env.OPENSSL_VERSION }}-zig${{ env.ZIG_VERSION }}-v3
+
+      - name: Compile every binary for Windows
+        working-directory: zaxonlite
+        run: |
+          zig build check -Dtarget=x86_64-windows-gnu \
+            -Dopenssl-prefix="${GITHUB_WORKSPACE}/openssl-dist/x86_64-windows-gnu"
