@@ -1,0 +1,10 @@
+# Keep the two templates above as the only entry points, so every issue
+# arrives with reproduction steps or a stated scope.
+blank_issues_enabled: false
+contact_links:
+  - name: Books and design records
+    url: https://insanai.github.io/zxdocs/
+    about: How zaxonlite works, and the ZDS records behind its decisions.
+  - name: Paxos core
+    url: https://github.com/insanai/paxos-zig
+    about: Report consensus-layer problems against the paxos-zig repository.
