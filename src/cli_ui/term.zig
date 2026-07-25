@@ -173,7 +173,8 @@ pub const Term = struct {
         // Tty.deinit restores the saved terminal state; a prior suspendRaw
         // makes that restore a no-op rather than an error.
         self.tty.deinit();
-        vaxis.tty.Tty.resetSignalHandler();
+        // Only the POSIX backend installs one.
+        if (comptime !is_windows) vaxis.tty.Tty.resetSignalHandler();
         // Upstream keeps a copy solely for panic recovery. It must not point
         // at our already-deinitialized terminal after a normal shell exit.
         vaxis.tty.global_tty = null;
@@ -294,9 +295,23 @@ pub const Term = struct {
     }
 
     /// Blocks until the next decoded terminal event.
-    pub fn nextEvent(self: *Term) !Event {
+    pub const NextEventError = error{ EndOfStream, ReadFailed };
+
+    /// Reports one event under a fixed error set. The backends disagree on
+    /// what they can return -- only the POSIX one ends the stream, while
+    /// the Windows console API and the test stub report failures instead --
+    /// so the translation happens here rather than leaking a
+    /// platform-shaped error set into every caller. The condition tracks
+    /// the same two branches `readEvent` opens with.
+    pub fn nextEvent(self: *Term) NextEventError!Event {
         if (self.popDeferred()) |event| return event;
-        return self.readEvent();
+        if (comptime is_windows or builtin.is_test) {
+            return self.readEvent() catch error.ReadFailed;
+        }
+        return self.readEvent() catch |err| switch (err) {
+            error.EndOfStream => error.EndOfStream,
+            else => error.ReadFailed,
+        };
     }
 
     /// Waits specifically for Ctrl+C while preserving ordinary type-ahead for
