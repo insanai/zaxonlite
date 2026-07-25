@@ -13,6 +13,7 @@
 //! Checks are free when nothing is armed beyond one atomic load.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 var armed_len = std.atomic.Value(usize).init(0);
 var armed_name: [64]u8 = undefined;
@@ -37,6 +38,12 @@ pub fn hit(name: []const u8) void {
 }
 
 fn crash(name: []const u8) noreturn {
+    // Both paths must skip the C runtime's exit handlers: flushing stdio
+    // or running destructors would defeat the point of modeling SIGKILL.
+    if (comptime builtin.os.tag == .windows) {
+        std.debug.print("zaxon: failpoint '{s}' hit\n", .{name});
+        std.os.windows.ntdll.RtlExitUserProcess(137);
+    }
     var buffer: [96]u8 = undefined;
     const message = std.fmt.bufPrint(
         &buffer,
