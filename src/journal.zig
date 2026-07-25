@@ -52,7 +52,7 @@ pub const Journal = struct {
         const name = fileName(&name_buffer, configuration_id);
         const file = try dir.createFile(io, name, .{ .exclusive = true, .read = true });
         errdefer file.close(io);
-        try durability.syncDirectory(dir);
+        try durability.syncPathnameTransition(io, dir, name);
         return .{ .io = io, .file = file, .next_sequence = 1, .end_offset = 0 };
     }
 

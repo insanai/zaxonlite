@@ -271,6 +271,10 @@ pub const Node = struct {
         errdefer lock_file.close(io);
         if (!try lock_file.tryLock(io, .exclusive)) return error.NodeLocked;
 
+        // Under the lock, so the probe's scratch names cannot race another
+        // process, and before any storage exists to be made durable.
+        try durability.probePathnameSemantics(io, dir);
+
         const identity = try loadOrCreateIdentity(
             gpa,
             io,
@@ -941,6 +945,9 @@ pub const Node = struct {
         defer self.gpa.free(manifest);
         try atomicWriteFile(self.io, tmp_dir, "manifest", manifest);
         try self.dir.rename(tmp_path, self.dir, final_path, self.io);
+        // The snapshot becomes authoritative only when the stop sign
+        // naming it is journaled and synced; that barrier, on this volume,
+        // is what persists this entry where a directory cannot be flushed.
         try durability.syncChildDirectory(self.io, self.dir, "snapshots");
 
         var metadata = SnapshotMetadata{ .buffer = undefined, .len = 0 };
@@ -2331,6 +2338,9 @@ pub const Node = struct {
         ) catch unreachable;
         self.dir.deleteTree(self.io, final_path) catch {};
         try self.dir.rename(install_tmp_dir, self.dir, final_path, self.io);
+        // The `current` pointer written immediately below is the barrier
+        // that persists this entry; nothing reads the snapshot until it
+        // names one.
         try durability.syncChildDirectory(self.io, self.dir, "snapshots");
         try atomicWriteFile(self.io, self.dir, current_file_name, &name);
 
@@ -2758,7 +2768,7 @@ fn atomicWriteFile(io: Io, dir: Io.Dir, name: []const u8, contents: []const u8) 
     try atomic.file.writePositionalAll(io, contents, 0);
     try durability.syncFile(io, atomic.file);
     try atomic.replace(io);
-    try durability.syncDirectory(dir);
+    try durability.syncPathnameTransition(io, dir, name);
 }
 
 fn fileSha256(io: Io, dir: Io.Dir, name: []const u8) ![32]u8 {

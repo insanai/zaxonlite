@@ -265,7 +265,7 @@ pub const Connection = struct {
         file.close(self.io);
         file_open = false;
         try directory.rename(temporary_name, directory, file_name, self.io);
-        try durability.syncDirectory(directory);
+        try durability.syncPathnameTransition(self.io, directory, file_name);
         keep_temporary = false;
     }
 

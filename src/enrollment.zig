@@ -260,7 +260,7 @@ pub fn issueTokenAt(
         else => return err,
     };
     temporary_exists = false;
-    try durability.syncDirectory(directory);
+    try durability.syncPathnameTransition(io, directory, pending_name);
     return .{ .secret = secret, .expires_unix_seconds = now + ttl_seconds };
 }
 
@@ -339,7 +339,9 @@ pub fn consumeTokenAt(
         error.FileNotFound, error.PathAlreadyExists => return error.TokenUsed,
         else => return err,
     };
-    try durability.syncDirectory(directory);
+    // A token that is not durably marked used can be replayed after a
+    // crash, so this transition takes its barrier immediately.
+    try durability.syncPathnameTransition(io, directory, used_name);
 }
 
 pub const EnrolledIdentity = struct {
@@ -488,6 +490,12 @@ pub fn installIdentity(
     try publishIdentityDirectory(parent, temporary_name, final_name, io);
     temporary_exists = false;
     try durability.syncDirectory(parent);
+    // A renamed directory carries no handle of its own. Flushing a file at
+    // its published path is what commits the entry where the volume log,
+    // rather than the parent directory, records it.
+    var published = try parent.openDir(io, final_name, .{ .iterate = true });
+    defer published.close(io);
+    try durability.syncPathnameTransition(io, published, "node.crt");
 }
 
 pub fn writeBundleFile(io: Io, path: []const u8, bytes: []const u8) !void {
@@ -530,7 +538,7 @@ pub fn writeBundleFile(io: Io, path: []const u8, bytes: []const u8) !void {
         else => return err,
     };
     temporary_exists = false;
-    try durability.syncDirectory(parent);
+    try durability.syncPathnameTransition(io, parent, name);
 }
 
 pub fn readBundleFile(
@@ -551,6 +559,8 @@ pub fn removeBundleFile(io: Io, path: []const u8) !void {
         try Io.Dir.cwd().openDir(io, parent_path, .{});
     defer parent.close(io);
     try parent.deleteFile(io, name);
+    // Removals are best-effort: a bundle that reappears after a crash is
+    // cleaned up again, and no protocol decision rests on its absence.
     try durability.syncDirectory(parent);
 }
 
