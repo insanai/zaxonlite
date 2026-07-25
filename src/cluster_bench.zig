@@ -16,6 +16,7 @@
 //! from that file, so recorded runs flow into the compiled documentation.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const zaxonlite = @import("zaxonlite");
 const client = zaxonlite.client;
@@ -552,6 +553,13 @@ fn sampleAll(
 ) ![3]Usage {
     var usages: [3]Usage = undefined;
     for (nodes, 0..) |node, index| {
+        if (comptime builtin.os.tag == .windows) {
+            // `ps` has no counterpart here and `Child.id` is a handle
+            // rather than a pid. The benchmark reports the columns it can
+            // actually measure instead of inventing these two.
+            usages[index] = .{ .rss_kb = 0, .cpu_ms = 0 };
+            continue;
+        }
         const pid = node.child.?.id orelse return error.NoPid;
         usages[index] = try sampleUsage(gpa, io, pid);
     }
