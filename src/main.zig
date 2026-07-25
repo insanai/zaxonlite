@@ -190,7 +190,9 @@ fn run(
     out: *std.Io.Writer,
     err_out: *std.Io.Writer,
 ) !u8 {
-    var iterator = std.process.Args.Iterator.init(args);
+    // Windows hands the process one command-line string that has to be
+    // split and re-encoded, so only the allocating initializer is portable.
+    var iterator = try std.process.Args.Iterator.initAllocator(args, gpa);
     defer iterator.deinit();
     _ = iterator.next();
 
