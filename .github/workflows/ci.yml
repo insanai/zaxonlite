@@ -1,13 +1,8 @@
 # CI for the zaxonlite repository (insanai/zaxonlite).
 #
-# This workflow is staged inside zaxonlite/.github/ while the code still
-# lives in the paxos-zig monorepo; GitHub only runs workflows from the
-# repository root, so it activates when zaxonlite becomes its own repo.
-#
-# build.zig.zon declares paxos as `.path = ".."`. The two checkouts below
-# recreate the monorepo shape: paxos-zig at the workspace root, this
-# repository in zaxonlite/. That keeps one manifest working both before
-# and after the split.
+# build.zig.zon declares paxos as `.path = ".."`, so the two checkouts
+# below place insanai/paxos-zig at the workspace root and this repository
+# in zaxonlite/ beside it. That is the layout the manifest expects.
 name: CI
 
 on:

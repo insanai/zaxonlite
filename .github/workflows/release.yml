@@ -36,8 +36,8 @@ jobs:
     name: Cross-compile and publish
     runs-on: ubuntu-latest
     steps:
-      # Recreate the monorepo shape so the `.path = ".."` paxos dependency
-      # resolves: paxos-zig at the workspace root, this repo in zaxonlite/.
+      # The `.path = ".."` paxos dependency resolves when paxos-zig sits at
+      # the workspace root with this repository in zaxonlite/ beside it.
       # While insanai/paxos-zig is private, add a CROSS_REPO_TOKEN secret
       # (fine-grained PAT with read access to it); once public, the
       # default token fallback is enough.

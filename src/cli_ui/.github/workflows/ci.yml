@@ -1,8 +1,7 @@
 # CI for the zaxon-cli-ui repository (insanai/zaxon-cli-ui).
 #
-# Staged inside the zaxonlite monorepo; GitHub runs it once this directory
-# becomes its own repository. The package is self-contained (libvaxis is
-# its only dependency), so no sibling checkouts are needed.
+# The package is self-contained -- libvaxis is its only dependency -- so
+# one checkout is all this needs.
 name: CI
 
 on:

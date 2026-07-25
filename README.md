@@ -216,8 +216,9 @@ recovery target are deferred; the checked recovery fixture is 1 MiB.
 
 Requires Zig 0.16 and system OpenSSL 3. SQLite 3.50.4 is a pinned
 `build.zig.zon` dependency. The [paxos-zig](https://github.com/insanai/paxos-zig)
-library is a path dependency in the monorepo; released builds pin it by
-content hash with `zig fetch`. Cross-builds pass `-Dopenssl-prefix` for the
+library is declared as a path dependency, so a checkout expects it beside
+this one; released builds pin it by content hash with `zig fetch`.
+Cross-builds pass `-Dopenssl-prefix` for the
 target OpenSSL SDK.
 
 ```sh
