@@ -21,6 +21,7 @@
 //!   decided value at that slot is the client's own batch.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const paxos = @import("paxos");
 
@@ -271,6 +272,14 @@ pub fn serve(
             err_out,
             "a unix socket serves one local node; peers require TCP",
         );
+    }
+    if (comptime builtin.os.tag == .windows) {
+        if (options.listen_unix != null) {
+            return reportConfig(
+                err_out,
+                "unix socket listeners are not available on Windows",
+            );
+        }
     }
     if (options.listen_unix == null) {
         if (options.tls == null and !options.allow_insecure_test_tcp and
@@ -592,6 +601,11 @@ fn listenUnixSocket(
     path: []const u8,
     mode: u16,
 ) !std.Io.net.Server {
+    // Windows has AF_UNIX but no file mode on it: access is governed by a
+    // DACL the narrowing below cannot express, so a socket bound here
+    // would be reachable by every local account. Refusing is the safe
+    // answer until the DACL work is done; loopback TCP still serves.
+    if (comptime builtin.os.tag == .windows) return error.UnixSocketUnsupported;
     const address = try std.Io.net.UnixAddress.init(path);
     var exists = true;
     Io.Dir.cwd().access(io, path, .{}) catch |err| switch (err) {
