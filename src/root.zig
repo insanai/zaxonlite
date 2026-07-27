@@ -53,6 +53,9 @@ pub const TlsConfig = tls.Config;
 pub const enrollment = @import("enrollment.zig");
 /// Configuration loading with CLI > environment > file precedence.
 pub const configuration = @import("configuration.zig");
+/// The canonical decided registry: consensus-decided membership, roles,
+/// endpoints, the node-ID allocation fence, and the operation ring.
+pub const registry = @import("registry.zig");
 /// Elm-style operator diagnostics: boundary header, explanation, and hint.
 pub const diagnostic = @import("diagnostic.zig");
 /// Shared fsync policy and helpers: `full` (F_FULLFSYNC on macOS) or `os`.
@@ -101,6 +104,7 @@ test {
     _ = @import("tls.zig");
     _ = @import("enrollment.zig");
     _ = @import("configuration.zig");
+    _ = @import("registry.zig");
     _ = @import("durability.zig");
     _ = @import("node.zig");
     _ = @import("roles.zig");

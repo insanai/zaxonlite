@@ -1301,6 +1301,53 @@ pub fn main(init: std.process.Init) !u8 {
         "-- NO REACHABLE LEADER --",
     );
 
+    // --- membership and replacement command contract ----------------------
+    try expect(
+        gpa,
+        io,
+        "membership requires the status subcommand",
+        &.{ "membership", "--connect", "127.0.0.1:9" },
+        null,
+        2,
+        null,
+        "membership needs a subcommand",
+    );
+    try expect(
+        gpa,
+        io,
+        "membership status with no server exits 4",
+        &.{ "membership", "status", "--connect", "127.0.0.1:9" },
+        null,
+        4,
+        null,
+        "-- NO REACHABLE LEADER --",
+    );
+    try expect(
+        gpa,
+        io,
+        "replace-voter validates its arguments",
+        &.{ "replace-voter", "--connect", "127.0.0.1:9" },
+        null,
+        2,
+        null,
+        "replace-voter needs --operation",
+    );
+    try expect(
+        gpa,
+        io,
+        "replace-voter validates the new node spec",
+        &.{
+            "replace-voter",     "--connect", "127.0.0.1:9",
+            "--operation",       "1",         "--expected-config",
+            "1",                 "--old-node", "3",
+            "--new-node",        "not-a-spec",
+        },
+        null,
+        2,
+        null,
+        "--new-node must be <id>@<host>:<port>",
+    );
+
     if (failures == 0) {
         std.debug.print("cli contract test: all checks passed\n", .{});
         return 0;

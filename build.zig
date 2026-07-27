@@ -246,6 +246,23 @@ pub fn build(b: *std.Build) void {
     );
     cluster_step.dependOn(&run_cluster_test.step);
 
+    const replacement_cluster_test = b.addExecutable(.{
+        .name = "zaxon-replace-cluster-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/replacement_cluster_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zaxonlite", .module = zaxonlite }},
+        }),
+    });
+    const run_replacement_cluster_test = b.addRunArtifact(replacement_cluster_test);
+    run_replacement_cluster_test.addArtifactArg(zaxon);
+    const replacement_cluster_step = b.step(
+        "test-replace-cluster",
+        "Run the decided voter-replacement cluster scenario under mTLS",
+    );
+    replacement_cluster_step.dependOn(&run_replacement_cluster_test.step);
+
     const role_cluster_test = b.addExecutable(.{
         .name = "zaxon-role-cluster-test",
         .root_module = b.createModule(.{

@@ -782,3 +782,310 @@ test "application SQL cannot break the replication contract" {
     const report = try node.integrityCheck();
     try testing.expect(report.ok());
 }
+
+const registry = zaxonlite.registry;
+
+fn testRegistryRecords() [3]registry.NodeRecord {
+    return .{
+        registry.NodeRecord.init(1, .data_voter, "127.0.0.1:9901") catch unreachable,
+        registry.NodeRecord.init(2, .data_voter, "127.0.0.1:9902") catch unreachable,
+        registry.NodeRecord.init(3, .data_voter, "127.0.0.1:9903") catch unreachable,
+    };
+}
+
+test "network bootstrap persists the decided registry and pins flags" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var test_dir = try TestDir.init(gpa);
+    defer test_dir.deinit(gpa);
+    const dir = try test_dir.nodeDir(gpa);
+    defer gpa.free(dir);
+    const voters = [_]u32{ 1, 2, 3 };
+    const records = testRegistryRecords();
+
+    var digest: [32]u8 = undefined;
+    {
+        const node = try Node.open(gpa, io, .{
+            .directory = dir,
+            .node_id = 1,
+            .members = &voters,
+            .database_id = 77,
+            .registry_nodes = &records,
+        });
+        defer node.close();
+        const decided = node.decidedRegistry().?;
+        try testing.expectEqual(@as(u64, 1), decided.configuration_id);
+        try testing.expectEqual(@as(u128, 77), decided.database_id);
+        try testing.expectEqual(@as(u32, 3), decided.highest_allocated_node_id);
+        digest = decided.digest();
+    }
+    try test_dir.tmp.dir.access(io, "node/REGISTRY", .{});
+    try test_dir.tmp.dir.access(io, "node/registries/0000000000000001", .{});
+
+    // Reopen with matching flags: the same decided registry loads.
+    {
+        const node = try Node.open(gpa, io, .{
+            .directory = dir,
+            .node_id = 1,
+            .members = &voters,
+            .database_id = 77,
+            .registry_nodes = &records,
+        });
+        defer node.close();
+        try testing.expectEqualSlices(
+            u8,
+            &digest,
+            &node.decidedRegistry().?.digest(),
+        );
+    }
+
+    // Once the registry exists, the database identity comes from it: a
+    // conflicting derived flag is ignored, never re-derived.
+    {
+        const node = try Node.open(gpa, io, .{
+            .directory = dir,
+            .node_id = 1,
+            .members = &voters,
+            .database_id = 88,
+            .registry_nodes = &records,
+        });
+        defer node.close();
+        try testing.expectEqual(
+            @as(u128, 77),
+            node.decidedRegistry().?.database_id,
+        );
+    }
+
+    // Conflicting membership flags are a startup error.
+    var moved = records;
+    moved[2] = registry.NodeRecord.init(3, .data_voter, "127.0.0.1:9999") catch
+        unreachable;
+    try testing.expectError(error.RegistryMismatch, Node.open(gpa, io, .{
+        .directory = dir,
+        .node_id = 1,
+        .members = &voters,
+        .database_id = 77,
+        .registry_nodes = &moved,
+    }));
+    try testing.expectError(error.RegistryMismatch, Node.open(gpa, io, .{
+        .directory = dir,
+        .node_id = 1,
+        .members = &voters,
+        .database_id = 77,
+        .registry_nodes = records[0..2],
+    }));
+
+    // Crash window: a missing pointer after the blob write re-runs the
+    // idempotent bootstrap and converges to the same digest.
+    try test_dir.tmp.dir.deleteFile(io, "node/REGISTRY");
+    {
+        const node = try Node.open(gpa, io, .{
+            .directory = dir,
+            .node_id = 1,
+            .members = &voters,
+            .database_id = 77,
+            .registry_nodes = &records,
+        });
+        defer node.close();
+        try testing.expectEqualSlices(
+            u8,
+            &digest,
+            &node.decidedRegistry().?.digest(),
+        );
+    }
+    try test_dir.tmp.dir.access(io, "node/REGISTRY", .{});
+
+    // A present but corrupt pointer fails closed instead of re-deriving.
+    try test_dir.tmp.dir.writeFile(io, .{
+        .sub_path = "node/REGISTRY",
+        .data = "zz",
+    });
+    try testing.expectError(error.CorruptRegistryPointer, Node.open(gpa, io, .{
+        .directory = dir,
+        .node_id = 1,
+        .members = &voters,
+        .database_id = 77,
+        .registry_nodes = &records,
+    }));
+}
+
+test "embedded and local nodes write no registry" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var test_dir = try TestDir.init(gpa);
+    defer test_dir.deinit(gpa);
+    const dir = try test_dir.nodeDir(gpa);
+    defer gpa.free(dir);
+
+    const node = try openNode(dir);
+    defer node.close();
+    try testing.expect(node.decidedRegistry() == null);
+    try testing.expectError(
+        error.FileNotFound,
+        test_dir.tmp.dir.access(io, "node/REGISTRY", .{}),
+    );
+}
+
+fn openRegistryNode(dir: []const u8) !*Node {
+    const records = [_]registry.NodeRecord{
+        registry.NodeRecord.init(1, .data_voter, "127.0.0.1:9901") catch unreachable,
+    };
+    return Node.open(testing.allocator, testing.io, .{
+        .directory = dir,
+        .node_id = 1,
+        .members = &.{1},
+        .database_id = 42,
+        .registry_nodes = &records,
+    });
+}
+
+test "snapshot rollover advances the decided registry with the epoch" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var test_dir = try TestDir.init(gpa);
+    defer test_dir.deinit(gpa);
+    const dir = try test_dir.nodeDir(gpa);
+    defer gpa.free(dir);
+
+    {
+        const node = try openRegistryNode(dir);
+        defer node.close();
+        _ = try node.exec("create table items(id integer primary key, v text)");
+        _ = try node.exec("insert into items(v) values ('epoch one')");
+        try node.snapshot();
+        try testing.expectEqual(@as(u64, 2), node.identity.configuration_id);
+        const decided = node.decidedRegistry().?;
+        try testing.expectEqual(@as(u64, 2), decided.configuration_id);
+        try testing.expectEqual(@as(u64, 1), decided.predecessor_configuration_id);
+        try testing.expectEqual(@as(u128, 42), decided.database_id);
+    }
+    {
+        const pointer = try test_dir.tmp.dir.readFileAlloc(
+            io,
+            "node/REGISTRY",
+            gpa,
+            .limited(64),
+        );
+        defer gpa.free(pointer);
+        try testing.expectEqualStrings("0000000000000002", pointer);
+    }
+
+    // A second rollover retires the oldest registry blob, mirroring
+    // snapshot retention: the pointer target plus one fallback remain.
+    {
+        const node = try openRegistryNode(dir);
+        defer node.close();
+        try testing.expectEqual(@as(u64, 2), node.decidedRegistry().?.configuration_id);
+        _ = try node.exec("insert into items(v) values ('epoch two')");
+        try node.snapshot();
+        try testing.expectEqual(@as(u64, 3), node.decidedRegistry().?.configuration_id);
+        try testing.expectEqual(@as(i64, 2), try countItems(node));
+    }
+    try test_dir.tmp.dir.access(io, "node/registries/0000000000000002", .{});
+    try test_dir.tmp.dir.access(io, "node/registries/0000000000000003", .{});
+    try testing.expectError(
+        error.FileNotFound,
+        test_dir.tmp.dir.access(io, "node/registries/0000000000000001", .{}),
+    );
+}
+
+test "recovery completes registry rollover after CURRENT advances" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var test_dir = try TestDir.init(gpa);
+    defer test_dir.deinit(gpa);
+    const dir = try test_dir.nodeDir(gpa);
+    defer gpa.free(dir);
+
+    var database_id: u128 = 0;
+    {
+        const node = try openRegistryNode(dir);
+        defer node.close();
+        _ = try node.exec("create table items(id integer primary key, v text)");
+        _ = try node.exec("insert into items(v) values ('durable')");
+        database_id = node.identity.database_id;
+        try node.snapshot();
+        try testing.expectEqual(@as(u64, 2), node.identity.configuration_id);
+    }
+
+    // Recreate the crash window after CURRENT was installed but before the
+    // REGISTRY pointer and identity advanced: both still name epoch 1 and
+    // the next-epoch journal does not exist yet.
+    var node_dir = try std.Io.Dir.cwd().openDir(testing.io, dir, .{});
+    defer node_dir.close(testing.io);
+    var identity_buffer: [256]u8 = undefined;
+    const identity = std.fmt.bufPrint(
+        &identity_buffer,
+        "format=2\nnode_id=1\ndatabase_id={x:0>32}\nconfiguration_id=1\nrole=data-voter\n",
+        .{database_id},
+    ) catch unreachable;
+    {
+        const file = try node_dir.createFile(testing.io, "identity", .{
+            .read = true,
+            .truncate = true,
+        });
+        try file.writePositionalAll(testing.io, identity, 0);
+        try file.sync(testing.io);
+        file.close(testing.io);
+    }
+    try node_dir.writeFile(io, .{
+        .sub_path = "REGISTRY",
+        .data = "0000000000000001",
+    });
+    try node_dir.deleteFile(testing.io, "paxos-0000000000000002.log");
+
+    const reopened = try openRegistryNode(dir);
+    defer reopened.close();
+    try testing.expectEqual(@as(u64, 2), reopened.identity.configuration_id);
+    try testing.expectEqual(@as(u64, 2), reopened.decidedRegistry().?.configuration_id);
+    try testing.expectEqual(@as(i64, 1), try countItems(reopened));
+    const pointer = try node_dir.readFileAlloc(io, "REGISTRY", gpa, .limited(64));
+    defer gpa.free(pointer);
+    try testing.expectEqualStrings("0000000000000002", pointer);
+}
+
+test "recovery completes registry rollover after the pointer advances" {
+    const gpa = testing.allocator;
+    var test_dir = try TestDir.init(gpa);
+    defer test_dir.deinit(gpa);
+    const dir = try test_dir.nodeDir(gpa);
+    defer gpa.free(dir);
+
+    var database_id: u128 = 0;
+    {
+        const node = try openRegistryNode(dir);
+        defer node.close();
+        _ = try node.exec("create table items(id integer primary key, v text)");
+        _ = try node.exec("insert into items(v) values ('durable')");
+        database_id = node.identity.database_id;
+        try node.snapshot();
+    }
+
+    // The crash window one step later than the previous test: CURRENT and
+    // REGISTRY both advanced, the identity file did not. Recovery must use
+    // the pointer's configuration, never fall back to the old registry.
+    var node_dir = try std.Io.Dir.cwd().openDir(testing.io, dir, .{});
+    defer node_dir.close(testing.io);
+    var identity_buffer: [256]u8 = undefined;
+    const identity = std.fmt.bufPrint(
+        &identity_buffer,
+        "format=2\nnode_id=1\ndatabase_id={x:0>32}\nconfiguration_id=1\nrole=data-voter\n",
+        .{database_id},
+    ) catch unreachable;
+    {
+        const file = try node_dir.createFile(testing.io, "identity", .{
+            .read = true,
+            .truncate = true,
+        });
+        try file.writePositionalAll(testing.io, identity, 0);
+        try file.sync(testing.io);
+        file.close(testing.io);
+    }
+    try node_dir.deleteFile(testing.io, "paxos-0000000000000002.log");
+
+    const reopened = try openRegistryNode(dir);
+    defer reopened.close();
+    try testing.expectEqual(@as(u64, 2), reopened.identity.configuration_id);
+    try testing.expectEqual(@as(u64, 2), reopened.decidedRegistry().?.configuration_id);
+    try testing.expectEqual(@as(i64, 1), try countItems(reopened));
+}

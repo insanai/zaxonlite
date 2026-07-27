@@ -558,7 +558,7 @@ fn runScenario(
     if (std.mem.indexOf(
         u8,
         members_body,
-        "\"voter_membership\":\"static\"",
+        "\"voter_membership\":\"decided\"",
     ) == null) {
         fail(&cluster, "members RPC malformed: {s}", .{members_body});
     }

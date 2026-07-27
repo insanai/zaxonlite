@@ -54,6 +54,10 @@ const usage_text =
     \\  session           Open a client session and print its ID.
     \\  status            Show node status. --json for automation.
     \\  members           Show cluster membership and node roles.
+    \\  membership status Show the decided registry, phase, and quorum health.
+    \\  replace-voter     Replace one data voter (admin certificate required):
+    \\                    --operation <u64> --expected-config <id>
+    \\                    --old-node <id> --new-node <id>@<host>:<port>
     \\  leader            Show the current leader (client mode).
     \\  wait              Wait for --applied <slot> and/or --leader (client mode).
     \\  snapshot          Take a snapshot and seal the current journal epoch.
@@ -86,6 +90,7 @@ const usage_text =
     \\                      service over a Unix-domain socket (serve).
     \\  --role <role>       data-voter|witness|standby|read-replica|gateway.
     \\  --peer <spec>       id@host:port[/role] (repeat; serve).
+    \\  --admin <name>      authorize one zaxon-admin principal (repeat; serve).
     \\  --cluster-id <text> Extra entropy for the derived database identity.
     \\  --auth-file <path>  PSK provider; or ZAXON_AUTH_FILE. Never a literal key.
     \\  --dev-psk           Loopback-only PSK transport for local development.
@@ -131,6 +136,7 @@ const Options = struct {
     role_set: bool = false,
     listen: ?[]const u8 = null,
     peers: std.ArrayList([]const u8) = .empty,
+    admins: std.ArrayList([]const u8) = .empty,
     cluster_id: ?[]const u8 = null,
     auth_file: ?[]const u8 = null,
     tls_cert: ?[]const u8 = null,
@@ -140,6 +146,10 @@ const Options = struct {
     token_file: ?[]const u8 = null,
     identity_dir: ?[]const u8 = null,
     ttl_seconds: ?u64 = null,
+    operation: ?u64 = null,
+    expected_config: ?u64 = null,
+    old_node: ?u32 = null,
+    new_node: ?[]const u8 = null,
     revocation_file: ?[]const u8 = null,
     sync: ?[]const u8 = null,
     enable_failpoints: bool = false,
@@ -196,12 +206,21 @@ fn run(
     defer iterator.deinit();
     _ = iterator.next();
 
-    const command = iterator.next() orelse {
+    var command = iterator.next() orelse {
         try out.writeAll(usage_text);
         return exit_usage;
     };
+    // The only two-word command: `zaxon membership status`.
+    if (std.mem.eql(u8, command, "membership")) {
+        const subcommand = iterator.next() orelse "";
+        if (!std.mem.eql(u8, subcommand, "status")) {
+            return usageError(err_out, "membership needs a subcommand: status");
+        }
+        command = "membership";
+    }
     var options = Options{ .command = command };
     defer options.peers.deinit(gpa);
+    defer options.admins.deinit(gpa);
     if (try parseOptions(gpa, &iterator, &options, err_out, out)) |code| return code;
 
     if (std.mem.eql(u8, command, "version")) {
@@ -622,6 +641,11 @@ fn applyPeersConfig(
             for (value.peers) |item| try options.peers.append(gpa, item);
         }
     }
+    if (options.admins.items.len == 0) {
+        if (file) |value| {
+            for (value.admins) |item| try options.admins.append(gpa, item);
+        }
+    }
 }
 
 fn usageError(err_out: *std.Io.Writer, message: []const u8) !u8 {
@@ -741,6 +765,7 @@ fn serveCommand(
         .tls = tls_config,
         .enrollment_ca_key = options.enrollment_ca_key,
         .revocation_file = options.revocation_file,
+        .admin_principals = options.admins.items,
         .enable_failpoints = options.enable_failpoints,
         .allow_insecure_test_tcp = options.insecure_test_tcp,
     }, err_out);
@@ -1020,6 +1045,13 @@ fn buildRemoteRequestBody(
     if (std.mem.eql(u8, command, "enroll-token")) {
         return buildRemoteEnrollTokenBody(options, writer, err_out);
     }
+    if (std.mem.eql(u8, command, "membership")) {
+        try writer.writeAll("{\"op\":\"membership\"}");
+        return false;
+    }
+    if (std.mem.eql(u8, command, "replace-voter")) {
+        return buildRemoteReplaceVoterBody(options, writer, err_out);
+    }
     if (std.mem.eql(u8, command, "stop")) {
         try writer.writeAll("{\"op\":\"stop\"}");
         return false;
@@ -1032,6 +1064,50 @@ fn buildRemoteRequestBody(
         "Use --data for this operation or select a remote-capable command.",
     );
     return error.UsageError;
+}
+
+fn buildRemoteReplaceVoterBody(
+    options: *const Options,
+    writer: *std.Io.Writer,
+    err_out: *std.Io.Writer,
+) !bool {
+    const operation = options.operation orelse {
+        _ = try usageError(err_out, "replace-voter needs --operation");
+        return error.UsageError;
+    };
+    const expected_config = options.expected_config orelse {
+        _ = try usageError(err_out, "replace-voter needs --expected-config");
+        return error.UsageError;
+    };
+    const old_node = options.old_node orelse {
+        _ = try usageError(err_out, "replace-voter needs --old-node");
+        return error.UsageError;
+    };
+    const new_node_spec = options.new_node orelse {
+        _ = try usageError(err_out, "replace-voter needs --new-node <id>@<host>:<port>");
+        return error.UsageError;
+    };
+    const at = std.mem.indexOfScalar(u8, new_node_spec, '@') orelse {
+        _ = try usageError(err_out, "--new-node must be <id>@<host>:<port>");
+        return error.UsageError;
+    };
+    const new_node = std.fmt.parseInt(u32, new_node_spec[0..at], 10) catch {
+        _ = try usageError(err_out, "--new-node must be <id>@<host>:<port>");
+        return error.UsageError;
+    };
+    const endpoint = new_node_spec[at + 1 ..];
+    if (endpoint.len == 0 or new_node == 0) {
+        _ = try usageError(err_out, "--new-node must be <id>@<host>:<port>");
+        return error.UsageError;
+    }
+    try writer.print(
+        "{{\"op\":\"replace-voter\",\"operation\":{d},\"expected_config\":{d}," ++
+            "\"old_node\":{d},\"new_node\":{d},\"endpoint\":",
+        .{ operation, expected_config, old_node, new_node },
+    );
+    try cli_render.writeJsonString(writer, endpoint);
+    try writer.writeAll("}");
+    return true;
 }
 
 fn buildRemoteEnrollTokenBody(
@@ -1255,6 +1331,24 @@ fn enrollCommand(
         return exit_unavailable;
     };
     enrollment.removeBundleFile(io, token_path) catch {};
+    // A joining replacement records the decided database identity and
+    // registry digest beside its future durable state, so its first start
+    // adopts the cluster's identity instead of deriving one from flags.
+    if (options.data) |data| {
+        zaxonlite.node.writeJoinDescriptor(io, data, .{
+            .database_id = bundle.database_id,
+            .configuration_id = identity.configuration_id,
+            .registry_digest = identity.registry_digest,
+        }) catch |err| {
+            try diagnostic.write(
+                err_out,
+                "join descriptor write failed",
+                @errorName(err),
+                "Check the --data directory before starting the node.",
+            );
+            return exit_unavailable;
+        };
+    }
     if (options.json) {
         try out.print(
             "{{\"ok\":true,\"node_id\":{d},\"identity_dir\":\"{s}\"}}\n",
@@ -1365,6 +1459,10 @@ fn parseOptionFlag(
         const text = iterator.next() orelse
             return optError(err_out, "--peer needs a value");
         try options.peers.append(gpa, text);
+    } else if (std.mem.eql(u8, arg, "--admin")) {
+        const text = iterator.next() orelse
+            return optError(err_out, "--admin needs a value");
+        try options.admins.append(gpa, text);
     } else if (std.mem.eql(u8, arg, "--cluster-id")) {
         options.cluster_id = iterator.next() orelse
             return optError(err_out, "--cluster-id needs a value");
@@ -1394,6 +1492,24 @@ fn parseOptionFlag(
             return optError(err_out, "--ttl-seconds needs a value");
         options.ttl_seconds = std.fmt.parseInt(u64, text, 10) catch
             return optError(err_out, "--ttl-seconds must be an integer");
+    } else if (std.mem.eql(u8, arg, "--operation")) {
+        const text = iterator.next() orelse
+            return optError(err_out, "--operation needs a value");
+        options.operation = std.fmt.parseInt(u64, text, 10) catch
+            return optError(err_out, "--operation must be an integer");
+    } else if (std.mem.eql(u8, arg, "--expected-config")) {
+        const text = iterator.next() orelse
+            return optError(err_out, "--expected-config needs a value");
+        options.expected_config = std.fmt.parseInt(u64, text, 10) catch
+            return optError(err_out, "--expected-config must be an integer");
+    } else if (std.mem.eql(u8, arg, "--old-node")) {
+        const text = iterator.next() orelse
+            return optError(err_out, "--old-node needs a value");
+        options.old_node = std.fmt.parseInt(u32, text, 10) catch
+            return optError(err_out, "--old-node must be an integer");
+    } else if (std.mem.eql(u8, arg, "--new-node")) {
+        options.new_node = iterator.next() orelse
+            return optError(err_out, "--new-node needs a value");
     } else if (std.mem.eql(u8, arg, "--revocation-file")) {
         options.revocation_file = iterator.next() orelse
             return optError(err_out, "--revocation-file needs a value");

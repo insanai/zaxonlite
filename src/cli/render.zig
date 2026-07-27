@@ -256,10 +256,53 @@ fn renderRemoteSuccess(
         try out.writeAll("integrity: pass\n");
     } else if (std.mem.eql(u8, command, "expire-sessions")) {
         try out.print("{d} session(s) expired\n", .{jsonInt(object.get("expired")) orelse 0});
+    } else if (std.mem.eql(u8, command, "replace-voter")) {
+        const phase = jsonString(object.get("phase")) orelse "unknown";
+        try out.print(
+            "operation {d}: {s}\n",
+            .{ jsonInt(object.get("operation")) orelse 0, phase },
+        );
+        if (std.mem.eql(u8, phase, "proposed")) {
+            try out.writeAll(
+                "the stop sign is in Paxos; query `zaxon membership status` " ++
+                    "by operation id. A timeout does not mean failure.\n",
+            );
+        }
+    } else if (std.mem.eql(u8, command, "membership")) {
+        try renderRemoteMembership(object, out);
     } else {
         try out.print("{s}\n", .{body});
     }
     return exit_ok;
+}
+
+fn renderRemoteMembership(object: *const std.json.ObjectMap, out: *std.Io.Writer) !void {
+    try out.print(
+        "configuration {d} ({s}); quorum_available={}; installation={s}\n",
+        .{
+            jsonInt(object.get("configuration_id")) orelse 0,
+            jsonString(object.get("phase")) orelse "unknown",
+            blk: {
+                const value = object.get("quorum_available") orelse
+                    break :blk false;
+                break :blk value == .bool and value.bool;
+            },
+            jsonString(object.get("installation_state")) orelse "unknown",
+        },
+    );
+    if (jsonString(object.get("registry_digest"))) |digest| {
+        try out.print("registry digest {s}\n", .{digest});
+    }
+    if (object.get("nodes")) |nodes| {
+        if (nodes == .array) for (nodes.array.items) |item| {
+            if (item != .object) continue;
+            try out.print("node {d} {s} {s}\n", .{
+                jsonInt(item.object.get("id")) orelse 0,
+                jsonString(item.object.get("role")) orelse "?",
+                jsonString(item.object.get("endpoint")) orelse "?",
+            });
+        };
+    }
 }
 
 fn renderRemoteLeader(object: *const std.json.ObjectMap, out: *std.Io.Writer) !void {
@@ -279,6 +322,14 @@ fn renderRemoteLeader(object: *const std.json.ObjectMap, out: *std.Io.Writer) !v
             try out.print("leader: node {d}\n", .{id});
         },
         else => try out.writeAll("leader: none\n"),
+    };
+}
+
+pub fn jsonString(value: ?std.json.Value) ?[]const u8 {
+    const wrapped = value orelse return null;
+    return switch (wrapped) {
+        .string => |text| text,
+        else => null,
     };
 }
 
