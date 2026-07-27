@@ -84,6 +84,10 @@ jobs:
         if: runner.os == 'Linux'
         run: zig build test-cluster
 
+      - name: Voter replacement scenario
+        if: runner.os == 'Linux'
+        run: zig build test-replace-cluster
+
   # Cross-compiling is not proof that Windows works, but it is proof that
   # the port still builds. Without this the POSIX-only assumptions creep
   # back in unnoticed, which is how the target was lost the first time.

@@ -6,8 +6,8 @@
 # using `zig cc` as the cross C compiler, and caches the result. No
 # target-native machines are involved.
 #
-# Cut a release by pushing a tag:
-#   git tag v0.1.0 && git push origin v0.1.0
+# Cut a release by pushing the version declared in build.zig.zon:
+#   git tag v0.1.2 && git push origin v0.1.2
 # Before tagging, bump `.version` in build.zig.zon and the library version
 # string so `zaxon version` reports the tag.
 #
@@ -46,6 +46,7 @@ jobs:
         with:
           repository: insanai/paxos-zig
           token: ${{ secrets.CROSS_REPO_TOKEN || github.token }}
+          ref: ${{ github.ref_name }}
           path: .
 
       - name: Checkout zaxonlite
@@ -57,6 +58,21 @@ jobs:
         uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
+
+      - name: Verify release versions
+        if: startsWith(github.ref, 'refs/tags/')
+        working-directory: zaxonlite
+        run: |
+          set -eu
+          expected="${GITHUB_REF_NAME#v}"
+          package_version="$(awk -F'"' '/\.version =/{print $2; exit}' build.zig.zon)"
+          library_version="$(awk -F'"' '/pub const version =/{print $2; exit}' src/root.zig)"
+          paxos_version="$(awk -F'"' '/\.version =/{print $2; exit}' ../build.zig.zon)"
+          paxos_library_version="$(awk -F'"' '/pub const version =/{print $2; exit}' ../src/root.zig)"
+          test "${package_version}" = "${expected}"
+          test "${library_version}" = "${expected}"
+          test "${paxos_version}" = "${expected}"
+          test "${paxos_library_version}" = "${expected}"
 
       # Zig's zip fetch (the SQLite amalgamation) writes its temporary file
       # under the global cache's tmp/ directory but does not create it.
