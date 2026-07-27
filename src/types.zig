@@ -22,7 +22,9 @@ pub const log_options = paxos.ReplicatedLogOptions{
     // deliberately small compared with an unbounded database log.
     .max_entries = 2048,
     .max_batch = 16,
-    .max_metadata_bytes = 256,
+    // 512 holds zx2 stop metadata: checkpoint name, manifest digest,
+    // next-registry digest, and the bounded replacement seed.
+    .max_metadata_bytes = 512,
 };
 
 pub const Log = paxos.ReplicatedLog(Command, log_options);
@@ -108,16 +110,14 @@ pub fn decodeEntry(reader: *ReadCursor) DecodeError!Entry {
             }
             const metadata = try reader.take(metadata_count);
 
-            var stop = StopSign{
-                .configuration_id = configuration_id,
-                .members = [_]paxos.NodeId{0} ** log_options.max_members,
-                .member_count = member_count,
-                .metadata = [_]u8{0} ** log_options.max_metadata_bytes,
-                .metadata_count = metadata_count,
-            };
-            @memcpy(stop.members[0..member_count], members[0..member_count]);
-            @memcpy(stop.metadata[0..metadata_count], metadata);
-            if (configuration_id == 0) return error.InvalidStopSign;
+            // The library validates the configuration ID and the member
+            // list, including zero and duplicate IDs a raw copy would let
+            // through.
+            const stop = StopSign.create(
+                configuration_id,
+                members[0..member_count],
+                metadata,
+            ) catch return error.InvalidStopSign;
             return .{ .stop = stop };
         },
         else => return error.InvalidEntryTag,
@@ -217,8 +217,7 @@ pub const ReadCursor = struct {
 test "write records round trip" {
     const ballot = paxos.Ballot{ .round = 9, .priority = 2, .node = 1 };
     const noop_cmd = Command.noop;
-    var stop_members = [_]paxos.NodeId{ 1, 2, 3 };
-    const stop = try makeStop(7, &stop_members, "manifest");
+    const stop = try StopSign.create(7, &.{ 1, 2, 3 }, "manifest");
 
     const cases = [_]Write{
         .{ .promise = ballot },
@@ -234,19 +233,20 @@ test "write records round trip" {
     }
 }
 
-fn makeStop(
-    configuration_id: u64,
-    members: []const paxos.NodeId,
-    metadata: []const u8,
-) !StopSign {
-    var stop = StopSign{
-        .configuration_id = configuration_id,
-        .members = [_]paxos.NodeId{0} ** log_options.max_members,
-        .member_count = @intCast(members.len),
-        .metadata = [_]u8{0} ** log_options.max_metadata_bytes,
-        .metadata_count = @intCast(metadata.len),
+test "stop sign decoder rejects duplicate and zero member ids" {
+    const cases = [_][]const paxos.NodeId{
+        &.{ 1, 2, 2 },
+        &.{ 1, 0, 3 },
     };
-    @memcpy(stop.members[0..members.len], members);
-    @memcpy(stop.metadata[0..metadata.len], metadata);
-    return stop;
+    for (cases) |bad_members| {
+        var buffer: [max_entry_size]u8 = undefined;
+        var cursor = Cursor{ .buffer = &buffer };
+        cursor.byte(1);
+        cursor.int(u64, 7);
+        cursor.int(u16, @intCast(bad_members.len));
+        for (bad_members) |member| cursor.int(u32, member);
+        cursor.int(u16, 0);
+        var reader = ReadCursor{ .buffer = buffer[0..cursor.offset] };
+        try std.testing.expectError(error.InvalidStopSign, decodeEntry(&reader));
+    }
 }

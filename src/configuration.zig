@@ -25,6 +25,9 @@ pub const File = struct {
     tls_ca: ?[]const u8 = null,
     enrollment_ca_key: ?[]const u8 = null,
     revocation_file: ?[]const u8 = null,
+    /// Administrator names allowed to run privileged membership
+    /// operations; matched against `zaxon-admin-<name>` certificates.
+    admins: []const []const u8 = &.{},
     sync: ?[]const u8 = null,
 };
 
