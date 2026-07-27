@@ -39,6 +39,7 @@ const roles = @import("roles.zig");
 const diagnostic = @import("diagnostic.zig");
 const durability = @import("durability.zig");
 const configuration = @import("configuration.zig");
+const registry = @import("registry.zig");
 
 const Node = node_mod.Node;
 const Log = types.Log;
@@ -49,6 +50,141 @@ pub const PeerAddress = struct {
     port: u16,
     role: roles.Role = .data_voter,
 };
+
+/// Bounded copy of one administrator principal name.
+pub const AdminName = struct {
+    bytes: [tls.max_admin_name]u8 = undefined,
+    len: u8 = 0,
+
+    pub fn slice(self: *const AdminName) []const u8 {
+        return self.bytes[0..self.len];
+    }
+
+    fn from(name: []const u8) AdminName {
+        var result = AdminName{ .len = @intCast(name.len) };
+        @memcpy(result.bytes[0..name.len], name);
+        return result;
+    }
+};
+
+/// Authenticated identity of one connection, fixed at the TLS handshake.
+/// PSK and unix-socket connections carry no certificate and stay
+/// anonymous, which keeps privileged membership operations structurally
+/// unreachable in development modes.
+pub const Principal = union(enum) {
+    anonymous,
+    /// A cluster node certificate, `zaxon-node-<id>`.
+    node: paxos.NodeId,
+    /// An administrator certificate, `zaxon-admin-<name>`.
+    admin: AdminName,
+};
+
+/// One immutable transport-membership generation, derived from the decided
+/// registry (or from startup flags on registry-less hosts). Readers load
+/// the current generation with one atomic pointer read; superseded
+/// generations stay allocated until shutdown so borrowed member records
+/// can never dangle across an in-process swap.
+const MemberGeneration = struct {
+    configuration_id: u64,
+    members: []PeerAddress,
+    hosts: [][]u8,
+
+    fn destroy(self: *MemberGeneration, gpa: std.mem.Allocator) void {
+        for (self.hosts) |host| gpa.free(host);
+        gpa.free(self.hosts);
+        gpa.free(self.members);
+        gpa.destroy(self);
+    }
+};
+
+/// True when a transport generation reflects exactly the decided
+/// registry's IDs, roles, and endpoints.
+fn membershipMatchesRegistry(
+    generation: *const MemberGeneration,
+    decided: *const registry.Decided,
+) bool {
+    const records = decided.nodesSlice();
+    if (generation.members.len != records.len) return false;
+    for (generation.members, records) |member, *record| {
+        if (member.id != record.id or member.role != record.role) return false;
+        const parsed = parseEndpoint(record.endpointSlice()) catch return false;
+        if (member.port != parsed.port or
+            !std.mem.eql(u8, member.host, parsed.host))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Splits a registry endpoint (`host:port`) at its last colon.
+fn parseEndpoint(endpoint: []const u8) !struct { host: []const u8, port: u16 } {
+    const colon = std.mem.lastIndexOfScalar(u8, endpoint, ':') orelse
+        return error.InvalidEndpoint;
+    if (colon == 0 or colon + 1 == endpoint.len) return error.InvalidEndpoint;
+    const port = std.fmt.parseInt(u16, endpoint[colon + 1 ..], 10) catch
+        return error.InvalidEndpoint;
+    return .{ .host = endpoint[0..colon], .port = port };
+}
+
+/// Builds one generation from the node's decided registry, or from the
+/// startup flags when the host keeps flag-fixed membership.
+fn buildMemberGeneration(
+    gpa: std.mem.Allocator,
+    node: *Node,
+    fallback: []const PeerAddress,
+) !*MemberGeneration {
+    const generation = try gpa.create(MemberGeneration);
+    errdefer gpa.destroy(generation);
+    if (node.decidedRegistry()) |decided| {
+        const records = decided.nodesSlice();
+        const members = try gpa.alloc(PeerAddress, records.len);
+        errdefer gpa.free(members);
+        const hosts = try gpa.alloc([]u8, records.len);
+        errdefer gpa.free(hosts);
+        var host_count: usize = 0;
+        errdefer for (hosts[0..host_count]) |host| gpa.free(host);
+        for (records, 0..) |*record, index| {
+            const parsed = try parseEndpoint(record.endpointSlice());
+            hosts[index] = try gpa.dupe(u8, parsed.host);
+            host_count += 1;
+            members[index] = .{
+                .id = record.id,
+                .host = hosts[index],
+                .port = parsed.port,
+                .role = record.role,
+            };
+        }
+        generation.* = .{
+            .configuration_id = decided.configuration_id,
+            .members = members,
+            .hosts = hosts,
+        };
+        return generation;
+    }
+    const members = try gpa.alloc(PeerAddress, fallback.len);
+    errdefer gpa.free(members);
+    const hosts = try gpa.alloc([]u8, fallback.len);
+    errdefer gpa.free(hosts);
+    var host_count: usize = 0;
+    errdefer for (hosts[0..host_count]) |host| gpa.free(host);
+    for (fallback, 0..) |member, index| {
+        hosts[index] = try gpa.dupe(u8, member.host);
+        host_count += 1;
+        members[index] = .{
+            .id = member.id,
+            .host = hosts[index],
+            .port = member.port,
+            .role = member.role,
+        };
+    }
+    generation.* = .{
+        .configuration_id = node.identity.configuration_id,
+        .members = members,
+        .hosts = hosts,
+    };
+    return generation;
+}
 
 pub const ServeOptions = struct {
     directory: []const u8,
@@ -88,6 +224,10 @@ pub const ServeOptions = struct {
     /// Optional operator-managed denylist. Each non-comment line is one
     /// configured node ID. Reloads close live inbound and outbound links.
     revocation_file: ?[]const u8 = null,
+    /// Administrator names authorized for privileged membership
+    /// operations, matched against `zaxon-admin-<name>` client
+    /// certificates. Empty denies every privileged request.
+    admin_principals: []const []const u8 = &.{},
     /// Explicit escape hatch for deterministic local test harnesses. It is
     /// rejected unless failpoints are enabled and is never a production
     /// transport mode.
@@ -343,6 +483,48 @@ pub fn serve(
     }
     std.mem.sort(paxos.NodeId, member_ids[0..member_count], {}, std.sort.asc(paxos.NodeId));
 
+    // Network-hosted nodes persist the product registry; the durable
+    // decided registry is the membership authority from the first boot on.
+    // A unix-socket local node keeps flag-fixed membership and no registry.
+    var registry_records: [registry.max_nodes]registry.NodeRecord = undefined;
+    var registry_count: usize = 0;
+    const registry_nodes: ?[]const registry.NodeRecord = blk: {
+        if (options.listen_unix != null) break :blk null;
+        if (options.members.len > registry.max_nodes) {
+            return reportConfig(err_out, "node registry exceeds the registry bound");
+        }
+        if (options.members.len == 0) {
+            var endpoint_buffer: [registry.max_endpoint_bytes]u8 = undefined;
+            const endpoint = std.fmt.bufPrint(
+                &endpoint_buffer,
+                "{s}:{d}",
+                .{ options.listen_host, options.listen_port },
+            ) catch return reportConfig(err_out, "listen endpoint is too long");
+            registry_records[0] = registry.NodeRecord.init(
+                options.node_id,
+                self_role,
+                endpoint,
+            ) catch return reportConfig(err_out, "listen endpoint is invalid");
+            registry_count = 1;
+            break :blk registry_records[0..registry_count];
+        }
+        for (options.members) |member| {
+            var endpoint_buffer: [registry.max_endpoint_bytes]u8 = undefined;
+            const endpoint = std.fmt.bufPrint(
+                &endpoint_buffer,
+                "{s}:{d}",
+                .{ member.host, member.port },
+            ) catch return reportConfig(err_out, "peer endpoint is too long");
+            registry_records[registry_count] = registry.NodeRecord.init(
+                member.id,
+                member.role,
+                endpoint,
+            ) catch return reportConfig(err_out, "peer endpoint is invalid");
+            registry_count += 1;
+        }
+        break :blk registry_records[0..registry_count];
+    };
+
     const node = Node.open(gpa, io, .{
         .directory = options.directory,
         .node_id = options.node_id,
@@ -350,6 +532,7 @@ pub fn serve(
         .leader_priority = options.node_id,
         .database_id = options.database_id,
         .role = self_role,
+        .registry_nodes = registry_nodes,
         .test_storage_delay_ms = options.test_faults.storage_delay_ms,
     }) catch |err| {
         try diagnostic.write(
@@ -362,14 +545,32 @@ pub fn serve(
         return 4;
     };
 
+    const initial_generation = buildMemberGeneration(
+        gpa,
+        node,
+        options.members,
+    ) catch |err| {
+        node.close();
+        try diagnostic.write(
+            err_out,
+            "member registry invalid",
+            @errorName(err),
+            "Check the decided registry endpoints before retrying.",
+        );
+        try err_out.flush();
+        return 4;
+    };
+
     var server = Server{
         .gpa = gpa,
         .io = io,
         .node = node,
         .options = options,
+        .membership = .init(initial_generation),
         .held = std.AutoHashMap(command.HashBytes, Held).init(gpa),
     };
     defer server.deinit();
+    try server.member_generations.append(gpa, initial_generation);
     if (options.revocation_file != null) {
         server.reloadRevocationsLocked() catch |err| {
             try diagnostic.write(
@@ -464,30 +665,13 @@ pub fn serve(
 
     try writeStartupSummary(&server, self_role, err_out);
 
-    // One sender per peer.
-    for (options.members) |member| {
-        if (member.id == options.node_id) continue;
-        if (!member.role.capabilities().stores_log) continue;
-        // Voters distribute chosen values to every storage node. Learners
-        // only need return paths to voters for payload ACKs and requests;
-        // learner-to-learner links carry no protocol information.
-        if (!self_role.capabilities().votes and
-            !member.role.capabilities().votes)
-        {
-            continue;
-        }
-        const sender = try gpa.create(PeerSender);
-        sender.* = .{ .server = &server, .peer = member };
-        sender.stored_payloads = std.AutoHashMap(command.HashBytes, void).init(gpa);
-        try server.senders.append(gpa, sender);
-    }
+    // One sender per peer of the active membership generation.
+    try server.buildSenders();
     server.node.setPreDurableOutboxHook(.{
         .context = &server,
         .run = drainPreDurableOutbox,
     });
-    for (server.senders.items) |sender| {
-        sender.thread = try std.Thread.spawn(.{}, PeerSender.run, .{sender});
-    }
+    try server.spawnSenders();
     const ticker = try std.Thread.spawn(.{}, Server.tickLoop, .{&server});
 
     // Accept loop. The `stop` RPC sets the shutdown flag and then dials
@@ -676,12 +860,26 @@ const CheckpointProofWaiter = struct {
     nonce: u64,
     sealed_configuration_id: u64,
     digest: [32]u8,
+    /// Voters of the sealed configuration, from the proof itself. Only
+    /// distinct IDs drawn from this set count toward the quorum; the
+    /// proposed next voter never does.
+    sealed_members: [types.log_options.max_members]paxos.NodeId =
+        [_]paxos.NodeId{0} ** types.log_options.max_members,
+    sealed_count: u16 = 0,
     acked: [types.log_options.max_members]paxos.NodeId =
         [_]paxos.NodeId{0} ** types.log_options.max_members,
     ack_count: usize = 0,
     needed: usize,
 
+    fn isSealedVoter(self: *const CheckpointProofWaiter, member: paxos.NodeId) bool {
+        for (self.sealed_members[0..self.sealed_count]) |sealed| {
+            if (sealed == member) return true;
+        }
+        return false;
+    }
+
     fn noteAck(self: *CheckpointProofWaiter, member: paxos.NodeId) void {
+        if (!self.isSealedVoter(member)) return;
         for (self.acked[0..self.ack_count]) |seen| {
             if (seen == member) return;
         }
@@ -715,8 +913,27 @@ pub const Server = struct {
     proof_mutex: std.Io.Mutex = .init,
     proof_waiter: ?*CheckpointProofWaiter = null,
     next_proof_nonce: u64 = 1,
+    /// Set once a decided stop sign replaced this voter: the node stays
+    /// permanently sealed and the server stops attempting rollover.
+    retired: bool = false,
+    /// This node's own snapshot-install lifecycle while it joins as a
+    /// decided replacement; `not_applicable` on every other node.
+    installation: enum {
+        not_applicable,
+        transferring,
+        verifying,
+        installed,
+        active,
+        failed,
+    } = .not_applicable,
     listener: ?std.Io.net.Server = null,
     senders: std.ArrayList(*PeerSender) = .empty,
+    /// The active transport-membership generation; swapped atomically by
+    /// `rebuildTransport` after a decided membership change.
+    membership: std.atomic.Value(*const MemberGeneration),
+    /// Every generation ever published, owned until shutdown so borrowed
+    /// member records never dangle across a swap.
+    member_generations: std.ArrayList(*MemberGeneration) = .empty,
     held: std.AutoHashMap(command.HashBytes, Held),
     held_total: usize = 0,
     write_waiter: ?*WriteWaiter = null,
@@ -772,6 +989,10 @@ pub const Server = struct {
             self.gpa.destroy(sender);
         }
         self.senders.deinit(self.gpa);
+        for (self.member_generations.items) |generation| {
+            generation.destroy(self.gpa);
+        }
+        self.member_generations.deinit(self.gpa);
         self.fences.deinit(self.gpa);
         self.waiters.deinit(self.gpa);
         self.active_connections.deinit(self.gpa);
@@ -917,7 +1138,126 @@ pub const Server = struct {
     /// assumptions.
     fn connectionLimit(self: *const Server) usize {
         if (self.options.max_connections != 0) return self.options.max_connections;
-        return 4 * self.options.members.len + 16;
+        return 4 * self.currentMembers().len + 16;
+    }
+
+    /// The active membership generation's records. Lock-free: one atomic
+    /// pointer load of an immutable generation.
+    fn currentMembers(self: *const Server) []const PeerAddress {
+        return self.membership.load(.acquire).members;
+    }
+
+    /// Creates one sender per peer of the active generation. Voters
+    /// distribute chosen values to every storage node; learners only need
+    /// return paths to voters for payload ACKs and requests.
+    fn buildSenders(self: *Server) !void {
+        const self_votes = self.node.capabilities.votes;
+        const self_id = self.node.identity.node_id;
+        for (self.currentMembers()) |member| {
+            if (member.id == self_id) continue;
+            if (!member.role.capabilities().stores_log) continue;
+            if (!self_votes and !member.role.capabilities().votes) continue;
+            const sender = try self.gpa.create(PeerSender);
+            sender.* = .{ .server = self, .peer = member };
+            sender.stored_payloads =
+                std.AutoHashMap(command.HashBytes, void).init(self.gpa);
+            try self.senders.append(self.gpa, sender);
+        }
+    }
+
+    fn spawnSenders(self: *Server) !void {
+        for (self.senders.items) |sender| {
+            if (sender.spawned) continue;
+            sender.thread = try std.Thread.spawn(.{}, PeerSender.run, .{sender});
+            sender.spawned = true;
+        }
+    }
+
+    /// True when the node's decided registry no longer matches the active
+    /// transport generation. Same-member epoch rollovers keep the
+    /// generation; only a decided membership change makes it stale.
+    /// Caller holds `mutex`.
+    fn transportStaleLocked(self: *Server) bool {
+        const decided = self.node.decidedRegistry() orelse return false;
+        const generation = self.membership.load(.acquire);
+        return !membershipMatchesRegistry(generation, decided);
+    }
+
+    /// Rebuilds the transport boundary from the decided registry after an
+    /// in-process rollover: publishes the next membership generation,
+    /// tears down and rebuilds peer senders, and closes connections from
+    /// nodes the registry removed. Client TCP connections stay open. Runs
+    /// without `mutex` held; sender threads take that mutex themselves.
+    fn rebuildTransport(self: *Server) !void {
+        self.mutex.lockUncancelable(self.io);
+        const decided = self.node.decidedRegistry() orelse {
+            self.mutex.unlock(self.io);
+            return;
+        };
+        const previous = self.membership.load(.acquire);
+        if (membershipMatchesRegistry(previous, decided)) {
+            self.mutex.unlock(self.io);
+            return;
+        }
+        const next = buildMemberGeneration(
+            self.gpa,
+            self.node,
+            self.options.members,
+        ) catch |err| {
+            self.mutex.unlock(self.io);
+            return err;
+        };
+        self.member_generations.append(self.gpa, next) catch |err| {
+            next.destroy(self.gpa);
+            self.mutex.unlock(self.io);
+            return err;
+        };
+        self.membership.store(next, .release);
+        failpoint.hit("before_transport_swap");
+
+        // Detach the old sender set under the lock; concurrent iterators
+        // observe an empty list and protocol retransmission recovers any
+        // frame dropped during the swap.
+        var old_senders = self.senders;
+        self.senders = .empty;
+
+        // Close inbound connections from nodes the registry removed, and
+        // from stale anonymous peers; established client connections keep
+        // their identity and stay open.
+        for (self.active_connections.items) |connection| {
+            const credential = connection.credential_node_id orelse continue;
+            var still_registered = false;
+            for (next.members) |member| {
+                if (member.id == credential) still_registered = true;
+            }
+            if (!still_registered) {
+                connection.stream.shutdown(self.io, .both) catch {};
+            }
+        }
+        self.mutex.unlock(self.io);
+
+        // Stop and join the old senders off-lock: a sender thread takes
+        // the server mutex during its handshake, so joining under it
+        // could deadlock.
+        for (old_senders.items) |sender| sender.requestStop();
+        for (old_senders.items) |sender| {
+            if (sender.spawned) sender.thread.join();
+            sender.deinit();
+            self.gpa.destroy(sender);
+        }
+        old_senders.deinit(self.gpa);
+        failpoint.hit("after_transport_teardown");
+
+        self.mutex.lockUncancelable(self.io);
+        const build_result = self.buildSenders();
+        self.mutex.unlock(self.io);
+        try build_result;
+        try self.spawnSenders();
+        failpoint.hit("after_transport_swap");
+        std.log.info(
+            "node {d}: transport rebuilt for configuration {d}",
+            .{ self.node.identity.node_id, next.configuration_id },
+        );
     }
 
     fn noteHandlerStarted(self: *Server, stream: std.Io.net.Stream) !void {
@@ -1037,7 +1377,7 @@ pub const Server = struct {
     }
 
     fn addressOf(self: *Server, peer: paxos.NodeId) ?PeerAddress {
-        for (self.options.members) |member| {
+        for (self.currentMembers()) |member| {
             if (member.id == peer) return member;
         }
         return null;
@@ -1081,7 +1421,9 @@ pub const Server = struct {
 
         // Complete a decided epoch rollover once everything before the
         // stop sign is applied.
-        if (self.node.rollover_pending and self.node.log.isReconfigured() != null) {
+        if (!self.retired and self.node.rollover_pending and
+            self.node.log.isReconfigured() != null)
+        {
             if (self.node.completeClusterRollover()) |_| {
                 self.checkpoint_started = false;
                 self.observed_leader_decided = 0;
@@ -1094,6 +1436,16 @@ pub const Server = struct {
                             self.requestSnapshot(leader);
                         }
                     }
+                },
+                error.RetiredByReconfiguration => {
+                    // The chosen stop sign replaced this voter. The node
+                    // stays permanently sealed on its final configuration.
+                    self.retired = true;
+                    std.log.warn(
+                        "node {d} was replaced by a decided reconfiguration; " ++
+                            "it stays sealed and cannot rejoin",
+                        .{self.node.identity.node_id},
+                    );
                 },
                 else => return err,
             }
@@ -1335,43 +1687,60 @@ pub const Server = struct {
     fn tickLoop(self: *Server) void {
         while (!self.isShutdown()) {
             self.io.sleep(.fromMilliseconds(@intCast(self.options.tick_ms)), .awake) catch {};
-            self.mutex.lockUncancelable(self.io);
-            defer self.mutex.unlock(self.io);
-            if (self.failed) continue;
-            self.tick_count += 1;
-            if (self.options.revocation_file != null and
-                self.tick_count % 40 == 0)
+            var transport_stale = false;
             {
-                self.reloadRevocationsLocked() catch |err| {
-                    std.log.warn(
-                        "revocation reload retained prior state: {s}",
-                        .{@errorName(err)},
-                    );
+                self.mutex.lockUncancelable(self.io);
+                defer self.mutex.unlock(self.io);
+                if (self.failed) continue;
+                self.tick_count += 1;
+                if (self.options.revocation_file != null and
+                    self.tick_count % 40 == 0)
+                {
+                    self.reloadRevocationsLocked() catch |err| {
+                        std.log.warn(
+                            "revocation reload retained prior state: {s}",
+                            .{@errorName(err)},
+                        );
+                    };
+                    self.evictRevokedLocked();
+                }
+                self.node.tickProtocol() catch |err| {
+                    std.log.err("tick failure: {s}", .{@errorName(err)});
+                    self.failed = true;
+                    self.failEverything();
+                    continue;
                 };
-                self.evictRevokedLocked();
-            }
-            self.node.tickProtocol() catch |err| {
-                std.log.err("tick failure: {s}", .{@errorName(err)});
-                self.failed = true;
-                self.failEverything();
-                continue;
-            };
-            self.pump();
-            self.reportLeaderChangeLocked();
-            self.wakeWaiters();
-            self.closeExpiredConnections();
+                self.pump();
+                self.reportLeaderChangeLocked();
+                self.wakeWaiters();
+                self.closeExpiredConnections();
 
-            // A member that observes a further-ahead leader asks for the
-            // decided suffix it is missing.
-            if (self.tick_count % 20 == 0 and !self.node.isLeader()) {
-                if (self.node.currentLeader()) |leader| {
-                    if (leader != self.node.identity.node_id and
-                        self.observed_leader_decided > self.node.log.decidedThrough())
-                    {
-                        self.node.requestCatchUp(leader) catch {};
-                        self.pump();
+                // A member that observes a further-ahead leader asks for
+                // the decided suffix it is missing.
+                if (self.tick_count % 20 == 0 and !self.node.isLeader()) {
+                    if (self.node.currentLeader()) |leader| {
+                        if (leader != self.node.identity.node_id and
+                            self.observed_leader_decided > self.node.log.decidedThrough())
+                        {
+                            self.node.requestCatchUp(leader) catch {};
+                            self.pump();
+                        }
                     }
                 }
+                transport_stale = self.transportStaleLocked();
+            }
+            if (transport_stale) {
+                // The decided registry is already durable. If this
+                // in-process swap cannot complete, the process stops and
+                // a clean restart converges from the same durable files;
+                // it never continues on a mixed transport generation.
+                self.rebuildTransport() catch |err| {
+                    std.log.err(
+                        "in-process transport swap failed: {s}; restart to recover",
+                        .{@errorName(err)},
+                    );
+                    std.c._exit(1);
+                };
             }
         }
     }
@@ -1487,6 +1856,14 @@ pub const Server = struct {
             tls.parseNodeCommonName(certificate_name)
         else
             null;
+        var principal: Principal = .anonymous;
+        if (peer_certificate_name) |certificate_name| {
+            if (credential_node_id) |id| {
+                principal = .{ .node = id };
+            } else if (tls.parseAdminCommonName(certificate_name)) |admin| {
+                principal = .{ .admin = AdminName.from(admin) };
+            }
+        }
         if (hello.kind == .peer and self.peerRevoked(hello.node_id)) return;
         if (hello.kind == .client and credential_node_id != null and
             self.peerRevoked(credential_node_id.?))
@@ -1529,7 +1906,7 @@ pub const Server = struct {
             .client => self.clientLoop(stream, reader, writer, if (authenticated) |*session|
                 session
             else
-                null) catch {},
+                null, principal) catch {},
             .enrollment => self.enrollmentExchange(stream, reader, writer, hello) catch {},
         }
     }
@@ -1594,8 +1971,22 @@ pub const Server = struct {
         ) catch return self.writeEnrollmentRefused(writer);
         defer self.gpa.free(certificate);
         var response_buffer: [wire.EnrollmentResponse.max_encoded_size]u8 = undefined;
+        self.mutex.lockUncancelable(self.io);
+        const decided_configuration: u64 = if (self.node.decidedRegistry()) |decided|
+            decided.configuration_id
+        else
+            self.node.identity.configuration_id;
+        const decided_digest: [32]u8 = if (self.node.decidedRegistry()) |decided|
+            decided.digest()
+        else
+            [_]u8{0} ** 32;
+        self.mutex.unlock(self.io);
         const response = wire.EnrollmentResponse{
             .status = .ok,
+            .node_id = request.node_id,
+            .database_id = self.node.identity.database_id,
+            .configuration_id = decided_configuration,
+            .registry_digest = decided_digest,
             .certificate = certificate,
         };
         try wire.writeFrame(
@@ -1619,10 +2010,11 @@ pub const Server = struct {
     }
 
     fn isConfiguredNode(self: *const Server, node_id: paxos.NodeId) bool {
-        for (self.options.members) |member| {
+        const members = self.currentMembers();
+        for (members) |member| {
             if (member.id == node_id and member.role != .gateway) return true;
         }
-        return self.options.members.len == 0 and self.node.identity.node_id == node_id;
+        return members.len == 0 and self.node.identity.node_id == node_id;
     }
 
     fn handleConnectionTracked(self: *Server, stream: std.Io.net.Stream) void {
@@ -1643,12 +2035,28 @@ pub const Server = struct {
         name: [16]u8 = undefined,
         manifest: ?[]u8 = null,
         proof: ?[]u8 = null,
+        /// Fetched decided-registry blob for a joining replacement. It may
+        /// arrive before, during, or after the snapshot frames, so it
+        /// survives transfer resets and is verified against the proof's
+        /// registry digest before installation.
+        registry_blob: ?[]u8 = null,
+        registry_blob_configuration: u64 = 0,
 
         fn reset(self: *InstallState, io: Io, gpa: std.mem.Allocator) void {
             if (self.file) |file| file.close(io);
             if (self.dir) |*dir| dir.close(io);
             if (self.manifest) |manifest| gpa.free(manifest);
             if (self.proof) |proof| gpa.free(proof);
+            const blob = self.registry_blob;
+            const blob_configuration = self.registry_blob_configuration;
+            self.* = .{};
+            self.registry_blob = blob;
+            self.registry_blob_configuration = blob_configuration;
+        }
+
+        fn deinit(self: *InstallState, io: Io, gpa: std.mem.Allocator) void {
+            self.reset(io, gpa);
+            if (self.registry_blob) |blob| gpa.free(blob);
             self.* = .{};
         }
     };
@@ -1666,8 +2074,11 @@ pub const Server = struct {
             if (hello.database_id != self.node.identity.database_id) {
                 return error.DatabaseMismatch;
             }
+            // Admission follows the exact current membership generation: a
+            // node the decided registry removed cannot rejoin, even with a
+            // certificate that is otherwise still valid.
             var known = false;
-            for (self.options.members) |member| {
+            for (self.currentMembers()) |member| {
                 if (member.id == hello.node_id) known = true;
             }
             if (!known) return error.NotMember;
@@ -1677,7 +2088,7 @@ pub const Server = struct {
         }
 
         var install = InstallState{};
-        defer install.reset(self.io, self.gpa);
+        defer install.deinit(self.io, self.gpa);
 
         while (!self.isShutdown()) {
             const frame = try self.readConnectionFrame(
@@ -1715,6 +2126,8 @@ pub const Server = struct {
                     body,
                     hello.node_id,
                 ),
+                .registry_request => self.onRegistryRequest(body, hello.node_id),
+                .registry_data => try self.onRegistryData(body, &install),
                 else => return error.InvalidFrame,
             }
         }
@@ -1956,6 +2369,32 @@ pub const Server = struct {
         self.mutex.unlock(self.io);
         defer handle.close(self.io, self.gpa);
 
+        // Send the decided registry blob ahead of the transfer: a joining
+        // replacement has no predecessor registry to reconstruct from, and
+        // ordering the blob first removes any race with a small snapshot.
+        // The receiver verifies it against its quorum-confirmed proof
+        // digest, so an unneeded or stale blob is harmless.
+        self.mutex.lockUncancelable(self.io);
+        const registry_blob: ?[]u8 = if (self.node.decidedRegistry() != null)
+            self.node.readRegistryBlob(self.gpa, handle.configuration_id) catch null
+        else
+            null;
+        self.mutex.unlock(self.io);
+        if (registry_blob) |blob| {
+            defer self.gpa.free(blob);
+            if (blob.len > 0 and blob.len <= wire.RegistryData.max_blob_bytes) {
+                var body_buffer: [wire.RegistryData.max_encoded_size]u8 = undefined;
+                if ((wire.RegistryData{
+                    .configuration_id = handle.configuration_id,
+                    .blob = blob,
+                }).encode(&body_buffer)) |encoded| {
+                    if (wire.frameAlloc(self.gpa, .registry_data, &.{encoded})) |frame| {
+                        _ = sender.enqueueBackpressure(frame);
+                    } else |_| {}
+                } else |_| {}
+            }
+        }
+
         const begin = wire.SnapshotBegin{
             .configuration_id = handle.configuration_id,
             .name = handle.name,
@@ -2021,6 +2460,7 @@ pub const Server = struct {
         const proof = try checkpoint_proof.decode(begin.proof);
         try self.confirmCheckpointProof(
             proof.sealed_configuration_id,
+            proof.sealedMembersSlice(),
             proof_digest,
             from,
         );
@@ -2045,6 +2485,70 @@ pub const Server = struct {
             install.manifest = null;
         }
         install.proof = try self.gpa.dupe(u8, begin.proof);
+
+        // A joining replacement has no predecessor registry to reconstruct
+        // from: ask the transfer source for the decided blob. The reply
+        // arrives interleaved with the snapshot chunks on this connection.
+        if (self.node.decidedRegistry() == null and
+            !std.mem.eql(
+                u8,
+                &proof.next_registry_digest,
+                &checkpoint_proof.no_registry_digest,
+            ))
+        {
+            self.installation = .transferring;
+            if (self.senderFor(from)) |sender| {
+                var request_buffer: [wire.RegistryRequest.encoded_size]u8 = undefined;
+                const encoded = (wire.RegistryRequest{
+                    .configuration_id = begin.configuration_id,
+                }).encode(&request_buffer);
+                const frame = try wire.frameAlloc(
+                    self.gpa,
+                    .registry_request,
+                    &.{encoded},
+                );
+                sender.enqueue(frame);
+            }
+        }
+    }
+
+    /// Serves a joining replacement's decided-registry fetch. The blob is
+    /// self-authenticating downstream: the receiver checks it against the
+    /// digest its quorum-confirmed proof binds.
+    fn onRegistryRequest(self: *Server, body: []const u8, from: paxos.NodeId) void {
+        const request = wire.RegistryRequest.decode(body) catch return;
+        const sender = self.senderFor(from) orelse return;
+        self.mutex.lockUncancelable(self.io);
+        const blob = self.node.readRegistryBlob(
+            self.gpa,
+            request.configuration_id,
+        ) catch {
+            self.mutex.unlock(self.io);
+            return;
+        };
+        self.mutex.unlock(self.io);
+        defer self.gpa.free(blob);
+        if (blob.len == 0 or blob.len > wire.RegistryData.max_blob_bytes) return;
+        var body_buffer: [wire.RegistryData.max_encoded_size]u8 = undefined;
+        const encoded = (wire.RegistryData{
+            .configuration_id = request.configuration_id,
+            .blob = blob,
+        }).encode(&body_buffer) catch return;
+        const frame = wire.frameAlloc(self.gpa, .registry_data, &.{encoded}) catch
+            return;
+        sender.enqueue(frame);
+    }
+
+    fn onRegistryData(
+        self: *Server,
+        body: []const u8,
+        install: *InstallState,
+    ) !void {
+        const data = wire.RegistryData.decode(body) catch
+            return error.InvalidFrame;
+        if (install.registry_blob) |old| self.gpa.free(old);
+        install.registry_blob = try self.gpa.dupe(u8, data.blob);
+        install.registry_blob_configuration = data.configuration_id;
     }
 
     fn onSnapshotChunk(self: *Server, body: []const u8, install: *InstallState) !void {
@@ -2079,19 +2583,32 @@ pub const Server = struct {
             self.gpa.free(proof);
             install.proof = null;
         }
+        const registry_blob: ?[]const u8 = if (install.registry_blob != null and
+            install.registry_blob_configuration == install.configuration_id)
+            install.registry_blob
+        else
+            null;
 
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         self.snapshot_source = null;
+        if (self.installation == .transferring) self.installation = .verifying;
         self.node.installSnapshot(
             install.configuration_id,
             install.name,
             manifest,
             proof,
+            registry_blob,
         ) catch |err| {
             std.log.warn("snapshot install failed: {s}", .{@errorName(err)});
+            if (self.installation != .not_applicable) self.installation = .failed;
             return;
         };
+        if (self.installation != .not_applicable) {
+            // The verified state is durable and this voter may now send
+            // and receive Paxos traffic in the installed configuration.
+            self.installation = .active;
+        }
         self.observed_leader_decided = 0;
         self.node.requestCatchUp(from) catch {};
         self.pump();
@@ -2100,14 +2617,11 @@ pub const Server = struct {
     fn confirmCheckpointProof(
         self: *Server,
         sealed_configuration_id: u64,
+        sealed_members: []const paxos.NodeId,
         digest: [32]u8,
         source: paxos.NodeId,
     ) !void {
-        var voter_count: usize = 0;
-        for (self.options.members) |member| {
-            if (member.role.capabilities().votes) voter_count += 1;
-        }
-        if (voter_count == 0) return error.CheckpointProofQuorum;
+        if (sealed_members.len == 0) return error.CheckpointProofQuorum;
 
         self.proof_mutex.lockUncancelable(self.io);
         if (self.proof_waiter != null) {
@@ -2122,14 +2636,14 @@ pub const Server = struct {
             .nonce = nonce,
             .sealed_configuration_id = sealed_configuration_id,
             .digest = digest,
-            .needed = voter_count / 2 + 1,
+            .needed = sealed_members.len / 2 + 1,
         };
+        @memcpy(waiter.sealed_members[0..sealed_members.len], sealed_members);
+        waiter.sealed_count = @intCast(sealed_members.len);
         // SnapshotBegin itself is a matching report from its authenticated
-        // source. Count it exactly once when that source is a configured
-        // voter, then probe the remaining voters independently.
-        if (self.addressOf(source)) |member| {
-            if (member.role.capabilities().votes) waiter.noteAck(source);
-        }
+        // source. Count it exactly once when that source is a sealed
+        // voter, then probe the remaining sealed voters independently.
+        waiter.noteAck(source);
         self.proof_waiter = &waiter;
         self.proof_mutex.unlock(self.io);
         defer {
@@ -2145,7 +2659,7 @@ pub const Server = struct {
             .digest = digest,
         }).encode(&probe_buffer);
         for (self.senders.items) |sender| {
-            if (!sender.peer.role.capabilities().votes) continue;
+            if (!waiter.isSealedVoter(sender.peer.id)) continue;
             const frame = try wire.frameAlloc(
                 self.gpa,
                 .checkpoint_proof_request,
@@ -2200,8 +2714,6 @@ pub const Server = struct {
         from: paxos.NodeId,
     ) void {
         const probe = wire.CheckpointProofProbe.decode(body) catch return;
-        const member = self.addressOf(from) orelse return;
-        if (!member.role.capabilities().votes) return;
         self.proof_mutex.lockUncancelable(self.io);
         defer self.proof_mutex.unlock(self.io);
         const waiter = self.proof_waiter orelse return;
@@ -2211,6 +2723,7 @@ pub const Server = struct {
         {
             return;
         }
+        // noteAck admits only distinct members of the sealed voter set.
         waiter.noteAck(from);
     }
 
@@ -2224,6 +2737,7 @@ pub const Server = struct {
         reader: *Io.Reader,
         writer: *Io.Writer,
         authenticated: ?*transport_auth.Session,
+        principal: Principal,
     ) !void {
         while (!self.isShutdown()) {
             const frame = try self.readConnectionFrame(
@@ -2245,7 +2759,7 @@ pub const Server = struct {
                 @memset(response.writer.buffer, 0);
                 response.deinit();
             }
-            self.dispatch(body, &response.writer) catch |err| {
+            self.dispatch(body, principal, &response.writer) catch |err| {
                 response.clearRetainingCapacity();
                 writeErrorResponse(&response.writer, "internal", @errorName(err)) catch {};
             };
@@ -2375,9 +2889,19 @@ pub const Server = struct {
         name: ?[]const u8 = null,
         node_id: ?u32 = null,
         ttl_seconds: ?u64 = null,
+        operation: ?u64 = null,
+        expected_config: ?u64 = null,
+        old_node: ?u32 = null,
+        new_node: ?u32 = null,
+        endpoint: ?[]const u8 = null,
     };
 
-    fn dispatch(self: *Server, body: []const u8, out: *Io.Writer) !void {
+    fn dispatch(
+        self: *Server,
+        body: []const u8,
+        principal: Principal,
+        out: *Io.Writer,
+    ) !void {
         const parsed = std.json.parseFromSlice(Request, self.gpa, body, .{
             .ignore_unknown_fields = true,
         }) catch {
@@ -2410,6 +2934,10 @@ pub const Server = struct {
             return self.opExpireSessions(request, out);
         } else if (std.mem.eql(u8, request.op, "issue-enrollment-token")) {
             return self.opIssueEnrollmentToken(request, out);
+        } else if (std.mem.eql(u8, request.op, "membership")) {
+            return self.opMembership(out);
+        } else if (std.mem.eql(u8, request.op, "replace-voter")) {
+            return self.opReplaceVoter(request, principal, out);
         } else if (std.mem.eql(u8, request.op, "failpoint")) {
             return self.opFailpoint(request, out);
         } else if (std.mem.eql(u8, request.op, "stop")) {
@@ -2475,16 +3003,278 @@ pub const Server = struct {
         );
     }
 
+    /// Returns the admin principal name when this connection may run
+    /// privileged membership operations, or writes the refusal and
+    /// returns null. Requires mutual TLS, an admin certificate, and an
+    /// allow-list entry; development PSK connections are anonymous and
+    /// can never pass.
+    fn authorizeAdmin(
+        self: *Server,
+        principal: Principal,
+        out: *Io.Writer,
+    ) !?AdminName {
+        if (self.options.tls == null) {
+            try writeErrorResponse(
+                out,
+                "privileged_unavailable",
+                "membership operations require mutual TLS",
+            );
+            return null;
+        }
+        const admin = switch (principal) {
+            .admin => |admin| admin,
+            else => {
+                try writeErrorResponse(
+                    out,
+                    "unauthorized",
+                    "membership operations require a zaxon-admin certificate",
+                );
+                return null;
+            },
+        };
+        for (self.options.admin_principals) |name| {
+            if (std.mem.eql(u8, name, admin.slice())) return admin;
+        }
+        try writeErrorResponse(
+            out,
+            "unauthorized",
+            "administrator is not in this server's allow-list",
+        );
+        return null;
+    }
+
+    fn opMembership(self: *Server, out: *Io.Writer) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const decided = self.node.decidedRegistry() orelse {
+            return writeErrorResponse(
+                out,
+                "no_registry",
+                "this node keeps flag-fixed membership and no decided registry",
+            );
+        };
+        const digest_hex = std.fmt.bytesToHex(decided.digest(), .lower);
+        const phase = self.membershipPhase();
+        const quorum_available = self.quorumAvailable();
+        const installation_state = self.installationState();
+        try out.print(
+            "{{\"ok\":true,\"database_id\":\"{x:0>32}\"," ++
+                "\"configuration_id\":{d},\"source\":\"decided\"," ++
+                "\"registry_digest\":\"{s}\"," ++
+                "\"highest_allocated_node_id\":{d},\"phase\":\"{s}\"," ++
+                "\"quorum_available\":{},\"installation_state\":\"{s}\"," ++
+                "\"nodes\":[",
+            .{
+                decided.database_id,
+                decided.configuration_id,
+                &digest_hex,
+                decided.highest_allocated_node_id,
+                phase,
+                quorum_available,
+                installation_state,
+            },
+        );
+        for (decided.nodesSlice(), 0..) |*record, index| {
+            if (index > 0) try out.writeAll(",");
+            try out.print(
+                "{{\"id\":{d},\"role\":\"{s}\",\"endpoint\":\"{s}\"}}",
+                .{ record.id, record.role.name(), record.endpointSlice() },
+            );
+        }
+        try out.writeAll("]}");
+    }
+
+    /// High-level replacement lifecycle phase. `active-degraded` means the
+    /// next configuration is active but the replacement is not yet an
+    /// active voter; it does not imply quorum health — operators read
+    /// `quorum_available` for that fact. Caller holds `mutex`.
+    fn membershipPhase(self: *Server) []const u8 {
+        if (self.retired) return "retired";
+        if (self.node.pendingOperation() catch null) |pending| {
+            return switch (pending.phase) {
+                .prepared => "prepared",
+                .proposed => "proposed",
+            };
+        }
+        if (self.node.rollover_pending or self.node.log.isReconfigured() != null) {
+            return "chosen";
+        }
+        if (self.currentReplacement()) |new_node| {
+            return if (self.replacementActive(new_node))
+                "complete"
+            else
+                "active-degraded";
+        }
+        return "idle";
+    }
+
+    /// The replacement voter that created the current configuration, if
+    /// the newest decided operation did. Caller holds `mutex`.
+    fn currentReplacement(self: *Server) ?paxos.NodeId {
+        const decided = self.node.decidedRegistry() orelse return null;
+        const ring = decided.ringSlice();
+        if (ring.len == 0) return null;
+        const newest = ring[ring.len - 1];
+        if (newest.result_configuration_id != decided.configuration_id) return null;
+        return newest.new_node_id;
+    }
+
+    fn replacementActive(self: *Server, new_node: paxos.NodeId) bool {
+        if (new_node == self.node.identity.node_id) return true;
+        if (self.senderFor(new_node)) |sender| return sender.isConnected();
+        return false;
+    }
+
+    /// Operational observation: recent authenticated peers plus this
+    /// voter can satisfy the configured read and write quorums. It does
+    /// not authorize membership decisions and does not promise that this
+    /// server is the leader. Caller holds `mutex`.
+    fn quorumAvailable(self: *Server) bool {
+        var voters: u16 = 0;
+        var reachable: u16 = 0;
+        const self_id = self.node.identity.node_id;
+        const self_votes = self.node.capabilities.votes;
+        for (self.currentMembers()) |member| {
+            if (!member.role.capabilities().votes) continue;
+            voters += 1;
+            if (member.id == self_id) {
+                if (self_votes and !self.retired) reachable += 1;
+                continue;
+            }
+            if (self.senderFor(member.id)) |sender| {
+                if (sender.isConnected()) reachable += 1;
+            }
+        }
+        if (voters == 0) return self_votes;
+        // The default read and write quorums are both the majority.
+        return reachable >= voters / 2 + 1;
+    }
+
+    /// The replacement voter's installation lifecycle: this node's own
+    /// transfer progress when it is the one joining, otherwise the
+    /// observed state of the decided replacement. Caller holds `mutex`.
+    fn installationState(self: *Server) []const u8 {
+        switch (self.installation) {
+            .not_applicable => {},
+            .transferring => return "transferring",
+            .verifying => return "verifying",
+            .installed => return "installed",
+            .active => return "active",
+            .failed => return "failed",
+        }
+        const new_node = self.currentReplacement() orelse return "not-applicable";
+        if (self.replacementActive(new_node)) return "active";
+        return "not-started";
+    }
+
+    fn opReplaceVoter(
+        self: *Server,
+        request: Request,
+        principal: Principal,
+        out: *Io.Writer,
+    ) !void {
+        if ((try self.authorizeAdmin(principal, out)) == null) return;
+        const operation_id = request.operation orelse
+            return writeErrorResponse(out, "bad_request", "operation is required");
+        const expected_config = request.expected_config orelse
+            return writeErrorResponse(out, "bad_request", "expected_config is required");
+        const old_node = request.old_node orelse
+            return writeErrorResponse(out, "bad_request", "old_node is required");
+        const new_node = request.new_node orelse
+            return writeErrorResponse(out, "bad_request", "new_node is required");
+        const endpoint = request.endpoint orelse
+            return writeErrorResponse(out, "bad_request", "endpoint is required");
+
+        const replacement = registry.ReplacementRequest{
+            .operation_id = operation_id,
+            .expected_configuration_id = expected_config,
+            .old_node_id = old_node,
+            .new_node_id = new_node,
+            .new_endpoint = endpoint,
+        };
+
+        self.mutex.lockUncancelable(self.io);
+        var not_leader = false;
+        var response: enum { none, complete, proposed } = .none;
+        var result_configuration: u64 = 0;
+        var failure: ?anyerror = null;
+        blk: {
+            const decided = self.node.decidedRegistry() orelse {
+                failure = error.NoDecidedRegistry;
+                break :blk;
+            };
+            const disposition = decided.validateRequest(&replacement) catch |err| {
+                failure = err;
+                break :blk;
+            };
+            switch (disposition) {
+                .retry => |done| {
+                    // An idempotent retry of a decided operation reports
+                    // the recorded outcome without proposing anything.
+                    response = .complete;
+                    result_configuration = done.result_configuration_id;
+                    break :blk;
+                },
+                .fresh => {},
+            }
+            if (self.node.log.core.role != .leader) {
+                not_leader = true;
+                break :blk;
+            }
+            if (self.node.pendingOperation() catch null) |pending| {
+                if (pending.operation_id != operation_id) {
+                    failure = error.OperationPending;
+                    break :blk;
+                }
+                if (pending.phase == .proposed) {
+                    response = .proposed;
+                    result_configuration = decided.configuration_id + 1;
+                    break :blk;
+                }
+            }
+            self.node.prepareReplacement(&replacement) catch |err| {
+                failure = err;
+                break :blk;
+            };
+            response = .proposed;
+            result_configuration = decided.configuration_id + 1;
+        }
+        self.mutex.unlock(self.io);
+
+        if (not_leader) return self.writeNotLeader(out);
+        if (failure) |err| {
+            return writeErrorResponse(out, "replace_rejected", @errorName(err));
+        }
+        switch (response) {
+            .none => return writeErrorResponse(out, "internal", "unreachable"),
+            .complete => try out.print(
+                "{{\"ok\":true,\"operation\":{d},\"phase\":\"complete\"," ++
+                    "\"configuration_id\":{d}}}",
+                .{ operation_id, result_configuration },
+            ),
+            .proposed => try out.print(
+                "{{\"ok\":true,\"operation\":{d},\"phase\":\"proposed\"," ++
+                    "\"next_configuration_id\":{d}}}",
+                .{ operation_id, result_configuration },
+            ),
+        }
+    }
+
     fn opStatus(self: *Server, out: *Io.Writer) !void {
         self.mutex.lockUncancelable(self.io);
         const status = self.node.status();
         const leader = self.knownLeader();
+        const phase = self.membershipPhase();
+        const quorum_available = self.quorumAvailable();
+        const installation_state = self.installationState();
         self.mutex.unlock(self.io);
         const chain_hex = std.fmt.bytesToHex(status.chain, .lower);
         try out.print(
             "{{\"ok\":true,\"node_id\":{d},\"database_id\":\"{x:0>32}\"," ++
                 "\"configuration_id\":{d},\"role\":\"{s}\"," ++
                 "\"node_type\":\"{s}\",\"leader\":{?d}," ++
+                "\"phase\":\"{s}\",\"quorum_available\":{}," ++
+                "\"installation_state\":\"{s}\"," ++
                 "\"ballot\":{{\"round\":{d},\"priority\":{d},\"node\":{d}}}," ++
                 "\"decided_slot\":{d},\"applied_slot\":{d}," ++
                 "\"journal_records\":{d},\"epoch_capacity\":{d}," ++
@@ -2493,11 +3283,12 @@ pub const Server = struct {
                 status.node_id,          status.database_id,
                 status.configuration_id, status.role,
                 status.node_type,        leader,
-                status.ballot.round,     status.ballot.priority,
-                status.ballot.node,      status.decided_slot,
-                status.applied_slot,     status.journal_records,
-                status.epoch_capacity,   &chain_hex,
-                status.page_size,
+                phase,                   quorum_available,
+                installation_state,      status.ballot.round,
+                status.ballot.priority,  status.ballot.node,
+                status.decided_slot,     status.applied_slot,
+                status.journal_records,  status.epoch_capacity,
+                &chain_hex,              status.page_size,
             },
         );
         if (status.snapshot) |name| {
@@ -2511,11 +3302,14 @@ pub const Server = struct {
         self.mutex.lockUncancelable(self.io);
         const leader = self.knownLeader();
         const self_id = self.node.identity.node_id;
+        const decided = self.node.decidedRegistry() != null;
         self.mutex.unlock(self.io);
-        try out.writeAll(
-            "{\"ok\":true,\"voter_membership\":\"static\",\"nodes\":[",
+        const source = if (decided) "decided" else "static";
+        try out.print(
+            "{{\"ok\":true,\"voter_membership\":\"{s}\",\"nodes\":[",
+            .{source},
         );
-        for (self.options.members, 0..) |member, index| {
+        for (self.currentMembers(), 0..) |member, index| {
             if (index > 0) try out.writeAll(",");
             const capabilities = member.role.capabilities();
             try out.print(
@@ -3116,6 +3910,10 @@ const PeerSender = struct {
     server: *Server,
     peer: PeerAddress,
     thread: std.Thread = undefined,
+    spawned: bool = false,
+    /// Set by an in-process transport swap; the run loop exits and the
+    /// swap joins the thread before the sender is destroyed.
+    stopped: std.atomic.Value(bool) = .init(false),
     mutex: std.Io.Mutex = .init,
     cond: std.Io.Condition = .init,
     queue: std.ArrayList([]u8) = .empty,
@@ -3165,13 +3963,13 @@ const PeerSender = struct {
         const io = self.server.io;
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        while (self.connected and !self.server.isShutdown() and
+        while (self.connected and !self.shouldStop() and
             (self.queue.items.len + self.gated.items.len >= sender_queue_limit or
                 self.queue_bytes + self.gated_bytes + frame.len > sender_queue_byte_limit))
         {
             self.cond.waitUncancelable(io, &self.mutex);
         }
-        if (!self.connected or self.server.isShutdown()) {
+        if (!self.connected or self.shouldStop()) {
             self.server.gpa.free(frame);
             return false;
         }
@@ -3288,9 +4086,20 @@ const PeerSender = struct {
         self.mutex.unlock(io);
     }
 
+    /// Asks the run loop to exit so a transport swap can join and destroy
+    /// this sender. Wakes both the queue wait and any blocked write.
+    fn requestStop(self: *PeerSender) void {
+        self.stopped.store(true, .release);
+        self.disconnect();
+    }
+
+    fn shouldStop(self: *PeerSender) bool {
+        return self.server.isShutdown() or self.stopped.load(.acquire);
+    }
+
     fn run(self: *PeerSender) void {
         const io = self.server.io;
-        while (!self.server.isShutdown()) {
+        while (!self.shouldStop()) {
             if (self.server.peerRevoked(self.peer.id)) {
                 io.sleep(.fromMilliseconds(200), .awake) catch {};
                 continue;
@@ -3400,10 +4209,10 @@ const PeerSender = struct {
                 self.server.mutex.unlock(self.server.io);
             }
 
-            send_loop: while (!self.server.isShutdown()) {
+            send_loop: while (!self.shouldStop()) {
                 self.mutex.lockUncancelable(io);
                 while (self.queue.items.len == 0 and self.connected) {
-                    if (self.server.isShutdown()) {
+                    if (self.shouldStop()) {
                         self.mutex.unlock(io);
                         break :send_loop;
                     }
@@ -3523,10 +4332,15 @@ test "derive database id is order independent" {
 }
 
 test "connection admission is sized for a small cluster" {
-    const members = [_]PeerAddress{
+    var members = [_]PeerAddress{
         .{ .id = 1, .host = "h", .port = 1 },
         .{ .id = 2, .host = "h", .port = 2 },
         .{ .id = 3, .host = "h", .port = 3 },
+    };
+    var generation = MemberGeneration{
+        .configuration_id = 1,
+        .members = &members,
+        .hosts = &.{},
     };
     var server: Server = undefined;
     server.options = .{
@@ -3535,10 +4349,16 @@ test "connection admission is sized for a small cluster" {
         .listen_port = 0,
         .members = &members,
     };
+    server.membership = .init(&generation);
     try std.testing.expectEqual(@as(usize, 4 * 3 + 16), server.connectionLimit());
     server.options.max_connections = 5;
     try std.testing.expectEqual(@as(usize, 5), server.connectionLimit());
-    server.options.members = &.{};
+    var empty_generation = MemberGeneration{
+        .configuration_id = 1,
+        .members = &.{},
+        .hosts = &.{},
+    };
+    server.membership = .init(&empty_generation);
     server.options.max_connections = 0;
     try std.testing.expectEqual(@as(usize, 16), server.connectionLimit());
 }
@@ -3584,4 +4404,29 @@ test "payload gate releases envelopes only after storage ack" {
     try std.testing.expectEqual(@as(usize, 0), sender.gated.items.len);
     sender.ackPayload(hash);
     try std.testing.expectEqual(@as(usize, 1), sender.queue.items.len);
+}
+
+test "checkpoint proof quorum counts distinct sealed voters only" {
+    var waiter = CheckpointProofWaiter{
+        .nonce = 1,
+        .sealed_configuration_id = 7,
+        .digest = [_]u8{9} ** 32,
+        .needed = 2,
+    };
+    waiter.sealed_members[0] = 1;
+    waiter.sealed_members[1] = 2;
+    waiter.sealed_members[2] = 3;
+    waiter.sealed_count = 3;
+
+    // The proposed next voter never helps satisfy the sealed quorum.
+    waiter.noteAck(4);
+    try std.testing.expectEqual(@as(usize, 0), waiter.ack_count);
+
+    // A sealed voter counts exactly once, however often it confirms.
+    waiter.noteAck(1);
+    waiter.noteAck(1);
+    try std.testing.expectEqual(@as(usize, 1), waiter.ack_count);
+    waiter.noteAck(3);
+    try std.testing.expectEqual(@as(usize, 2), waiter.ack_count);
+    try std.testing.expect(waiter.ack_count >= waiter.needed);
 }

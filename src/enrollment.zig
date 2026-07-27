@@ -347,6 +347,10 @@ pub fn consumeTokenAt(
 pub const EnrolledIdentity = struct {
     credentials: tls.GeneratedCredentials,
     certificate_pem: []u8,
+    /// Decided configuration and registry digest at issuance; a joining
+    /// replacement records them in its data directory's join descriptor.
+    configuration_id: u64 = 0,
+    registry_digest: [32]u8 = [_]u8{0} ** 32,
 
     pub fn deinit(self: *EnrolledIdentity, gpa: std.mem.Allocator) void {
         self.credentials.deinit(gpa);
@@ -389,25 +393,33 @@ pub fn requestCertificate(
         return error.TlsPeerUnverified;
     }
 
-    const cert_pem = try performEnrollmentExchange(gpa, &tls_stream, bundle, credentials.csr_pem);
+    const exchanged = try performEnrollmentExchange(gpa, &tls_stream, bundle, credentials.csr_pem);
     try tls.validateIssuedIdentity(
-        cert_pem,
+        exchanged.certificate_pem,
         credentials.private_key_pem,
         bundle.node_id,
         bundle.ca_pem,
     );
     return .{
         .credentials = credentials,
-        .certificate_pem = cert_pem,
+        .certificate_pem = exchanged.certificate_pem,
+        .configuration_id = exchanged.configuration_id,
+        .registry_digest = exchanged.registry_digest,
     };
 }
+
+const ExchangeResult = struct {
+    certificate_pem: []u8,
+    configuration_id: u64,
+    registry_digest: [32]u8,
+};
 
 fn performEnrollmentExchange(
     gpa: std.mem.Allocator,
     tls_stream: *tls.Stream,
     bundle: Bundle,
     csr_pem: []const u8,
-) ![]u8 {
+) !ExchangeResult {
     var hello_buffer: [wire.Hello.encoded_size]u8 = undefined;
     const hello = wire.Hello{
         .version = wire.protocol_version,
@@ -440,7 +452,18 @@ fn performEnrollmentExchange(
     defer gpa.free(body);
     const response = try wire.EnrollmentResponse.decode(body);
     if (response.status != .ok) return error.EnrollmentRefused;
-    return try gpa.dupe(u8, response.certificate);
+    // The response binding must name exactly the identity this bundle
+    // authorized; a mismatch means a confused or hostile issuer.
+    if (response.node_id != bundle.node_id or
+        response.database_id != bundle.database_id)
+    {
+        return error.EnrollmentRefused;
+    }
+    return .{
+        .certificate_pem = try gpa.dupe(u8, response.certificate),
+        .configuration_id = response.configuration_id,
+        .registry_digest = response.registry_digest,
+    };
 }
 
 /// Installs all three PEM files as one directory rename. A crash exposes either

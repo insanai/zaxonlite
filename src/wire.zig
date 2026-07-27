@@ -22,12 +22,15 @@ const paxos = @import("paxos");
 const types = @import("types.zig");
 const command = @import("command.zig");
 
-/// Version 6 adds the bounded one-time-token/CSR enrollment exchange.
+/// Version 7 adds decided-registry membership: checkpoint proof v2 with
+/// sealed and next voter sets, the next-registry digest, and the voter
+/// replacement operation surface.
+/// Version 6 added the bounded one-time-token/CSR enrollment exchange.
 /// Version 5 added voter quorum confirmation for transferred checkpoint
 /// proofs. Older peers are deliberately rejected:
 /// silently falling back would turn a configuration error into a security
 /// downgrade.
-pub const protocol_version: u16 = 6;
+pub const protocol_version: u16 = 7;
 
 /// Upper bound for one frame body; larger frames are a protocol error.
 pub const max_frame_bytes: u32 = 64 * 1024 * 1024;
@@ -66,6 +69,8 @@ pub const FrameKind = enum(u8) {
     checkpoint_proof_reply = 22,
     enrollment_request = 23,
     enrollment_response = 24,
+    registry_request = 25,
+    registry_data = 26,
 };
 
 pub const EnrollmentRequest = struct {
@@ -118,48 +123,127 @@ pub const EnrollmentRequest = struct {
     }
 };
 
+/// The enrollment reply binds the issued certificate to the identity it
+/// authorizes: database, node ID, the decided configuration, and the
+/// decided registry digest a joining replacement later verifies its
+/// fetched registry against.
 pub const EnrollmentResponse = struct {
     status: Status,
+    node_id: paxos.NodeId = 0,
+    database_id: u128 = 0,
+    configuration_id: u64 = 0,
+    registry_digest: [32]u8 = [_]u8{0} ** 32,
     certificate: []const u8 = &.{},
 
     pub const Status = enum(u8) {
         ok = 0,
         refused = 1,
     };
+    const binding_size = 1 + 4 + 16 + 8 + 32;
     pub const max_certificate_bytes: usize = 64 * 1024;
-    pub const max_encoded_size: usize = 1 + max_certificate_bytes;
+    pub const max_encoded_size: usize = binding_size + max_certificate_bytes;
 
     pub fn encode(
         self: EnrollmentResponse,
         buffer: *[max_encoded_size]u8,
     ) WireError![]const u8 {
-        if (self.status == .ok and (self.certificate.len == 0 or
-            self.certificate.len > max_certificate_bytes))
+        if (self.status == .refused) {
+            if (self.certificate.len != 0) return error.InvalidFrame;
+            buffer[0] = @intFromEnum(self.status);
+            return buffer[0..1];
+        }
+        if (self.certificate.len == 0 or
+            self.certificate.len > max_certificate_bytes or
+            self.node_id == 0 or self.database_id == 0 or
+            self.configuration_id == 0)
         {
             return error.InvalidFrame;
         }
-        if (self.status == .refused and self.certificate.len != 0) {
-            return error.InvalidFrame;
-        }
-        buffer[0] = @intFromEnum(self.status);
-        @memcpy(buffer[1..][0..self.certificate.len], self.certificate);
-        std.debug.assert(1 + self.certificate.len <= max_encoded_size);
-        const encoded = buffer[0 .. 1 + self.certificate.len];
-        std.debug.assert(encoded.len <= max_encoded_size);
-        return encoded;
+        var cursor = types.Cursor{ .buffer = buffer };
+        cursor.byte(@intFromEnum(self.status));
+        cursor.int(u32, self.node_id);
+        cursor.int(u128, self.database_id);
+        cursor.int(u64, self.configuration_id);
+        cursor.bytes(&self.registry_digest);
+        cursor.bytes(self.certificate);
+        std.debug.assert(cursor.offset <= max_encoded_size);
+        return buffer[0..cursor.offset];
     }
 
     pub fn decode(body: []const u8) WireError!EnrollmentResponse {
         if (body.len == 0 or body.len > max_encoded_size) return error.InvalidFrame;
         const status = std.enums.fromInt(Status, body[0]) orelse
             return error.InvalidFrame;
-        const certificate = body[1..];
-        if ((status == .ok and certificate.len == 0) or
-            (status == .refused and certificate.len != 0))
+        if (status == .refused) {
+            if (body.len != 1) return error.InvalidFrame;
+            return .{ .status = status };
+        }
+        if (body.len <= binding_size) return error.InvalidFrame;
+        var reader = types.ReadCursor{ .buffer = body };
+        _ = reader.byte() catch unreachable;
+        const response = EnrollmentResponse{
+            .status = status,
+            .node_id = reader.int(u32) catch return error.InvalidFrame,
+            .database_id = reader.int(u128) catch return error.InvalidFrame,
+            .configuration_id = reader.int(u64) catch return error.InvalidFrame,
+            .registry_digest = ((reader.take(32) catch
+                return error.InvalidFrame)[0..32]).*,
+            .certificate = body[binding_size..],
+        };
+        if (response.node_id == 0 or response.database_id == 0 or
+            response.configuration_id == 0)
         {
             return error.InvalidFrame;
         }
-        return .{ .status = status, .certificate = certificate };
+        return response;
+    }
+};
+
+/// Asks a current member for the canonical decided-registry blob of one
+/// configuration. Sent by a joining replacement during snapshot install.
+pub const RegistryRequest = struct {
+    configuration_id: u64,
+
+    pub const encoded_size = 8;
+
+    pub fn encode(self: RegistryRequest, buffer: *[encoded_size]u8) []const u8 {
+        std.mem.writeInt(u64, buffer[0..8], self.configuration_id, .little);
+        return buffer;
+    }
+
+    pub fn decode(body: []const u8) WireError!RegistryRequest {
+        if (body.len != encoded_size) return error.InvalidFrame;
+        const configuration_id = std.mem.readInt(u64, body[0..8], .little);
+        if (configuration_id == 0) return error.InvalidFrame;
+        return .{ .configuration_id = configuration_id };
+    }
+};
+
+/// One stored decided-registry blob (canonical bytes plus its digest
+/// trailer). The receiver verifies it against the digest the chosen stop
+/// sign bound before trusting a single byte.
+pub const RegistryData = struct {
+    configuration_id: u64,
+    blob: []const u8,
+
+    pub const max_blob_bytes: usize = 8 * 1024;
+    pub const max_encoded_size: usize = 8 + max_blob_bytes;
+
+    pub fn encode(self: RegistryData, buffer: *[max_encoded_size]u8) WireError![]const u8 {
+        if (self.blob.len == 0 or self.blob.len > max_blob_bytes) {
+            return error.InvalidFrame;
+        }
+        var cursor = types.Cursor{ .buffer = buffer };
+        cursor.int(u64, self.configuration_id);
+        cursor.bytes(self.blob);
+        return buffer[0..cursor.offset];
+    }
+
+    pub fn decode(body: []const u8) WireError!RegistryData {
+        if (body.len <= 8 or body.len > max_encoded_size) return error.InvalidFrame;
+        const configuration_id = std.mem.readInt(u64, body[0..8], .little);
+        if (configuration_id == 0) return error.InvalidFrame;
+        return .{ .configuration_id = configuration_id, .blob = body[8..] };
     }
 };
 
@@ -508,7 +592,7 @@ pub const SnapshotBegin = struct {
     proof: []const u8,
 
     pub const max_manifest_bytes = 4096;
-    pub const max_proof_bytes = 512;
+    pub const max_proof_bytes = 768;
     pub const max_encoded_size = 8 + 16 + 8 + 4 + max_manifest_bytes +
         2 + max_proof_bytes;
 
@@ -927,16 +1011,35 @@ test "enrollment request and response are bounded" {
     try testing.expectEqualStrings(request.csr, decoded.csr);
 
     var response_buffer: [EnrollmentResponse.max_encoded_size]u8 = undefined;
-    const response = EnrollmentResponse{ .status = .ok, .certificate = "cert" };
+    const response = EnrollmentResponse{
+        .status = .ok,
+        .node_id = 3,
+        .database_id = 91,
+        .configuration_id = 7,
+        .registry_digest = [_]u8{0x5c} ** 32,
+        .certificate = "cert",
+    };
     const decoded_response = try EnrollmentResponse.decode(
         try response.encode(&response_buffer),
     );
     try testing.expectEqual(EnrollmentResponse.Status.ok, decoded_response.status);
+    try testing.expectEqual(@as(u32, 3), decoded_response.node_id);
+    try testing.expectEqual(@as(u128, 91), decoded_response.database_id);
+    try testing.expectEqual(@as(u64, 7), decoded_response.configuration_id);
+    try testing.expectEqual([_]u8{0x5c} ** 32, decoded_response.registry_digest);
     try testing.expectEqualStrings("cert", decoded_response.certificate);
     try testing.expectError(
         error.InvalidFrame,
         EnrollmentResponse.decode(&.{@intFromEnum(EnrollmentResponse.Status.ok)}),
     );
+
+    var registry_buffer: [RegistryData.max_encoded_size]u8 = undefined;
+    const registry_data = RegistryData{ .configuration_id = 7, .blob = "blob" };
+    const decoded_registry = try RegistryData.decode(
+        try registry_data.encode(&registry_buffer),
+    );
+    try testing.expectEqual(@as(u64, 7), decoded_registry.configuration_id);
+    try testing.expectEqualStrings("blob", decoded_registry.blob);
 }
 
 test "frame alloc produces a parseable frame" {

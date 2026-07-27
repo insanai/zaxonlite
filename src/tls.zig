@@ -244,6 +244,34 @@ pub fn parseNodeCommonName(name: []const u8) ?u32 {
     return if (id == 0) null else id;
 }
 
+/// Upper bound for one administrator principal name.
+pub const max_admin_name = 32;
+
+/// Administrator principals use a distinct name shape, `zaxon-admin-<name>`,
+/// issued by the same cluster CA. The namespaces never overlap: a node
+/// certificate can never authorize a membership operation, and an admin
+/// certificate can never authenticate as a storage node.
+pub fn adminCommonName(buffer: *[max_common_name]u8, name: []const u8) []const u8 {
+    return std.fmt.bufPrint(buffer, "zaxon-admin-{s}", .{name}) catch
+        unreachable;
+}
+
+/// Parses an administrator certificate name: `zaxon-admin-<name>` with a
+/// nonempty lowercase `[a-z0-9-]` name of at most 32 bytes.
+pub fn parseAdminCommonName(name: []const u8) ?[]const u8 {
+    const prefix = "zaxon-admin-";
+    if (!std.mem.startsWith(u8, name, prefix)) return null;
+    const suffix = name[prefix.len..];
+    if (suffix.len == 0 or suffix.len > max_admin_name) return null;
+    for (suffix) |byte| {
+        switch (byte) {
+            'a'...'z', '0'...'9', '-' => {},
+            else => return null,
+        }
+    }
+    return suffix;
+}
+
 fn pathZ(buffer: *[std.Io.Dir.max_path_bytes]u8, path: []const u8) Error![:0]const u8 {
     return std.fmt.bufPrintZ(buffer, "{s}", .{path}) catch
         return error.NameTooLong;
@@ -873,6 +901,22 @@ test "node common name parser rejects client principals" {
     try testing.expectEqual(@as(?u32, null), parseNodeCommonName("zaxon-client"));
     try testing.expectEqual(@as(?u32, null), parseNodeCommonName("zaxon-node-0"));
     try testing.expectEqual(@as(?u32, null), parseNodeCommonName("zaxon-node-x"));
+}
+
+test "admin common name parser accepts only the admin namespace" {
+    try testing.expectEqualStrings("ops-1", parseAdminCommonName("zaxon-admin-ops-1").?);
+    try testing.expectEqual(@as(?[]const u8, null), parseAdminCommonName("zaxon-node-3"));
+    try testing.expectEqual(@as(?[]const u8, null), parseAdminCommonName("zaxon-admin-"));
+    try testing.expectEqual(@as(?[]const u8, null), parseAdminCommonName("zaxon-admin-Ops"));
+    try testing.expectEqual(
+        @as(?[]const u8, null),
+        parseAdminCommonName("zaxon-admin-" ++ "a" ** 33),
+    );
+    // The namespaces never overlap.
+    try testing.expectEqual(@as(?u32, null), parseNodeCommonName("zaxon-admin-ops"));
+
+    var buffer: [max_common_name]u8 = undefined;
+    try testing.expectEqualStrings("zaxon-admin-ops", adminCommonName(&buffer, "ops"));
 }
 
 test "enrollment key stays local and CSR binds the requested node" {
