@@ -567,6 +567,7 @@ pub fn serve(
         .node = node,
         .options = options,
         .membership = .init(initial_generation),
+        .transport_configuration_id = initial_generation.configuration_id,
         .held = std.AutoHashMap(command.HashBytes, Held).init(gpa),
     };
     defer server.deinit();
@@ -926,11 +927,19 @@ pub const Server = struct {
         active,
         failed,
     } = .not_applicable,
+    installation_failure: ?anyerror = null,
+    /// Explicit durable-readiness evidence received from the replacement.
+    /// Connection state alone never changes installation status.
+    replacement_ready_node: ?paxos.NodeId = null,
+    replacement_ready_configuration: u64 = 0,
     listener: ?std.Io.net.Server = null,
     senders: std.ArrayList(*PeerSender) = .empty,
     /// The active transport-membership generation; swapped atomically by
     /// `rebuildTransport` after a decided membership change.
     membership: std.atomic.Value(*const MemberGeneration),
+    /// Configuration whose sender and admission generation is published.
+    /// Paxos envelopes are held while Node rollover runs ahead of it.
+    transport_configuration_id: u64,
     /// Every generation ever published, owned until shutdown so borrowed
     /// member records never dangle across a swap.
     member_generations: std.ArrayList(*MemberGeneration) = .empty,
@@ -1059,8 +1068,8 @@ pub const Server = struct {
         self.revoked_count = count;
     }
 
-    /// Consensus membership remains static in this release; this transport
-    /// denylist is the immediate operational override for a compromised node.
+    /// The decided registry owns consensus membership. This transport denylist
+    /// is the immediate operational override for a compromised node.
     fn evictRevokedLocked(self: *Server) void {
         for (self.active_connections.items) |connection| {
             const peer = connection.credential_node_id orelse continue;
@@ -1151,9 +1160,20 @@ pub const Server = struct {
     /// distribute chosen values to every storage node; learners only need
     /// return paths to voters for payload ACKs and requests.
     fn buildSenders(self: *Server) !void {
+        try self.buildSendersFor(
+            self.membership.load(.acquire),
+            &self.senders,
+        );
+    }
+
+    fn buildSendersFor(
+        self: *Server,
+        generation: *const MemberGeneration,
+        senders: *std.ArrayList(*PeerSender),
+    ) !void {
         const self_votes = self.node.capabilities.votes;
         const self_id = self.node.identity.node_id;
-        for (self.currentMembers()) |member| {
+        for (generation.members) |member| {
             if (member.id == self_id) continue;
             if (!member.role.capabilities().stores_log) continue;
             if (!self_votes and !member.role.capabilities().votes) continue;
@@ -1161,7 +1181,11 @@ pub const Server = struct {
             sender.* = .{ .server = self, .peer = member };
             sender.stored_payloads =
                 std.AutoHashMap(command.HashBytes, void).init(self.gpa);
-            try self.senders.append(self.gpa, sender);
+            senders.append(self.gpa, sender) catch |err| {
+                sender.deinit();
+                self.gpa.destroy(sender);
+                return err;
+            };
         }
     }
 
@@ -1207,19 +1231,37 @@ pub const Server = struct {
             self.mutex.unlock(self.io);
             return err;
         };
-        self.member_generations.append(self.gpa, next) catch |err| {
+        var next_senders: std.ArrayList(*PeerSender) = .empty;
+        self.buildSendersFor(next, &next_senders) catch |err| {
+            for (next_senders.items) |sender| {
+                sender.deinit();
+                self.gpa.destroy(sender);
+            }
+            next_senders.deinit(self.gpa);
             next.destroy(self.gpa);
             self.mutex.unlock(self.io);
             return err;
         };
-        self.membership.store(next, .release);
+        self.member_generations.append(self.gpa, next) catch |err| {
+            for (next_senders.items) |sender| {
+                sender.deinit();
+                self.gpa.destroy(sender);
+            }
+            next_senders.deinit(self.gpa);
+            next.destroy(self.gpa);
+            self.mutex.unlock(self.io);
+            return err;
+        };
         failpoint.hit("before_transport_swap");
 
-        // Detach the old sender set under the lock; concurrent iterators
-        // observe an empty list and protocol retransmission recovers any
-        // frame dropped during the swap.
+        // Publish the complete next generation in one locked transition.
+        // New-epoch Paxos remains disabled until the old senders stop.
         var old_senders = self.senders;
-        self.senders = .empty;
+        self.senders = next_senders;
+        self.membership.store(next, .release);
+        self.transport_configuration_id = next.configuration_id;
+        self.replacement_ready_node = null;
+        self.replacement_ready_configuration = 0;
 
         // Close inbound connections from nodes the registry removed, and
         // from stale anonymous peers; established client connections keep
@@ -1249,10 +1291,18 @@ pub const Server = struct {
         failpoint.hit("after_transport_teardown");
 
         self.mutex.lockUncancelable(self.io);
-        const build_result = self.buildSenders();
+        if (self.installation == .installed) self.installation = .active;
         self.mutex.unlock(self.io);
-        try build_result;
         try self.spawnSenders();
+        self.mutex.lockUncancelable(self.io);
+        const activate_result = self.node.activateRollover();
+        if (activate_result) |_| {
+            self.pump();
+        } else |err| {
+            self.mutex.unlock(self.io);
+            return err;
+        }
+        self.mutex.unlock(self.io);
         failpoint.hit("after_transport_swap");
         std.log.info(
             "node {d}: transport rebuilt for configuration {d}",
@@ -1424,10 +1474,15 @@ pub const Server = struct {
         if (!self.retired and self.node.rollover_pending and
             self.node.log.isReconfigured() != null)
         {
-            if (self.node.completeClusterRollover()) |_| {
+            if (self.node.completeClusterRolloverDeferred()) |_| {
                 self.checkpoint_started = false;
                 self.observed_leader_decided = 0;
-                try self.drainOutbox();
+                if (!self.transportStaleLocked()) {
+                    self.transport_configuration_id =
+                        self.node.identity.configuration_id;
+                    try self.node.activateRollover();
+                    try self.drainOutbox();
+                }
             } else |err| switch (err) {
                 error.SnapshotDigestMismatch, error.NotCaughtUp => {
                     // Fall back to a full snapshot transfer from the leader.
@@ -1512,6 +1567,9 @@ pub const Server = struct {
             }
             index += 1;
         }
+        for (self.senders.items) |sender| {
+            self.advertiseInstallationReady(sender);
+        }
     }
 
     fn failEverything(self: *Server) void {
@@ -1540,6 +1598,7 @@ pub const Server = struct {
     /// envelope stays in its bounded missing-payload gate until storage ends.
     fn drainOutbox(self: *Server) !void {
         const configuration_id = self.node.identity.configuration_id;
+        if (configuration_id != self.transport_configuration_id) return;
         for (self.node.outbox.items) |envelope| {
             const sender = self.senderFor(envelope.to) orelse continue;
             var payload_precedes_envelope = false;
@@ -2128,9 +2187,25 @@ pub const Server = struct {
                 ),
                 .registry_request => self.onRegistryRequest(body, hello.node_id),
                 .registry_data => try self.onRegistryData(body, &install),
+                .installation_ready => try self.onInstallationReady(body, hello.node_id),
                 else => return error.InvalidFrame,
             }
         }
+    }
+
+    fn onInstallationReady(self: *Server, body: []const u8, from: paxos.NodeId) !void {
+        const ready = try wire.InstallationReady.decode(body);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const decided = self.node.decidedRegistry() orelse return error.InvalidFrame;
+        const replacement = self.currentReplacement() orelse return error.InvalidFrame;
+        if (from != replacement or ready.configuration_id != decided.configuration_id or
+            !std.mem.eql(u8, &ready.registry_digest, &decided.digest()))
+        {
+            return error.InvalidFrame;
+        }
+        self.replacement_ready_node = from;
+        self.replacement_ready_configuration = ready.configuration_id;
     }
 
     fn onEnvelopeFrame(self: *Server, body: []const u8, from: paxos.NodeId) !void {
@@ -2154,6 +2229,7 @@ pub const Server = struct {
             }
             return;
         }
+        if (local_configuration != self.transport_configuration_id) return;
 
         switch (envelope.message) {
             .heartbeat => |m| {
@@ -2601,13 +2677,17 @@ pub const Server = struct {
             registry_blob,
         ) catch |err| {
             std.log.warn("snapshot install failed: {s}", .{@errorName(err)});
-            if (self.installation != .not_applicable) self.installation = .failed;
+            if (self.installation != .not_applicable) {
+                self.installation = .failed;
+                self.installation_failure = err;
+            }
             return;
         };
         if (self.installation != .not_applicable) {
-            // The verified state is durable and this voter may now send
-            // and receive Paxos traffic in the installed configuration.
-            self.installation = .active;
+            // The image is durable. It becomes active only after the
+            // matching transport generation has been published.
+            self.installation = .installed;
+            self.installation_failure = null;
         }
         self.observed_leader_decided = 0;
         self.node.requestCatchUp(from) catch {};
@@ -3054,16 +3134,17 @@ pub const Server = struct {
             );
         };
         const digest_hex = std.fmt.bytesToHex(decided.digest(), .lower);
-        const phase = self.membershipPhase();
+        const pending = try self.node.pendingOperation();
+        const phase = try self.membershipPhase();
         const quorum_available = self.quorumAvailable();
         const installation_state = self.installationState();
+        const installation_error = self.installationError();
         try out.print(
             "{{\"ok\":true,\"database_id\":\"{x:0>32}\"," ++
                 "\"configuration_id\":{d},\"source\":\"decided\"," ++
                 "\"registry_digest\":\"{s}\"," ++
                 "\"highest_allocated_node_id\":{d},\"phase\":\"{s}\"," ++
-                "\"quorum_available\":{},\"installation_state\":\"{s}\"," ++
-                "\"nodes\":[",
+                "\"quorum_available\":{},\"installation_state\":\"{s}\",",
             .{
                 decided.database_id,
                 decided.configuration_id,
@@ -3074,6 +3155,8 @@ pub const Server = struct {
                 installation_state,
             },
         );
+        try writeMembershipOperation(out, pending, installation_error);
+        try out.writeAll(",\"nodes\":[");
         for (decided.nodesSlice(), 0..) |*record, index| {
             if (index > 0) try out.writeAll(",");
             try out.print(
@@ -3088,16 +3171,16 @@ pub const Server = struct {
     /// next configuration is active but the replacement is not yet an
     /// active voter; it does not imply quorum health — operators read
     /// `quorum_available` for that fact. Caller holds `mutex`.
-    fn membershipPhase(self: *Server) []const u8 {
+    fn membershipPhase(self: *Server) ![]const u8 {
         if (self.retired) return "retired";
-        if (self.node.pendingOperation() catch null) |pending| {
+        if (self.node.rollover_pending or self.node.log.isReconfigured() != null) {
+            return "chosen";
+        }
+        if (try self.node.pendingOperation()) |pending| {
             return switch (pending.phase) {
                 .prepared => "prepared",
                 .proposed => "proposed",
             };
-        }
-        if (self.node.rollover_pending or self.node.log.isReconfigured() != null) {
-            return "chosen";
         }
         if (self.currentReplacement()) |new_node| {
             return if (self.replacementActive(new_node))
@@ -3112,17 +3195,48 @@ pub const Server = struct {
     /// the newest decided operation did. Caller holds `mutex`.
     fn currentReplacement(self: *Server) ?paxos.NodeId {
         const decided = self.node.decidedRegistry() orelse return null;
-        const ring = decided.ringSlice();
-        if (ring.len == 0) return null;
-        const newest = ring[ring.len - 1];
+        const newest = decided.newestOperation() orelse return null;
         if (newest.result_configuration_id != decided.configuration_id) return null;
         return newest.new_node_id;
     }
 
     fn replacementActive(self: *Server, new_node: paxos.NodeId) bool {
-        if (new_node == self.node.identity.node_id) return true;
-        if (self.senderFor(new_node)) |sender| return sender.isConnected();
-        return false;
+        if (new_node == self.node.identity.node_id) {
+            const decided = self.node.decidedRegistry() orelse return false;
+            return self.node.identity.configuration_id == decided.configuration_id and
+                self.transport_configuration_id == decided.configuration_id;
+        }
+        return self.replacement_ready_node == new_node and
+            self.replacement_ready_configuration == self.node.identity.configuration_id;
+    }
+
+    /// Announces only local durable state. The receiver binds it to the
+    /// decided replacement ID, configuration, and registry digest.
+    fn advertiseInstallationReady(self: *Server, sender: *PeerSender) void {
+        const decided = self.node.decidedRegistry() orelse return;
+        const replacement = self.currentReplacement() orelse return;
+        if (replacement != self.node.identity.node_id or
+            self.node.identity.configuration_id != decided.configuration_id or
+            self.transport_configuration_id != decided.configuration_id)
+        {
+            return;
+        }
+        if (sender.ready_advertised_configuration == decided.configuration_id) {
+            return;
+        }
+        var body: [wire.InstallationReady.encoded_size]u8 = undefined;
+        const ready = wire.InstallationReady{
+            .configuration_id = decided.configuration_id,
+            .registry_digest = decided.digest(),
+        };
+        const frame = wire.frameAlloc(
+            self.gpa,
+            .installation_ready,
+            &.{ready.encode(&body)},
+        ) catch return;
+        if (sender.enqueueChecked(frame)) {
+            sender.ready_advertised_configuration = decided.configuration_id;
+        }
     }
 
     /// Operational observation: recent authenticated peers plus this
@@ -3134,15 +3248,22 @@ pub const Server = struct {
         var reachable: u16 = 0;
         const self_id = self.node.identity.node_id;
         const self_votes = self.node.capabilities.votes;
+        const replacement = self.currentReplacement();
         for (self.currentMembers()) |member| {
             if (!member.role.capabilities().votes) continue;
             voters += 1;
             if (member.id == self_id) {
-                if (self_votes and !self.retired) reachable += 1;
+                const ready = replacement == null or
+                    self_id != replacement.? or
+                    self.replacementActive(self_id);
+                if (ready and self_votes and !self.retired) reachable += 1;
                 continue;
             }
             if (self.senderFor(member.id)) |sender| {
-                if (sender.isConnected()) reachable += 1;
+                const ready = replacement == null or
+                    member.id != replacement.? or
+                    self.replacementActive(member.id);
+                if (ready and sender.isConnected()) reachable += 1;
             }
         }
         if (voters == 0) return self_votes;
@@ -3166,6 +3287,18 @@ pub const Server = struct {
         if (self.replacementActive(new_node)) return "active";
         return "not-started";
     }
+
+    fn installationError(self: *const Server) ?[]const u8 {
+        const err = self.installation_failure orelse return null;
+        return @errorName(err);
+    }
+
+    const ReplacementOutcome = union(enum) {
+        not_leader,
+        complete: u64,
+        proposed: u64,
+        rejected: anyerror,
+    };
 
     fn opReplaceVoter(
         self: *Server,
@@ -3194,79 +3327,74 @@ pub const Server = struct {
         };
 
         self.mutex.lockUncancelable(self.io);
-        var not_leader = false;
-        var response: enum { none, complete, proposed } = .none;
-        var result_configuration: u64 = 0;
-        var failure: ?anyerror = null;
-        blk: {
-            const decided = self.node.decidedRegistry() orelse {
-                failure = error.NoDecidedRegistry;
-                break :blk;
-            };
-            const disposition = decided.validateRequest(&replacement) catch |err| {
-                failure = err;
-                break :blk;
-            };
-            switch (disposition) {
-                .retry => |done| {
-                    // An idempotent retry of a decided operation reports
-                    // the recorded outcome without proposing anything.
-                    response = .complete;
-                    result_configuration = done.result_configuration_id;
-                    break :blk;
-                },
-                .fresh => {},
-            }
-            if (self.node.log.core.role != .leader) {
-                not_leader = true;
-                break :blk;
-            }
-            if (self.node.pendingOperation() catch null) |pending| {
-                if (pending.operation_id != operation_id) {
-                    failure = error.OperationPending;
-                    break :blk;
-                }
-                if (pending.phase == .proposed) {
-                    response = .proposed;
-                    result_configuration = decided.configuration_id + 1;
-                    break :blk;
-                }
-            }
-            self.node.prepareReplacement(&replacement) catch |err| {
-                failure = err;
-                break :blk;
-            };
-            response = .proposed;
-            result_configuration = decided.configuration_id + 1;
-        }
+        const outcome = self.replaceVoterLocked(&replacement);
         self.mutex.unlock(self.io);
 
-        if (not_leader) return self.writeNotLeader(out);
-        if (failure) |err| {
-            return writeErrorResponse(out, "replace_rejected", @errorName(err));
-        }
-        switch (response) {
-            .none => return writeErrorResponse(out, "internal", "unreachable"),
-            .complete => try out.print(
+        switch (outcome) {
+            .not_leader => return self.writeNotLeader(out),
+            .rejected => |err| return writeReplacementError(out, err),
+            .complete => |configuration_id| try out.print(
                 "{{\"ok\":true,\"operation\":{d},\"phase\":\"complete\"," ++
                     "\"configuration_id\":{d}}}",
-                .{ operation_id, result_configuration },
+                .{ operation_id, configuration_id },
             ),
-            .proposed => try out.print(
+            .proposed => |configuration_id| try out.print(
                 "{{\"ok\":true,\"operation\":{d},\"phase\":\"proposed\"," ++
                     "\"next_configuration_id\":{d}}}",
-                .{ operation_id, result_configuration },
+                .{ operation_id, configuration_id },
             ),
         }
+    }
+
+    fn replaceVoterLocked(
+        self: *Server,
+        replacement: *const registry.ReplacementRequest,
+    ) ReplacementOutcome {
+        const decided = self.node.decidedRegistry() orelse
+            return .{ .rejected = error.NoDecidedRegistry };
+        const disposition = decided.validateRequest(replacement) catch |err|
+            return .{ .rejected = err };
+        switch (disposition) {
+            .retry => |done| return .{
+                .complete = done.result_configuration_id,
+            },
+            .fresh => {},
+        }
+        if (self.node.log.core.role != .leader) return .not_leader;
+        const pending = self.node.pendingOperation() catch |err|
+            return .{ .rejected = err };
+        if (pending) |record| {
+            if (!record.matches(replacement)) {
+                const err = if (record.operation_id == replacement.operation_id)
+                    error.OperationConflict
+                else
+                    error.OperationPending;
+                return .{ .rejected = err };
+            }
+            if (record.phase == .proposed) {
+                return .{ .proposed = decided.configuration_id + 1 };
+            }
+        }
+        self.node.prepareReplacement(replacement) catch |err|
+            return .{ .rejected = err };
+        return .{ .proposed = decided.configuration_id + 1 };
     }
 
     fn opStatus(self: *Server, out: *Io.Writer) !void {
         self.mutex.lockUncancelable(self.io);
         const status = self.node.status();
         const leader = self.knownLeader();
-        const phase = self.membershipPhase();
+        const pending = self.node.pendingOperation() catch |err| {
+            self.mutex.unlock(self.io);
+            return writeErrorResponse(out, "corrupt_pending_operation", @errorName(err));
+        };
+        const phase = self.membershipPhase() catch |err| {
+            self.mutex.unlock(self.io);
+            return writeErrorResponse(out, "corrupt_pending_operation", @errorName(err));
+        };
         const quorum_available = self.quorumAvailable();
         const installation_state = self.installationState();
+        const installation_error = self.installationError();
         self.mutex.unlock(self.io);
         const chain_hex = std.fmt.bytesToHex(status.chain, .lower);
         try out.print(
@@ -3278,7 +3406,7 @@ pub const Server = struct {
                 "\"ballot\":{{\"round\":{d},\"priority\":{d},\"node\":{d}}}," ++
                 "\"decided_slot\":{d},\"applied_slot\":{d}," ++
                 "\"journal_records\":{d},\"epoch_capacity\":{d}," ++
-                "\"chain\":\"{s}\",\"page_size\":{d},\"snapshot\":",
+                "\"chain\":\"{s}\",\"page_size\":{d},",
             .{
                 status.node_id,          status.database_id,
                 status.configuration_id, status.role,
@@ -3291,6 +3419,8 @@ pub const Server = struct {
                 &chain_hex,              status.page_size,
             },
         );
+        try writeMembershipOperation(out, pending, installation_error);
+        try out.writeAll(",\"snapshot\":");
         if (status.snapshot) |name| {
             try out.print("\"{s}\"}}", .{&name});
         } else {
@@ -3925,6 +4055,7 @@ const PeerSender = struct {
     stored_payloads: std.AutoHashMap(command.HashBytes, void) = undefined,
     /// Highest current-epoch chosen slot queued on this connection.
     learned_through: paxos.Slot = 0,
+    ready_advertised_configuration: u64 = 0,
     enqueued_count: u64 = 0,
 
     const GatedFrame = struct {
@@ -4195,6 +4326,7 @@ const PeerSender = struct {
 
             {
                 self.server.mutex.lockUncancelable(self.server.io);
+                self.ready_advertised_configuration = 0;
                 self.learned_through = 0;
                 if (self.server.node.isVoter() and
                     self.peer.role.capabilities().votes)
@@ -4206,6 +4338,9 @@ const PeerSender = struct {
                     };
                 }
                 if (!self.server.failed) self.server.pump();
+                if (!self.server.failed) {
+                    self.server.advertiseInstallationReady(self);
+                }
                 self.server.mutex.unlock(self.server.io);
             }
 
@@ -4279,6 +4414,103 @@ fn writeErrorResponse(out: *Io.Writer, code: []const u8, message: []const u8) !v
     try out.print("{{\"ok\":false,\"error\":\"{s}\",\"message\":", .{code});
     try writeJsonString(out, message);
     try out.writeAll("}");
+}
+
+fn writeReplacementError(out: *Io.Writer, err: anyerror) !void {
+    const response: struct { code: []const u8, message: []const u8 } = switch (err) {
+        error.StaleConfiguration => .{
+            .code = "stale_configuration",
+            .message = "The expected configuration is no longer active.",
+        },
+        error.UnknownVoter => .{
+            .code = "unknown_voter",
+            .message = "The node being replaced is not a current data voter.",
+        },
+        error.NodeIdNotFresh => .{
+            .code = "node_id_not_fresh",
+            .message = "The replacement node ID has already been allocated.",
+        },
+        error.NodeIdExhausted => .{
+            .code = "node_id_exhausted",
+            .message = "The node ID allocation fence cannot advance.",
+        },
+        error.OperationIdExhausted => .{
+            .code = "operation_id_exhausted",
+            .message = "The replacement operation ID space cannot advance.",
+        },
+        error.ConfigurationIdExhausted => .{
+            .code = "configuration_id_exhausted",
+            .message = "The configuration ID space cannot advance.",
+        },
+        error.InvalidEndpoint => .{
+            .code = "invalid_endpoint",
+            .message = "The replacement endpoint is empty, malformed, or too long.",
+        },
+        error.EndpointInUse => .{
+            .code = "endpoint_in_use",
+            .message = "Another current node already uses the replacement endpoint.",
+        },
+        error.TooFewVoters => .{
+            .code = "too_few_voters",
+            .message = "Replacing a voter would leave an unsupported voter set.",
+        },
+        error.OperationConflict => .{
+            .code = "operation_conflict",
+            .message = "This operation ID is bound to different replacement arguments.",
+        },
+        error.OperationPending => .{
+            .code = "operation_pending",
+            .message = "Another voter replacement is still pending.",
+        },
+        error.OperationHistoryExpired => .{
+            .code = "operation_history_expired",
+            .message = "This operation ID is older than the retained result history.",
+        },
+        error.CorruptPendingOperation => .{
+            .code = "corrupt_pending_operation",
+            .message = "The durable pending replacement record is unreadable.",
+        },
+        error.TransactionOpen, error.WriteInFlight => .{
+            .code = "replacement_busy",
+            .message = "A database write is still in progress.",
+        },
+        error.StorageFailed => .{
+            .code = "storage_failed",
+            .message = "Durable storage failed, so this node cannot replace a voter.",
+        },
+        error.NoDecidedRegistry => .{
+            .code = "no_registry",
+            .message = "This node does not have decided registry membership.",
+        },
+        error.RoleCannotWrite => .{
+            .code = "role_cannot_write",
+            .message = "This node role cannot coordinate a voter replacement.",
+        },
+        else => .{
+            .code = "replace_rejected",
+            .message = @errorName(err),
+        },
+    };
+    return writeErrorResponse(out, response.code, response.message);
+}
+
+fn writeMembershipOperation(
+    out: *Io.Writer,
+    pending: ?Node.PendingOperation,
+    installation_error: ?[]const u8,
+) !void {
+    try out.writeAll("\"operation_id\":");
+    if (pending) |operation| {
+        try out.print("{d}", .{operation.operation_id});
+    } else {
+        try out.writeAll("null");
+    }
+    try out.writeAll(",\"installation_error\":");
+    if (installation_error) |message| {
+        try writeJsonString(out, message);
+    } else {
+        try out.writeAll("null");
+    }
 }
 
 fn writeSqlError(out: *Io.Writer, message: []const u8) !void {

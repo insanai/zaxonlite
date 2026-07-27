@@ -80,8 +80,8 @@ fn validateMembers(members: []const paxos.NodeId) !void {
     }
     for (members, 0..) |member, index| {
         if (member == 0) return error.InvalidCheckpointProof;
-        for (members[0..index]) |previous| {
-            if (previous == member) return error.InvalidCheckpointProof;
+        if (index > 0 and members[index - 1] >= member) {
+            return error.InvalidCheckpointProof;
         }
     }
 }
@@ -272,4 +272,48 @@ test "checkpoint proof rejects a changed voter count" {
         &grown,
         "zx1 0000000000000004 digest",
     ));
+}
+
+test "checkpoint proof decoder rejects unsorted voter ids" {
+    const members = [_]paxos.NodeId{ 1, 2, 3 };
+    var encoded = try create(
+        9,
+        4,
+        5,
+        8,
+        7,
+        [_]u8{1} ** 32,
+        [_]u8{2} ** 32,
+        no_registry_digest,
+        &members,
+        &members,
+        "zx1 0000000000000004 digest",
+    );
+    const first_member_offset = 146;
+    const first = std.mem.readInt(
+        u32,
+        encoded.bytes[first_member_offset..][0..4],
+        .little,
+    );
+    const second = std.mem.readInt(
+        u32,
+        encoded.bytes[first_member_offset + 4 ..][0..4],
+        .little,
+    );
+    std.mem.writeInt(
+        u32,
+        encoded.bytes[first_member_offset..][0..4],
+        second,
+        .little,
+    );
+    std.mem.writeInt(
+        u32,
+        encoded.bytes[first_member_offset + 4 ..][0..4],
+        first,
+        .little,
+    );
+    try std.testing.expectError(
+        error.InvalidCheckpointProof,
+        decode(encoded.slice()),
+    );
 }

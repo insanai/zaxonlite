@@ -159,8 +159,10 @@ pub const Decided = struct {
     node_count: u16,
     nodes: [max_nodes]NodeRecord,
     ring_count: u16,
-    /// Ascending by operation ID; the last retained record is the newest
-    /// and acts as the operation-ID high-water mark.
+    /// Physical index of the oldest retained operation. The canonical
+    /// encoder walks logical order, so internal rotation never changes
+    /// registry bytes or digests.
+    ring_start: u8,
     ring: [ring_size]OperationRecord,
 
     /// Builds configuration 1 from bootstrap records. Input order does not
@@ -190,6 +192,7 @@ pub const Decided = struct {
             .node_count = @intCast(records.len),
             .nodes = undefined,
             .ring_count = 0,
+            .ring_start = 0,
             .ring = undefined,
         };
         @memcpy(decided.nodes[0..records.len], records);
@@ -206,8 +209,15 @@ pub const Decided = struct {
         return self.nodes[0..self.node_count];
     }
 
-    pub fn ringSlice(self: *const Decided) []const OperationRecord {
-        return self.ring[0..self.ring_count];
+    pub fn operationAt(self: *const Decided, logical_index: usize) *const OperationRecord {
+        std.debug.assert(logical_index < self.ring_count);
+        const physical = (@as(usize, self.ring_start) + logical_index) % ring_size;
+        return &self.ring[physical];
+    }
+
+    pub fn newestOperation(self: *const Decided) ?*const OperationRecord {
+        if (self.ring_count == 0) return null;
+        return self.operationAt(self.ring_count - 1);
     }
 
     pub fn findNode(self: *const Decided, id: paxos.NodeId) ?*const NodeRecord {
@@ -253,6 +263,7 @@ pub const Decided = struct {
             return error.CorruptRegistry;
         }
         if (self.ring_count > ring_size) return error.InvalidOperationRing;
+        if (self.ring_start >= ring_size) return error.InvalidOperationRing;
 
         var voters: u16 = 0;
         var campaigners: u16 = 0;
@@ -279,9 +290,10 @@ pub const Decided = struct {
         }
         if (campaigners == 0) return error.InvalidVoterSet;
 
-        for (self.ringSlice(), 0..) |record, index| {
+        for (0..self.ring_count) |index| {
+            const record = self.operationAt(index);
             if (index > 0 and
-                self.ring[index - 1].operation_id >= record.operation_id)
+                self.operationAt(index - 1).operation_id >= record.operation_id)
             {
                 return error.InvalidOperationRing;
             }
@@ -311,7 +323,8 @@ pub const Decided = struct {
             cursor.bytes(record.endpointSlice());
         }
         cursor.int(u16, self.ring_count);
-        for (self.ringSlice()) |record| {
+        for (0..self.ring_count) |index| {
+            const record = self.operationAt(index);
             cursor.int(u64, record.operation_id);
             cursor.int(u64, record.expected_configuration_id);
             cursor.int(u32, record.old_node_id);
@@ -340,6 +353,7 @@ pub const Decided = struct {
             .node_count = 0,
             .nodes = undefined,
             .ring_count = 0,
+            .ring_start = 0,
             .ring = undefined,
         };
         const node_count = reader.int(u16) catch return error.CorruptRegistry;
@@ -394,7 +408,8 @@ pub const Decided = struct {
         self: *const Decided,
         request: *const ReplacementRequest,
     ) Error!Disposition {
-        for (self.ringSlice()) |record| {
+        for (0..self.ring_count) |index| {
+            const record = self.operationAt(index);
             if (record.operation_id != request.operation_id) continue;
             const request_digest = request.digestOf();
             if (!std.mem.eql(u8, &record.request_digest, &request_digest)) {
@@ -404,8 +419,8 @@ pub const Decided = struct {
                 .result_configuration_id = record.result_configuration_id,
             } };
         }
-        if (self.ring_count > 0) {
-            const newest = self.ring[self.ring_count - 1].operation_id;
+        if (self.newestOperation()) |record| {
+            const newest = record.operation_id;
             if (newest == std.math.maxInt(u64)) return error.OperationIdExhausted;
             if (request.operation_id <= newest) {
                 return error.OperationHistoryExpired;
@@ -486,15 +501,12 @@ pub const Decided = struct {
             .result_configuration_id = next.configuration_id,
         };
         if (next.ring_count == ring_size) {
-            // Overwrite only the oldest record; memory stays fixed.
-            std.mem.copyForwards(
-                OperationRecord,
-                next.ring[0 .. ring_size - 1],
-                next.ring[1..ring_size],
-            );
-            next.ring[ring_size - 1] = record;
+            next.ring[next.ring_start] = record;
+            next.ring_start = (next.ring_start + 1) % ring_size;
         } else {
-            next.ring[next.ring_count] = record;
+            const index =
+                (@as(usize, next.ring_start) + @as(usize, next.ring_count)) % ring_size;
+            next.ring[index] = record;
             next.ring_count += 1;
         }
         try next.validate();
@@ -754,8 +766,8 @@ test "successor replaces one voter and advances the fence" {
     try testing.expectEqual(roles.Role.data_voter, replacement.role);
     try testing.expectEqualStrings("127.0.0.1:9908", replacement.endpointSlice());
     try testing.expectEqual(@as(u16, 1), next.ring_count);
-    try testing.expectEqual(@as(u64, 10), next.ring[0].operation_id);
-    try testing.expectEqual(@as(u64, 2), next.ring[0].result_configuration_id);
+    try testing.expectEqual(@as(u64, 10), next.operationAt(0).operation_id);
+    try testing.expectEqual(@as(u64, 2), next.operationAt(0).result_configuration_id);
 
     var voters: [types.log_options.max_members]paxos.NodeId = undefined;
     try testing.expectEqualSlices(
@@ -882,13 +894,13 @@ test "operation ids expire out of the ring and never wrap" {
         new_id += 1;
     }
     try testing.expectEqual(@as(u16, ring_size), decided.ring_count);
-    try testing.expectEqual(@as(u64, 101), decided.ring[0].operation_id);
+    try testing.expectEqual(@as(u64, 101), decided.operationAt(0).operation_id);
 
     // The evicted operation ID can no longer start or retry anything.
     const expired = ReplacementRequest{
         .operation_id = 100,
         .expected_configuration_id = decided.configuration_id,
-        .old_node_id = decided.ring[ring_size - 1].new_node_id,
+        .old_node_id = decided.newestOperation().?.new_node_id,
         .new_node_id = new_id,
         .new_endpoint = "10.0.0.9:30000",
     };
@@ -899,7 +911,9 @@ test "operation ids expire out of the ring and never wrap" {
 
     // A ring whose newest ID is the maximum refuses new operations.
     var exhausted = decided;
-    exhausted.ring[exhausted.ring_count - 1].operation_id = std.math.maxInt(u64);
+    const newest_index =
+        (@as(usize, exhausted.ring_start) + exhausted.ring_count - 1) % ring_size;
+    exhausted.ring[newest_index].operation_id = std.math.maxInt(u64);
     const fresh = ReplacementRequest{
         .operation_id = 1,
         .expected_configuration_id = exhausted.configuration_id,

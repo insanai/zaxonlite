@@ -57,6 +57,7 @@ const identity_file_name = "identity";
 const current_file_name = "CURRENT";
 const lock_file_name = "LOCK";
 const pending_operation_file_name = "PENDING-OP";
+const deleted_file_tombstone = ".ZX-DELETED";
 const join_file_name = "JOIN";
 const install_tmp_dir = "snapshots/tmp-install";
 
@@ -68,7 +69,8 @@ pub const OpenOptions = struct {
     directory: []const u8,
     node_id: paxos.NodeId = 1,
     /// Full voting membership including this node. Empty means a
-    /// single-member configuration of just `node_id`.
+    /// single-member configuration of just `node_id`. Order does not
+    /// matter; membership is canonicalized to ascending node IDs.
     members: []const paxos.NodeId = &.{},
     /// Election priority carried in this node's ballots.
     leader_priority: u32 = 0,
@@ -201,6 +203,9 @@ pub const Node = struct {
     /// The durable decided registry, present on network-hosted nodes. It
     /// is the single membership authority after bootstrap.
     decided_registry: ?registry.Decided = null,
+    /// One-shot enrollment binding retained until the fetched registry is
+    /// verified and installed.
+    join_descriptor: ?JoinDescriptor = null,
     members: [types.log_options.max_members]paxos.NodeId,
     member_count: u16,
     leader_priority: u32,
@@ -222,6 +227,9 @@ pub const Node = struct {
     /// Set when a decided stop sign awaits epoch rollover. The slot the
     /// stop sign occupies comes from the log's own latch (`Log.stopSlot`).
     rollover_pending: bool = false,
+    /// The server defers a new-epoch campaign until its transport generation
+    /// matches the decided registry. Embedded hosts activate immediately.
+    rollover_campaign_pending: bool = false,
     /// Copy of the SQLite error message from a failed write transaction,
     /// captured before the rollback statement clears it.
     saved_error: [512]u8 = undefined,
@@ -243,25 +251,7 @@ pub const Node = struct {
         const capabilities = options.role.capabilities();
         if (!capabilities.stores_log) return error.RoleHasNoLocalStore;
         var member_storage: [types.log_options.max_members]paxos.NodeId = undefined;
-        const members: []const paxos.NodeId = blk: {
-            if (options.members.len == 0 and capabilities.votes) {
-                member_storage[0] = options.node_id;
-                break :blk member_storage[0..1];
-            }
-            if (options.members.len == 0) return error.VotersRequired;
-            if (options.members.len > types.log_options.max_members) {
-                return error.TooManyMembers;
-            }
-            @memcpy(member_storage[0..options.members.len], options.members);
-            break :blk member_storage[0..options.members.len];
-        };
-        var found_self = false;
-        for (members) |member| {
-            if (member == options.node_id) found_self = true;
-        }
-        if (found_self != capabilities.votes) return error.RoleMembershipMismatch;
-        const single = capabilities.votes and members.len == 1;
-
+        var members = try canonicalFlagMembers(&options, capabilities, &member_storage);
         // Iterating opens carry a real descriptor on every platform; a
         // non-iterating open is `O_PATH` on Linux, which `fchmod` and
         // `fsync` reject. This handle is chmodded here and synced on
@@ -293,7 +283,7 @@ pub const Node = struct {
         // An enrolled replacement carries a join descriptor: the decided
         // database identity it must adopt instead of deriving one from its
         // flags, and the registry digest it will fetch and verify.
-        const join = try readJoinDescriptor(gpa, io, dir);
+        var join = try readJoinDescriptor(gpa, io, dir);
 
         // The database identity derived from bootstrap flags applies only
         // while no registry exists; afterwards the decided registry carries
@@ -318,11 +308,17 @@ pub const Node = struct {
             if (decided.database_id != identity.database_id) {
                 return error.RegistryMismatch;
             }
-            if (options.registry_nodes) |records| {
-                try expectRegistryAgreement(decided, records);
+            if (join) |descriptor| {
+                if (descriptor.database_id != decided.database_id or
+                    descriptor.configuration_id != decided.configuration_id or
+                    !std.mem.eql(u8, &descriptor.registry_digest, &decided.digest()))
+                {
+                    return error.RegistryMismatch;
+                }
+                try durableDeleteFile(io, dir, join_file_name);
+                join = null;
             }
-            // The registry supersedes the one-shot join descriptor.
-            if (join != null) dir.deleteFile(io, join_file_name) catch {};
+            members = decided.voterIds(&member_storage);
         } else if (join != null) {
             // A joining replacement must not invent a registry: it fetches
             // and verifies the decided one during snapshot install.
@@ -338,7 +334,15 @@ pub const Node = struct {
             try registry.storeBlob(io, dir, &bootstrapped);
             try registry.activatePointer(io, dir, bootstrapped.configuration_id);
             decided_registry = bootstrapped;
+            members = bootstrapped.voterIds(&member_storage);
         }
+
+        var found_self = false;
+        for (members) |member| {
+            if (member == options.node_id) found_self = true;
+        }
+        if (found_self != capabilities.votes) return error.RoleMembershipMismatch;
+        const single = capabilities.votes and members.len == 1;
 
         var store = try PayloadStore.init(io, dir);
         errdefer store.deinit();
@@ -376,6 +380,7 @@ pub const Node = struct {
             .product_role = options.role,
             .capabilities = capabilities,
             .decided_registry = decided_registry,
+            .join_descriptor = join,
             .members = [_]paxos.NodeId{0} ** types.log_options.max_members,
             .member_count = @intCast(members.len),
             .leader_priority = options.leader_priority,
@@ -481,6 +486,7 @@ pub const Node = struct {
             try self.completeClusterRollover();
             try self.rebuildMaterializedImage();
         }
+        try self.reconcilePendingOperation();
 
         if (single and capabilities.serves_writes) {
             try self.openLiveDatabase();
@@ -977,6 +983,27 @@ pub const Node = struct {
         pub fn endpointSlice(self: *const PendingOperation) []const u8 {
             return self.endpoint[0..self.endpoint_len];
         }
+
+        pub fn matches(
+            self: *const PendingOperation,
+            request: *const registry.ReplacementRequest,
+        ) bool {
+            return self.operation_id == request.operation_id and
+                self.expected_configuration_id == request.expected_configuration_id and
+                self.old_node_id == request.old_node_id and
+                self.new_node_id == request.new_node_id and
+                std.mem.eql(u8, self.endpointSlice(), request.new_endpoint);
+        }
+
+        fn toRequest(self: *const PendingOperation) registry.ReplacementRequest {
+            return .{
+                .operation_id = self.operation_id,
+                .expected_configuration_id = self.expected_configuration_id,
+                .old_node_id = self.old_node_id,
+                .new_node_id = self.new_node_id,
+                .new_endpoint = self.endpointSlice(),
+            };
+        }
     };
 
     /// Reads the durable pending replacement record, if one exists.
@@ -1048,8 +1075,32 @@ pub const Node = struct {
         try atomicWriteFile(self.io, self.dir, pending_operation_file_name, contents);
     }
 
-    fn clearPendingOperation(self: *Node) void {
-        self.dir.deleteFile(self.io, pending_operation_file_name) catch {};
+    fn clearPendingOperation(self: *Node) !void {
+        try durableDeleteFile(self.io, self.dir, pending_operation_file_name);
+    }
+
+    /// Repairs the scratch phase after a crash. A durable accepted stop
+    /// proves that proposal submission completed even if the phase-file
+    /// update did not. Without that evidence, `prepared` remains retryable.
+    fn reconcilePendingOperation(self: *Node) !void {
+        const pending = (try self.pendingOperation()) orelse return;
+        if (pending.phase == .proposed) return;
+        const stop = self.log.pendingStopSign() orelse return;
+        const parsed = try parseStopMetadata(stop.metadataSlice());
+        const seed = parsed.seed orelse {
+            try self.clearPendingOperation();
+            return;
+        };
+        if (seed.operation_id != pending.operation_id or
+            seed.old_node_id != pending.old_node_id or
+            seed.new_node_id != pending.new_node_id or
+            !std.mem.eql(u8, seed.endpointSlice(), pending.endpointSlice()))
+        {
+            try self.clearPendingOperation();
+            return;
+        }
+        const request = pending.toRequest();
+        try self.persistPendingOperation(&request, .proposed);
     }
 
     /// Prepares and proposes a decided one-for-one voter replacement.
@@ -1064,6 +1115,10 @@ pub const Node = struct {
         if (self.fatal_storage_error) return error.StorageFailed;
         const decided = self.decidedRegistry() orelse
             return error.NoDecidedRegistry;
+        if (try self.pendingOperation()) |pending| {
+            if (!pending.matches(request)) return error.OperationConflict;
+            if (pending.phase == .proposed) return error.OperationAlreadyProposed;
+        }
         switch (try decided.validateRequest(request)) {
             .fresh => {},
             .retry => return error.OperationAlreadyComplete,
@@ -1089,8 +1144,6 @@ pub const Node = struct {
         const next = try decided.successor(request);
         var voter_buffer: [types.log_options.max_members]paxos.NodeId = undefined;
         const next_voters = next.voterIds(&voter_buffer);
-        try self.persistPendingOperation(request, .proposed);
-        failpoint.hit("after_replacement_proposed");
         _ = try self.log.reconfigure(
             next.configuration_id,
             next_voters,
@@ -1098,6 +1151,9 @@ pub const Node = struct {
             self.effects,
         );
         try self.consumeEffects();
+        failpoint.hit("after_replacement_submission");
+        try self.persistPendingOperation(request, .proposed);
+        failpoint.hit("after_replacement_proposed");
     }
 
     /// Copies the fully materialized database into `snapshots/<name>` with
@@ -2329,11 +2385,26 @@ pub const Node = struct {
     /// the leader (or a one-member node) already built it while preparing
     /// the checkpoint.
     pub fn completeClusterRollover(self: *Node) !void {
+        try self.completeClusterRolloverDeferred();
+        try self.activateRollover();
+    }
+
+    /// Installs the next epoch without emitting its first campaign. A
+    /// transport host calls `activateRollover` only after publishing the
+    /// matching peer generation.
+    pub fn completeClusterRolloverDeferred(self: *Node) !void {
         const stop = self.log.isReconfigured() orelse return error.NoStopSign;
         if (!self.db_open) {
             try self.buildFollowerSnapshot(&stop);
         }
         try self.completeRollover();
+    }
+
+    pub fn activateRollover(self: *Node) !void {
+        if (!self.rollover_campaign_pending) return;
+        self.rollover_campaign_pending = false;
+        try self.log.campaign(.noop, self.effects);
+        try self.consumeEffects();
     }
 
     /// Builds this member's snapshot generation for a decided stop sign
@@ -2677,14 +2748,12 @@ pub const Node = struct {
         self.last_data_slot = 0;
         self.rollover_pending = false;
         self.last_chain = try self.epochBaseChain();
-        if (self.capabilities.campaigns and (self.single or was_leader)) {
-            try self.log.campaign(.noop, self.effects);
-            try self.consumeEffects();
-        }
+        self.rollover_campaign_pending =
+            self.capabilities.campaigns and (self.single or was_leader);
 
         // The decided registry ring now records the operation outcome; the
         // scratch pending record has served its purpose.
-        self.clearPendingOperation();
+        try self.clearPendingOperation();
 
         try self.garbageCollect(old_configuration, &retained);
     }
@@ -2809,6 +2878,14 @@ pub const Node = struct {
             {
                 return error.RegistryDigestMismatch;
             }
+            if (self.join_descriptor) |descriptor| {
+                if (descriptor.database_id != self.identity.database_id or
+                    descriptor.configuration_id != configuration_id or
+                    !std.mem.eql(u8, &descriptor.registry_digest, &blob_digest))
+                {
+                    return error.RegistryMismatch;
+                }
+            }
             const decided = registry.Decided.decode(encoded) catch
                 return error.CorruptRegistry;
             if (decided.configuration_id != configuration_id or
@@ -2878,8 +2955,12 @@ pub const Node = struct {
 
         if (next_registry) |next| {
             self.decided_registry = next;
-            // The one-shot join descriptor has served its purpose.
-            self.dir.deleteFile(self.io, join_file_name) catch {};
+            var voter_buffer: [types.log_options.max_members]paxos.NodeId = undefined;
+            const voters = next.voterIds(&voter_buffer);
+            @memcpy(self.members[0..voters.len], voters);
+            self.member_count = @intCast(voters.len);
+            self.join_descriptor = null;
+            try durableDeleteFile(self.io, self.dir, join_file_name);
         }
 
         var membership: Log.Membership = undefined;
@@ -3326,22 +3407,30 @@ pub fn writeJoinDescriptor(
     try atomicWriteFile(io, dir, join_file_name, contents);
 }
 
-/// Startup flags cannot override the decided registry: every provided
-/// record must match it exactly, and no registered node may be missing
-/// from the flags. Operators update flags after a decided replacement.
-fn expectRegistryAgreement(
-    decided: *const registry.Decided,
-    records: []const registry.NodeRecord,
-) !void {
-    if (records.len != decided.node_count) return error.RegistryMismatch;
-    for (records) |*record| {
-        const known = decided.findNode(record.id) orelse
-            return error.RegistryMismatch;
-        if (known.role != record.role) return error.RegistryMismatch;
-        if (!std.mem.eql(u8, known.endpointSlice(), record.endpointSlice())) {
-            return error.RegistryMismatch;
-        }
+/// Resolves the flag-provided membership for `Node.open`. Proofs and the
+/// registry encode voter sets in canonical ascending order, so flag order
+/// must not matter.
+fn canonicalFlagMembers(
+    options: *const OpenOptions,
+    capabilities: roles.Capabilities,
+    storage: *[types.log_options.max_members]paxos.NodeId,
+) ![]const paxos.NodeId {
+    if (options.members.len == 0 and capabilities.votes) {
+        storage[0] = options.node_id;
+        return storage[0..1];
     }
+    if (options.members.len == 0) return error.VotersRequired;
+    if (options.members.len > types.log_options.max_members) {
+        return error.TooManyMembers;
+    }
+    @memcpy(storage[0..options.members.len], options.members);
+    std.mem.sort(
+        paxos.NodeId,
+        storage[0..options.members.len],
+        {},
+        std.sort.asc(paxos.NodeId),
+    );
+    return storage[0..options.members.len];
 }
 
 fn loadOrCreateIdentity(
@@ -3444,6 +3533,20 @@ fn atomicWriteFile(io: Io, dir: Io.Dir, name: []const u8, contents: []const u8) 
     try durability.syncFile(io, atomic.file);
     try atomic.replace(io);
     try durability.syncPathnameTransition(io, dir, name);
+}
+
+/// Makes removal durable on every supported platform. Renaming to a live
+/// tombstone gives Windows a file handle it can flush for the namespace
+/// transition. A leftover tombstone is harmless and is removed best-effort.
+fn durableDeleteFile(io: Io, dir: Io.Dir, name: []const u8) !void {
+    dir.deleteFile(io, deleted_file_tombstone) catch {};
+    dir.rename(name, dir, deleted_file_tombstone, io) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    try durability.syncPathnameTransition(io, dir, deleted_file_tombstone);
+    dir.deleteFile(io, deleted_file_tombstone) catch return;
+    try durability.syncDirectory(dir);
 }
 
 fn fileSha256(io: Io, dir: Io.Dir, name: []const u8) ![32]u8 {

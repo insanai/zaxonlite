@@ -22,7 +22,9 @@ const paxos = @import("paxos");
 const types = @import("types.zig");
 const command = @import("command.zig");
 
-/// Version 7 adds decided-registry membership: checkpoint proof v2 with
+/// Version 8 adds an explicit durable-installation announcement for a
+/// replacement voter. A TCP connection alone never implies readiness.
+/// Version 7 added decided-registry membership: checkpoint proof v2 with
 /// sealed and next voter sets, the next-registry digest, and the voter
 /// replacement operation surface.
 /// Version 6 added the bounded one-time-token/CSR enrollment exchange.
@@ -30,7 +32,7 @@ const command = @import("command.zig");
 /// proofs. Older peers are deliberately rejected:
 /// silently falling back would turn a configuration error into a security
 /// downgrade.
-pub const protocol_version: u16 = 7;
+pub const protocol_version: u16 = 8;
 
 /// Upper bound for one frame body; larger frames are a protocol error.
 pub const max_frame_bytes: u32 = 64 * 1024 * 1024;
@@ -71,6 +73,32 @@ pub const FrameKind = enum(u8) {
     enrollment_response = 24,
     registry_request = 25,
     registry_data = 26,
+    installation_ready = 27,
+};
+
+/// A replacement sends this only after its snapshot and decided registry
+/// are durable and the matching transport generation is active.
+pub const InstallationReady = struct {
+    configuration_id: u64,
+    registry_digest: [32]u8,
+
+    pub const encoded_size = 8 + 32;
+
+    pub fn encode(self: InstallationReady, buffer: *[encoded_size]u8) []const u8 {
+        std.mem.writeInt(u64, buffer[0..8], self.configuration_id, .little);
+        @memcpy(buffer[8..40], &self.registry_digest);
+        return buffer;
+    }
+
+    pub fn decode(body: []const u8) WireError!InstallationReady {
+        if (body.len != encoded_size) return error.InvalidFrame;
+        const configuration_id = std.mem.readInt(u64, body[0..8], .little);
+        if (configuration_id == 0) return error.InvalidFrame;
+        return .{
+            .configuration_id = configuration_id,
+            .registry_digest = body[8..40].*,
+        };
+    }
 };
 
 pub const EnrollmentRequest = struct {
@@ -994,6 +1022,21 @@ test "checkpoint proof probe round trips" {
         probe,
         try CheckpointProofProbe.decode(probe.encode(&buffer)),
     );
+}
+
+test "installation readiness binds configuration and registry" {
+    const ready = InstallationReady{
+        .configuration_id = 8,
+        .registry_digest = [_]u8{0x7a} ** 32,
+    };
+    var buffer: [InstallationReady.encoded_size]u8 = undefined;
+    try testing.expectEqualDeep(
+        ready,
+        try InstallationReady.decode(ready.encode(&buffer)),
+    );
+    buffer[0] = 0;
+    @memset(buffer[1..8], 0);
+    try testing.expectError(error.InvalidFrame, InstallationReady.decode(&buffer));
 }
 
 test "enrollment request and response are bounded" {

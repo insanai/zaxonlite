@@ -8,8 +8,8 @@
 
 const std = @import("std");
 
-/// Human-readable library version; replaced by the release tag when one exists.
-pub const version = "0.1.1";
+/// Human-readable library version.
+pub const version = "0.1.2";
 
 /// Fixed-size replicated command descriptor and its canonical wire codec.
 pub const command = @import("command.zig");
@@ -116,5 +116,6 @@ test {
 
 test "sqlite is linked and recent" {
     const c = @import("c");
+    try std.testing.expectEqualStrings("0.1.2", version);
     try std.testing.expect(c.sqlite3_libversion_number() >= 3050000);
 }

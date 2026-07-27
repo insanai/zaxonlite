@@ -100,7 +100,69 @@ pub fn remoteHint(code: []const u8) []const u8 {
     if (std.mem.eql(u8, code, "session")) {
         return "Retry only the latest sequence in the same unexpired session.";
     }
+    if (std.mem.eql(u8, code, "stale_configuration")) {
+        return "Read membership status and retry with its configuration ID.";
+    }
+    if (std.mem.eql(u8, code, "unknown_voter")) {
+        return "Read membership status and choose one listed data voter.";
+    }
+    if (std.mem.eql(u8, code, "node_id_not_fresh")) {
+        return "Choose a node ID above highest_allocated_node_id.";
+    }
+    if (std.mem.eql(u8, code, "node_id_exhausted") or
+        std.mem.eql(u8, code, "operation_id_exhausted") or
+        std.mem.eql(u8, code, "configuration_id_exhausted"))
+    {
+        return "No further voter replacement is safe for this database.";
+    }
+    if (std.mem.eql(u8, code, "invalid_endpoint")) {
+        return "Use a printable host:port endpoint within the documented length bound.";
+    }
+    if (std.mem.eql(u8, code, "endpoint_in_use")) {
+        return "Choose an endpoint that is not assigned to a current node.";
+    }
+    if (std.mem.eql(u8, code, "too_few_voters")) {
+        return "Restore at least three healthy voters before replacing one.";
+    }
+    if (std.mem.eql(u8, code, "operation_conflict")) {
+        return "Reuse the exact original arguments or submit a newer operation ID.";
+    }
+    if (std.mem.eql(u8, code, "operation_pending")) {
+        return "Query membership status and wait for the pending operation to finish.";
+    }
+    if (std.mem.eql(u8, code, "operation_history_expired")) {
+        return "Read membership status, then submit a new operation ID.";
+    }
+    if (std.mem.eql(u8, code, "corrupt_pending_operation")) {
+        return "Stop the node and restore its membership metadata from a verified backup.";
+    }
+    if (std.mem.eql(u8, code, "replacement_busy")) {
+        return "Wait for the current write to finish, then retry the same operation.";
+    }
+    if (std.mem.eql(u8, code, "storage_failed")) {
+        return "Repair durable storage and restart the node before retrying.";
+    }
+    if (std.mem.eql(u8, code, "no_registry")) {
+        return "Run voter replacement only on a registry-backed network cluster.";
+    }
+    if (std.mem.eql(u8, code, "role_cannot_write")) {
+        return "Retry the data-voter leader advertised by node status.";
+    }
     return "Inspect node status and retry only when the reported condition is resolved.";
+}
+
+test "replacement errors have specific operator hints" {
+    const codes = [_][]const u8{
+        "stale_configuration",
+        "node_id_not_fresh",
+        "operation_conflict",
+        "operation_pending",
+        "corrupt_pending_operation",
+    };
+    const fallback = remoteHint("unknown");
+    for (codes) |code| {
+        try std.testing.expect(!std.mem.eql(u8, remoteHint(code), fallback));
+    }
 }
 
 pub fn noLeaderDiagnostic(
@@ -292,6 +354,12 @@ fn renderRemoteMembership(object: *const std.json.ObjectMap, out: *std.Io.Writer
     );
     if (jsonString(object.get("registry_digest"))) |digest| {
         try out.print("registry digest {s}\n", .{digest});
+    }
+    if (jsonInt(object.get("operation_id"))) |operation_id| {
+        try out.print("pending operation {d}\n", .{operation_id});
+    }
+    if (jsonString(object.get("installation_error"))) |message| {
+        try out.print("installation error {s}\n", .{message});
     }
     if (object.get("nodes")) |nodes| {
         if (nodes == .array) for (nodes.array.items) |item| {
