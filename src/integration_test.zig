@@ -856,24 +856,26 @@ test "network bootstrap persists the decided registry and pins flags" {
         );
     }
 
-    // Conflicting membership flags are a startup error.
+    // Once present, the durable registry also owns membership. Stale
+    // bootstrap flags cannot prevent crash recovery or alter its digest.
     var moved = records;
     moved[2] = registry.NodeRecord.init(3, .data_voter, "127.0.0.1:9999") catch
         unreachable;
-    try testing.expectError(error.RegistryMismatch, Node.open(gpa, io, .{
-        .directory = dir,
-        .node_id = 1,
-        .members = &voters,
-        .database_id = 77,
-        .registry_nodes = &moved,
-    }));
-    try testing.expectError(error.RegistryMismatch, Node.open(gpa, io, .{
-        .directory = dir,
-        .node_id = 1,
-        .members = &voters,
-        .database_id = 77,
-        .registry_nodes = records[0..2],
-    }));
+    for ([_][]const registry.NodeRecord{ &moved, records[0..2] }) |stale| {
+        const node = try Node.open(gpa, io, .{
+            .directory = dir,
+            .node_id = 1,
+            .members = &voters,
+            .database_id = 77,
+            .registry_nodes = stale,
+        });
+        defer node.close();
+        try testing.expectEqualSlices(
+            u8,
+            &digest,
+            &node.decidedRegistry().?.digest(),
+        );
+    }
 
     // Crash window: a missing pointer after the blob write re-runs the
     // idempotent bootstrap and converges to the same digest.
@@ -924,6 +926,25 @@ test "embedded and local nodes write no registry" {
         error.FileNotFound,
         test_dir.tmp.dir.access(io, "node/REGISTRY", .{}),
     );
+}
+
+test "flag membership is canonicalized to ascending node ids" {
+    const gpa = testing.allocator;
+    var test_dir = try TestDir.init(gpa);
+    defer test_dir.deinit(gpa);
+    const dir = try test_dir.nodeDir(gpa);
+    defer gpa.free(dir);
+
+    // Checkpoint proofs and the decided registry encode voter sets in
+    // ascending order; flag order must not decide whether rollover works.
+    const node = try Node.open(gpa, testing.io, .{
+        .directory = dir,
+        .node_id = 2,
+        .members = &.{ 3, 1, 2 },
+        .database_id = 42,
+    });
+    defer node.close();
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, node.memberIds());
 }
 
 fn openRegistryNode(dir: []const u8) !*Node {

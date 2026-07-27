@@ -521,11 +521,10 @@ pub fn main(init: std.process.Init) !u8 {
     const initial_ids = [_]u32{ 1, 2, 3 };
 
     step("start the three-voter mTLS cluster");
-    // Node 2 carries an armed failpoint inside the in-process swap: it
-    // will die mid-swap and must converge through restart (crash points
-    // in the swap window).
+    // Runtime failpoints are armed after leader discovery, so the crash
+    // schedule does not depend on which voter wins the first election.
     try cluster.spawnNode(0, &initial_ids, &initial_ports, null);
-    try cluster.spawnNode(1, &initial_ids, &initial_ports, "before_transport_swap");
+    try cluster.spawnNode(1, &initial_ids, &initial_ports, null);
     try cluster.spawnNode(2, &initial_ids, &initial_ports, null);
 
     const endpoints = [_]Endpoint{
@@ -536,7 +535,9 @@ pub fn main(init: std.process.Init) !u8 {
 
     step("wait for a leader and write through the cluster");
     const first_leader = waitForLeader(&cluster, endpoints[0], 30_000);
-    _ = first_leader;
+    const leader_index: usize = @intCast(first_leader - 1);
+    const swap_crash_index: usize = if (leader_index == 1) 0 else 1;
+    const held_index: usize = if (swap_crash_index == 0) 1 else 0;
     gpa.free(mustCallAny(
         &cluster,
         &endpoints,
@@ -549,20 +550,6 @@ pub fn main(init: std.process.Init) !u8 {
         "{\"op\":\"exec\",\"sql\":\"insert into t(v) values ('before-replacement')\"}",
         30_000,
     ));
-
-    step("hold one client TCP connection open across the swap");
-    const held = client.Connection.openWithTransport(
-        gpa,
-        io,
-        endpoints[0],
-        .{ .tls = &cluster.admin },
-    ) catch |err| fail(&cluster, "held connection failed: {t}", .{err});
-    defer held.close();
-    {
-        const body = held.call("{\"op\":\"status\"}") catch |err|
-            fail(&cluster, "held status failed: {t}", .{err});
-        gpa.free(body);
-    }
 
     step("read the decided membership");
     const before = membershipView(&cluster, endpoints[0]) orelse
@@ -609,6 +596,44 @@ pub fn main(init: std.process.Init) !u8 {
 
     step("submit the replacement through the authorized admin");
     {
+        const arm_swap = mustCallAny(
+            &cluster,
+            endpoints[swap_crash_index .. swap_crash_index + 1],
+            "{\"op\":\"failpoint\",\"name\":\"before_transport_swap\"}",
+            30_000,
+        );
+        gpa.free(arm_swap);
+        const arm = rpcTry(
+            &cluster,
+            endpoints[leader_index],
+            "{\"op\":\"failpoint\",\"name\":\"after_replacement_submission\"}",
+        ) orelse fail(&cluster, "failed to arm replacement submission crash", .{});
+        gpa.free(arm);
+        if (rpcTry(&cluster, endpoints[leader_index], replace_request)) |body| {
+            gpa.free(body);
+            fail(&cluster, "replacement leader replied past its failpoint", .{});
+        }
+        cluster.waitNodeExit(leader_index);
+        try cluster.spawnNode(leader_index, &initial_ids, &initial_ports, null);
+    }
+
+    step("hold one client TCP connection open across the swap");
+    _ = waitForLeader(&cluster, endpoints[held_index], 30_000);
+    const held = client.Connection.openWithTransport(
+        gpa,
+        io,
+        endpoints[held_index],
+        .{ .tls = &cluster.admin },
+    ) catch |err| fail(&cluster, "held connection failed: {t}", .{err});
+    defer held.close();
+    {
+        const body = held.call("{\"op\":\"status\"}") catch |err|
+            fail(&cluster, "held status failed: {t}", .{err});
+        gpa.free(body);
+    }
+
+    step("retry the ambiguous request after the leader restarts");
+    {
         const body = mustCallAny(&cluster, &endpoints, replace_request, 30_000);
         defer gpa.free(body);
         const parsed = parse(&cluster, body);
@@ -623,16 +648,17 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     step("wait for the crashed swap survivor to exit and restart it");
-    // Node 2's armed failpoint kills it inside the swap window. Restart
-    // it with flags matching the decided registry.
-    cluster.waitNodeExit(1);
+    // The armed survivor dies inside the swap window. Its stale
+    // bootstrap flags are harmless because the durable registry is now
+    // the restart authority.
+    cluster.waitNodeExit(swap_crash_index);
     const updated_ids = [_]u32{ 1, 2, 4 };
     const updated_ports = [_]u16{
         cluster.nodes[0].port,
         cluster.nodes[1].port,
         cluster.replacement_port,
     };
-    try cluster.spawnNode(1, &updated_ids, &updated_ports, null);
+    try cluster.spawnNode(swap_crash_index, &initial_ids, &initial_ports, null);
 
     step("wait for both survivors to activate the next configuration");
     const after_1 = waitForConfiguration(&cluster, endpoints[0], next_configuration, 60_000);
@@ -695,7 +721,7 @@ pub fn main(init: std.process.Init) !u8 {
         expectErrorCode(
             &cluster,
             rpcTry(&cluster, survivor_endpoints[0], conflict_request),
-            "replace_rejected",
+            "operation_conflict",
         );
     }
 
@@ -719,26 +745,10 @@ pub fn main(init: std.process.Init) !u8 {
         if (!sealed_seen) fail(&cluster, "replaced voter unreachable", .{});
     }
 
-    step("stale flags naming the removed voter are refused on restart");
+    step("stale bootstrap flags converge through the decided registry");
     cluster.killNode(0);
     cluster.waitNodeExit(0);
     try cluster.spawnNode(0, &initial_ids, &initial_ports, null);
-    cluster.waitNodeExit(0);
-    {
-        const body = Io.Dir.cwd().readFileAlloc(
-            io,
-            cluster.nodes[0].log_path,
-            gpa,
-            .limited(1 << 20),
-        ) catch fail(&cluster, "missing node 1 log", .{});
-        defer gpa.free(body);
-        if (std.mem.indexOf(u8, body, "RegistryMismatch") == null) {
-            fail(&cluster, "stale-flag restart did not report RegistryMismatch", .{});
-        }
-    }
-
-    step("restart with updated flags converges to the same registry");
-    try cluster.spawnNode(0, &updated_ids, &updated_ports, null);
     const restarted = waitForConfiguration(
         &cluster,
         endpoints[0],
@@ -784,18 +794,17 @@ pub fn main(init: std.process.Init) !u8 {
             .{cluster.nodes[0].port},
         ) catch unreachable;
         runProgram(io, &.{
-            cluster.zaxon, "enroll-token", "--connect",     issuer,
-            "--node",      "4",           "--to",          token_path,
-            "--ttl-seconds", "300",       "--tls-cert",    admin_cert,
-            "--tls-key",   admin_key,     "--tls-ca",      ca_path,
+            cluster.zaxon,   "enroll-token", "--connect",  issuer,
+            "--node",        "4",            "--to",       token_path,
+            "--ttl-seconds", "300",          "--tls-cert", admin_cert,
+            "--tls-key",     admin_key,      "--tls-ca",   ca_path,
         }) catch fail(&cluster, "enroll-token failed", .{});
     }
 
     step("enroll the replacement and record its join descriptor");
     runProgram(io, &.{
-        cluster.zaxon,    "enroll",       "--token-file", token_path,
-        "--identity-dir", identity_dir,   "--data",
-        cluster.nodes[3].directory,
+        cluster.zaxon,    "enroll",     "--token-file", token_path,
+        "--identity-dir", identity_dir, "--data",       cluster.nodes[3].directory,
     }) catch fail(&cluster, "enroll failed", .{});
 
     step("a crash while installing the fetched registry converges by restart");
@@ -855,9 +864,9 @@ pub fn main(init: std.process.Init) !u8 {
             .{cluster.nodes[0].port},
         ) catch unreachable;
         runProgram(io, &.{
-            cluster.zaxon, "membership",  "status",   "--connect", connect,
-            "--tls-cert",  admin_cert,    "--tls-key", admin_key,
-            "--tls-ca",    ca_path,       "--json",
+            cluster.zaxon, "membership", "status",    "--connect", connect,
+            "--tls-cert",  admin_cert,   "--tls-key", admin_key,   "--tls-ca",
+            ca_path,       "--json",
         }) catch fail(&cluster, "zaxon membership status failed", .{});
         var operation_buffer: [24]u8 = undefined;
         const expected_text = std.fmt.bufPrint(
@@ -872,12 +881,11 @@ pub fn main(init: std.process.Init) !u8 {
             .{cluster.replacement_port},
         ) catch unreachable;
         runProgram(io, &.{
-            cluster.zaxon,       "replace-voter", "--connect", connect,
-            "--operation",       "1",             "--expected-config",
-            expected_text,       "--old-node",    "3",
-            "--new-node",        new_node_spec,   "--tls-cert",
-            admin_cert,          "--tls-key",     admin_key,
-            "--tls-ca",          ca_path,
+            cluster.zaxon, "replace-voter", "--connect",         connect,
+            "--operation", "1",             "--expected-config", expected_text,
+            "--old-node",  "3",             "--new-node",        new_node_spec,
+            "--tls-cert",  admin_cert,      "--tls-key",         admin_key,
+            "--tls-ca",    ca_path,
         }) catch fail(&cluster, "zaxon replace-voter retry failed", .{});
     }
 
