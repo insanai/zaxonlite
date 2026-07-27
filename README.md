@@ -1,6 +1,7 @@
 # zaxonlite
 
-SQLite that several machines keep identical.
+A distributed SQL database built on SQLite. Write to any node, read from
+any node, and consensus keeps every copy identical.
 
 **Read the book:**
 [The Zaxonlite book (PDF)](https://insanai.github.io/zxdocs/zaxonlite.pdf)
@@ -19,8 +20,9 @@ the same, even while machines crash and restart and the network misbehaves.
 The moment you say "exactly the same", you have a consensus problem. This
 project solves it with [paxos-zig](https://github.com/insanai/paxos-zig),
 a Multi-Paxos library, and it stays embeddable: link one Zig library (or
-the C ABI), open one data directory, and you get a durable SQL store as a
-single node or as a transport-owning cluster. The companion CLI is `zaxon`.
+the C ABI), open one data directory, and you get a durable SQL database as
+a single node or as a distributed cluster that accepts reads and writes at
+every node. The companion CLI is `zaxon`.
 
 ## Two ideas worth understanding
 
@@ -46,7 +48,9 @@ operating zaxonlite, remember this one.
 
 ## What you get
 
-- One writer, one to nine voters, and any number of non-voting nodes:
+- Reads and writes at every node. A follower answers a write with a leader
+  redirect that the client follows automatically; one elected leader orders
+  each transaction. One to nine voters, and any number of non-voting nodes:
   `standby` (promotion-eligible copy), `read-replica` (read copy),
   `witness` (votes, holds no SQL), and `gateway` (a stateless router).
 - Exactly-once sessions. Session state rides inside the replicated
@@ -58,6 +62,10 @@ operating zaxonlite, remember this one.
 - Snapshots and epoch rollover: online checkpoints seal 2,048-slot epochs,
   every member builds a byte-identical generation, and rollover is
   crash-resumable.
+- Decided membership: served clusters persist a consensus-decided
+  registry, and `zaxon replace-voter` replaces one failed data voter
+  online -- same database identity, client connections stay open, and the
+  removed node ID is retired forever.
 - Mutual TLS 1.3 on every production TCP listener, with short-lived
   single-use certificate enrollment (`zaxon enroll`).
 - A C ABI: `libzaxonlite.a` plus `include/zaxonlite.h`.
@@ -192,7 +200,11 @@ bound to configured node IDs, and TLS covers SQL, results, payloads, and
 snapshots. An optional provider-file PSK adds sequenced HMAC protection
 inside TLS. `--dev-psk` is for loopback experiments only; plaintext TCP is
 gated behind test failpoints; local single-node service uses an owner-only
-Unix socket. Static membership is the authorization boundary.
+Unix socket. The decided membership registry is the authorization
+boundary: only identities it names can connect, and a replaced voter's ID
+is rejected even with an otherwise valid certificate. Privileged
+membership operations additionally require a `zaxon-admin-<name>`
+certificate from the server's allow-list.
 
 Files on disk (database, WAL, journal, snapshots, backups) are plaintext.
 If you need protection from someone holding the disk, use full-disk or
@@ -201,9 +213,11 @@ otherwise.
 
 ## Current limits
 
-One logical writer. One to nine statically configured voters, and no
-automatic voter replacement yet. Transactions are capped at 64 MiB minus
-framing. Windows needs release 1809 or Server 2019 and newer, on NTFS:
+Writes are accepted at any node but ordered by one elected leader at a
+time; there is no multi-master concurrency. One to nine voters. Voter
+replacement is a decided, operator-initiated operation -- one voter at a
+time, at least three voters -- and nothing replaces a voter
+automatically. Transactions are capped at 64 MiB minus framing. Windows needs release 1809 or Server 2019 and newer, on NTFS:
 the storage layer relies on POSIX rename semantics and on the NTFS
 metadata log to persist directory entries, and a node refuses to start
 where a probe shows they are missing rather than quietly weakening the
@@ -227,6 +241,7 @@ zig build check              # compile every binary without running
 zig build test               # unit + shell + single-process integration
 zig build test-crash         # spawned-process crash matrix
 zig build test-cluster       # three-process scenario (-Dcluster-runs=N)
+zig build test-replace-cluster # decided voter replacement under mTLS
 zig build test-roles         # voters, witness, standby, read replica
 zig build test-gateway       # stateless end-to-end gateway
 zig build test-fault-network # loss/duplication/reorder/fragmentation
@@ -250,6 +265,10 @@ data/
   payloads/aa/<hash>       # immutable frame payloads by SHA-256
   snapshots/<config>/      # db image + manifest per sealed epoch
   CURRENT                  # installed snapshot pointer
+  registries/<config>      # canonical decided-registry blobs
+  REGISTRY                 # active decided-registry pointer
+  PENDING-OP               # one in-flight replacement request, if any
+  JOIN                     # one-shot join descriptor on an enrolling node
   current.db               # materialized SQLite image (rebuildable)
 ```
 
