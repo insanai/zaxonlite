@@ -1207,6 +1207,23 @@ pub const Server = struct {
         return !membershipMatchesRegistry(generation, decided);
     }
 
+    /// Housekeeping after the node entered a new configuration: reset
+    /// per-epoch peer progress and wake rollover waiters. A same-member
+    /// advance keeps the transport generation valid, so its traffic is
+    /// released by adopting the new configuration id here; a decided
+    /// membership change leaves the transport stale until
+    /// `rebuildTransport` swaps it. Caller holds `mutex`.
+    fn enterConfigurationLocked(self: *Server) void {
+        if (!self.transportStaleLocked()) {
+            self.transport_configuration_id =
+                self.node.identity.configuration_id;
+        }
+        for (self.senders.items) |sender| sender.learned_through = 0;
+        self.learner_leader = null;
+        self.learner_last_contact_tick = null;
+        self.rollover_cond.broadcast(self.io);
+    }
+
     /// Rebuilds the transport boundary from the decided registry after an
     /// in-process rollover: publishes the next membership generation,
     /// tears down and rebuilds peer senders, and closes connections from
@@ -1506,10 +1523,7 @@ pub const Server = struct {
             }
         }
         if (self.node.identity.configuration_id != previous_configuration) {
-            for (self.senders.items) |sender| sender.learned_through = 0;
-            self.learner_leader = null;
-            self.learner_last_contact_tick = null;
-            self.rollover_cond.broadcast(self.io);
+            self.enterConfigurationLocked();
         }
 
         // Write waiter resolution.
@@ -2669,6 +2683,7 @@ pub const Server = struct {
         defer self.mutex.unlock(self.io);
         self.snapshot_source = null;
         if (self.installation == .transferring) self.installation = .verifying;
+        const previous_configuration = self.node.identity.configuration_id;
         self.node.installSnapshot(
             install.configuration_id,
             install.name,
@@ -2688,6 +2703,11 @@ pub const Server = struct {
             // matching transport generation has been published.
             self.installation = .installed;
             self.installation_failure = null;
+        }
+        // The install advances the identity before `pump` runs, so the
+        // pump's own configuration-change detection cannot see it.
+        if (self.node.identity.configuration_id != previous_configuration) {
+            self.enterConfigurationLocked();
         }
         self.observed_leader_decided = 0;
         self.node.requestCatchUp(from) catch {};
