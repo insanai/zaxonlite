@@ -483,7 +483,7 @@ pub fn build(b: *std.Build) void {
     bench_step.dependOn(&run_bench.step);
 
     // Search benchmarks (ZDS 0009 performance gates): kernel throughput,
-    // storage ratio, heap bounds, mmap profiles, and fixture-gated recall.
+    // storage ratio, heap bounds, mmap profiles, and representative recall.
     const search_bench_exe = b.addExecutable(.{
         .name = "zaxon-search-bench",
         .root_module = b.createModule(.{
@@ -556,16 +556,39 @@ pub fn build(b: *std.Build) void {
     // Cross-target compile gate for the pure search kernels: the module
     // has no dependencies, so it must build for every supported vector
     // target, including the scalar fallbacks (ZDS 0009).
-    const kernel_targets = [_][]const u8{
-        "aarch64-linux-gnu",
-        "aarch64-windows-gnu",
-        "x86_64-linux-gnu",
-        "x86_64-windows-gnu",
-        "x86-linux-gnu",
-        "arm-linux-musleabi",
-        "arm-linux-musleabihf",
-        "wasm32-wasi",
-        "riscv64-linux-gnu",
+    const KernelTarget = struct {
+        name: []const u8,
+        triple: []const u8,
+        cpu_features: ?[]const u8 = null,
+    };
+    const kernel_targets = [_]KernelTarget{
+        .{ .name = "aarch64-macos", .triple = "aarch64-macos" },
+        .{ .name = "aarch64-linux", .triple = "aarch64-linux-gnu" },
+        .{ .name = "aarch64-windows", .triple = "aarch64-windows-gnu" },
+        .{ .name = "x86_64-linux", .triple = "x86_64-linux-gnu" },
+        .{ .name = "x86_64-windows", .triple = "x86_64-windows-gnu" },
+        .{ .name = "x86-linux", .triple = "x86-linux-gnu" },
+        .{
+            .name = "armv7-scalar",
+            .triple = "arm-linux-musleabihf",
+            .cpu_features = "baseline-neon",
+        },
+        .{
+            .name = "armv7-neon",
+            .triple = "arm-linux-musleabihf",
+            .cpu_features = "baseline+neon",
+        },
+        .{
+            .name = "wasm32-scalar",
+            .triple = "wasm32-wasi",
+            .cpu_features = "baseline-simd128",
+        },
+        .{
+            .name = "wasm32-simd128",
+            .triple = "wasm32-wasi",
+            .cpu_features = "baseline+simd128",
+        },
+        .{ .name = "riscv64-scalar", .triple = "riscv64-linux-gnu" },
     };
     // Disassembly gate (ZDS 0009): a ReleaseFast object exporting the
     // SIMD cosine kernel; benchmarks/verify-simd.sh greps its
@@ -592,17 +615,23 @@ pub fn build(b: *std.Build) void {
         "check-kernels",
         "Cross-compile the pure search kernels for the vector target matrix",
     );
-    for (kernel_targets) |triple| {
+    for (kernel_targets) |kernel_target| {
         const query = std.Target.Query.parse(
-            .{ .arch_os_abi = triple },
+            .{
+                .arch_os_abi = kernel_target.triple,
+                .cpu_features = kernel_target.cpu_features,
+            },
         ) catch unreachable;
         const kernel_mod = b.createModule(.{
-            .root_source_file = b.path("src/search/root.zig"),
+            // The exported probe forces semantic analysis and code
+            // generation of the distance kernel. Compiling root.zig alone
+            // would be a weak lazy-analysis check that could emit no code.
+            .root_source_file = b.path("src/search/disasm_probe.zig"),
             .target = b.resolveTargetQuery(query),
             .optimize = optimize,
         });
         const kernel_obj = b.addObject(.{
-            .name = b.fmt("zaxon-search-{s}", .{triple}),
+            .name = b.fmt("zaxon-search-{s}", .{kernel_target.name}),
             .root_module = kernel_mod,
         });
         kernels_step.dependOn(&kernel_obj.step);

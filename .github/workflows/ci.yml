@@ -65,6 +65,9 @@ jobs:
           mkdir -p "${ZIG_GLOBAL_CACHE_DIR:-$HOME/.cache/zig}/tmp"
           rm -rf "${ZIG_LOCAL_CACHE_DIR:-.zig-cache}/zx-capi-smoke"
 
+      - name: Zig format check
+        run: zig fmt --check build.zig src
+
       # Only src/sqlite/ may import the translated SQLite C module
       # (ZDS 0009). A plain grep keeps that boundary honest.
       - name: SQLite C import boundary
@@ -84,10 +87,13 @@ jobs:
           zig build disasm-probe
           sh benchmarks/verify-simd.sh
 
-      # The pinned retrieval fixture is generated offline; CI only proves
-      # the recorded artifact hashes still match.
-      - name: Benchmark fixture hashes
-        run: python3 benchmarks/verify-fixture.py
+      # The checked representative fixture is mandatory; Qwen qualification
+      # artifacts are verified too when explicitly generated offline.
+      - name: Benchmark fixtures
+        run: |
+          python3 benchmarks/generate-representative-fixture.py
+          python3 benchmarks/verify-fixture.py
+          git diff --exit-code -- benchmarks/data/representative-v1-512
 
       - name: Unit and single-process integration tests
         run: zig build test
