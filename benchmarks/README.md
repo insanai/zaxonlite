@@ -108,3 +108,22 @@ Tune only through recorded environment variables: `OPERATIONS`, `WARMUP`,
 `PAYLOAD_BYTES`, `BASE_PORT`, `ZAXON_BIN`, `RQLITED_BIN`, `RQLITE_CLI`,
 `DQLITE_DEMO`, and `PYTHON`. Failed runs preserve their generated directories
 and logs; `KEEP_RUN_DIR=1` also preserves a successful run.
+
+## Search benchmarks (ZDS 0009)
+
+`zig build bench-search` records kernel throughput (scalar versus SIMD
+cosine at dimensions 384 to 1536 plus a tail case), the coarse-bit versus
+float32 storage ratio, the SQLite heap high-water mark versus candidate
+count at two corpus sizes, and mmap-on versus mmap-off hybrid query
+latency into `results/search-latest.json`.
+
+Retrieval quality uses the pinned GME fixture under
+`data/gme-qwen2-vl-2b-1536/`. It is generated offline, once, with
+`generate-gme-fixture.py` (the model never runs in CI); CI verifies the
+recorded SHA-256 hashes with `verify-fixture.py`. When the fixture is
+present, `bench-search` also records final recall at oversampling
+factors 4, 8, and 16 against an exact float32 scan.
+
+`verify-simd.sh` is the disassembly gate: after `zig build disasm-probe`
+it greps the ReleaseFast cosine kernel object for packed float
+multiply/add instructions. A benchmark alone is not proof of SIMD.
