@@ -115,14 +115,23 @@ and logs; `KEEP_RUN_DIR=1` also preserves a successful run.
 cosine at dimensions 384 to 1536 plus a tail case), the coarse-bit versus
 float32 storage ratio, the SQLite heap high-water mark versus candidate
 count at two corpus sizes, and mmap-on versus mmap-off hybrid query
-latency into `results/search-latest.json`.
+latency, SQLite page reads, peak RSS, and minor/major page-fault deltas
+into `results/search-latest.json`. RSS and page-fault counters are
+available on Linux and macOS; other targets omit those host-specific
+measurements.
 
-Retrieval quality uses the pinned GME fixture under
-`data/gme-qwen2-vl-2b-1536/`. It is generated offline, once, with
-`generate-gme-fixture.py` (the model never runs in CI); CI verifies the
-recorded SHA-256 hashes with `verify-fixture.py`. When the fixture is
-present, `bench-search` also records final recall at oversampling
-factors 4, 8, and 16 against an exact float32 scan.
+Every run uses the checked `data/representative-v1-512/` bundle:
+96 corpus vectors plus 12 text and 12 image queries. Recreate it with
+`generate-representative-fixture.py`, which uses only the Python
+standard library. `verify-fixture.py` validates its NumPy layout,
+normalization, relevance structure, manifest, and hashes. `bench-search`
+records recall at oversampling factors 4, 8, and 16 against an exact
+float32 scan and fails if any representative result falls below 1.0.
+
+The representative vectors prove search mechanics, not neural-model
+quality. `generate-gme-fixture.py` remains the optional offline
+GME/Qwen 2B qualification harness; routine CI neither downloads nor
+runs that model.
 
 `verify-simd.sh` is the disassembly gate: after `zig build disasm-probe`
 it greps the ReleaseFast cosine kernel object for packed float

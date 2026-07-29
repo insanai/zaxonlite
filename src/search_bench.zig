@@ -1,8 +1,8 @@
 //! Search benchmarks (ZDS 0009 performance gates): scalar versus SIMD
 //! rerank throughput across the compatibility dimensions, coarse-bit
 //! versus float32 storage ratio, SQLite heap high-water versus candidate
-//! count, mmap-on versus mmap-off query latency, and — when the pinned
-//! GME fixture is present — final recall at oversampling 4, 8, and 16.
+//! count, mmap-on versus mmap-off query latency, RSS, and page faults,
+//! and representative text/image recall at oversampling 4, 8, and 16.
 //!
 //! Usage: search-bench [--record <path>]
 //!
@@ -10,29 +10,52 @@
 //! numbers, never prose copies.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const zaxonlite = @import("zaxonlite");
 const search = @import("zaxon_search");
 
 const sqlite = zaxonlite.sqlite;
 
-const fixture_dir = "benchmarks/data/gme-qwen2-vl-2b-1536";
+const fixture_dir = "benchmarks/data/representative-v1-512";
+const max_result_name_bytes = 63;
 
 fn nowNs(io: Io) i96 {
     return std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds;
 }
 
 const Result = struct {
-    name: []const u8,
+    name_buffer: [max_result_name_bytes]u8 = undefined,
+    name_len: u8,
     value: f64,
     unit: []const u8,
+
+    fn init(metric_name: []const u8, value: f64, unit: []const u8) Result {
+        if (metric_name.len > max_result_name_bytes) {
+            @panic("search benchmark metric name exceeds its static bound");
+        }
+        var result = Result{
+            .name_len = @intCast(metric_name.len),
+            .value = value,
+            .unit = unit,
+        };
+        @memcpy(result.name_buffer[0..metric_name.len], metric_name);
+        return result;
+    }
+
+    fn name(self: *const Result) []const u8 {
+        return self.name_buffer[0..self.name_len];
+    }
 };
 
 var results_buffer: [64]Result = undefined;
 var results_len: usize = 0;
 
 fn record(name: []const u8, value: f64, unit: []const u8) void {
-    results_buffer[results_len] = .{ .name = name, .value = value, .unit = unit };
+    if (results_len == results_buffer.len) {
+        @panic("search benchmark result count exceeds its static bound");
+    }
+    results_buffer[results_len] = Result.init(name, value, unit);
     results_len += 1;
     std.debug.print("{s:<44} {d:>14.3} {s}\n", .{ name, value, unit });
 }
@@ -251,7 +274,17 @@ fn benchHeapAndMmap(io: Io, gpa: std.mem.Allocator, root: []const u8) !void {
     defer gpa.free(query);
     fillRandomUnit(random, query);
     const query_bytes = std.mem.sliceAsBytes(query);
+    try benchHeap(gpa, random, root, dims, query_bytes);
+    try benchMmap(io, root, query_bytes);
+}
 
+fn benchHeap(
+    gpa: std.mem.Allocator,
+    random: std.Random,
+    root: []const u8,
+    dims: usize,
+    query_bytes: []const u8,
+) !void {
     // Heap high-water versus candidate count, at two corpus sizes: the
     // bound must follow the candidate count, not the row count.
     var heap_small: f64 = 0;
@@ -289,10 +322,11 @@ fn benchHeapAndMmap(io: Io, gpa: std.mem.Allocator, root: []const u8) !void {
     // Quadrupling the corpus must not scale the query heap: allow noise,
     // reject proportional growth.
     record("heap_growth_vs_corpus", heap_large / heap_small, "x");
+}
 
+fn benchMmap(io: Io, root: []const u8, query_bytes: []const u8) !void {
     // mmap-off versus the 256 MiB opt-in profile on the same image.
-    var latency_by_profile = [_]f64{ 0, 0 };
-    for ([_]u64{ 0, 256 * 1024 * 1024 }, 0..) |mmap_size, index| {
+    for ([_]u64{ 0, 256 * 1024 * 1024 }) |mmap_size| {
         var path_buffer: [128]u8 = undefined;
         const path = try std.fmt.bufPrintZ(
             &path_buffer,
@@ -302,15 +336,18 @@ fn benchHeapAndMmap(io: Io, gpa: std.mem.Allocator, root: []const u8) !void {
         var db = try sqlite.Db.openWithOptions(path, .{ .mmap_size = mmap_size });
         defer db.close();
         _ = try runHybrid(&db, query_bytes, 512, 10); // warm
+        const usage_before = resourceUsage();
+        const cache_misses_before = try db.cacheMisses();
         const iterations = 50;
         const start = nowNs(io);
         for (0..iterations) |_| {
             _ = try runHybrid(&db, query_bytes, 512, 10);
         }
         const elapsed = nowNs(io) - start;
+        const usage_after = resourceUsage();
+        const cache_misses_after = try db.cacheMisses();
         const mean_us = @as(f64, @floatFromInt(@as(i64, @intCast(elapsed)))) /
             (1000.0 * iterations);
-        latency_by_profile[index] = mean_us;
         var name_buffer: [64]u8 = undefined;
         record(
             std.fmt.bufPrint(
@@ -330,11 +367,82 @@ fn benchHeapAndMmap(io: Io, gpa: std.mem.Allocator, root: []const u8) !void {
             @floatFromInt(db.effective_mmap_size),
             "bytes",
         );
+        recordPageReads(mmap_size, cache_misses_before, cache_misses_after);
+        recordResourceUsage(mmap_size, usage_before, usage_after);
     }
 }
 
+const ResourceUsage = struct {
+    peak_rss_bytes: u64,
+    minor_faults: u64,
+    major_faults: u64,
+};
+
+fn recordPageReads(mmap_size: u64, before: u64, after: u64) void {
+    var name_buffer: [64]u8 = undefined;
+    record(
+        std.fmt.bufPrint(
+            &name_buffer,
+            "sqlite_pages_read_mmap{d}",
+            .{mmap_size / (1024 * 1024)},
+        ) catch unreachable,
+        @floatFromInt(after -| before),
+        "pages",
+    );
+}
+
+fn resourceUsage() ?ResourceUsage {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return null;
+    const usage = std.posix.getrusage(std.posix.rusage.SELF);
+    // Darwin reports bytes; Linux reports KiB.
+    const rss_scale: u64 = if (builtin.os.tag == .macos) 1 else 1024;
+    return .{
+        .peak_rss_bytes = @as(u64, @intCast(usage.maxrss)) * rss_scale,
+        .minor_faults = @intCast(usage.minflt),
+        .major_faults = @intCast(usage.majflt),
+    };
+}
+
+fn recordResourceUsage(
+    mmap_size: u64,
+    before: ?ResourceUsage,
+    after: ?ResourceUsage,
+) void {
+    const initial = before orelse return;
+    const final = after orelse return;
+    const profile_mib = mmap_size / (1024 * 1024);
+    var name_buffer: [64]u8 = undefined;
+    record(
+        std.fmt.bufPrint(
+            &name_buffer,
+            "rss_peak_mib_mmap{d}",
+            .{profile_mib},
+        ) catch unreachable,
+        @as(f64, @floatFromInt(final.peak_rss_bytes)) / (1024.0 * 1024.0),
+        "MiB",
+    );
+    record(
+        std.fmt.bufPrint(
+            &name_buffer,
+            "minor_page_faults_mmap{d}",
+            .{profile_mib},
+        ) catch unreachable,
+        @floatFromInt(final.minor_faults -| initial.minor_faults),
+        "faults",
+    );
+    record(
+        std.fmt.bufPrint(
+            &name_buffer,
+            "major_page_faults_mmap{d}",
+            .{profile_mib},
+        ) catch unreachable,
+        @floatFromInt(final.major_faults -| initial.major_faults),
+        "faults",
+    );
+}
+
 // ----------------------------------------------------------------------
-// Fixture-gated recall at oversampling factors 4, 8, and 16
+// Checked representative recall at oversampling factors 4, 8, and 16
 // ----------------------------------------------------------------------
 
 const Npy = struct {
@@ -360,6 +468,7 @@ fn readNpy(io: Io, gpa: std.mem.Allocator, path: []const u8) !Npy {
         return error.BadNpy;
     }
     const header_len = std.mem.readInt(u16, bytes[8..10], .little);
+    if (header_len > bytes.len - 10) return error.BadNpy;
     const header = bytes[10 .. 10 + header_len];
     if (std.mem.indexOf(u8, header, "'<f4'") == null) return error.BadNpy;
     if (std.mem.indexOf(u8, header, "'fortran_order': False") == null) {
@@ -380,12 +489,27 @@ fn readNpy(io: Io, gpa: std.mem.Allocator, path: []const u8) !Npy {
         shape_it.next() orelse return error.BadNpy,
         10,
     );
+    if (rows == 0 or dims == 0) return error.BadNpy;
     const payload = bytes[10 + header_len ..];
-    if (payload.len < rows * dims * 4) return error.BadNpy;
-    const data = try gpa.alloc(f32, rows * dims);
-    @memcpy(std.mem.sliceAsBytes(data), payload[0 .. rows * dims * 4]);
+    const elements = std.math.mul(usize, rows, dims) catch
+        return error.BadNpy;
+    const payload_bytes = std.math.mul(usize, elements, @sizeOf(f32)) catch
+        return error.BadNpy;
+    if (payload.len != payload_bytes) return error.BadNpy;
+    const data = try gpa.alloc(f32, elements);
+    @memcpy(std.mem.sliceAsBytes(data), payload);
     return .{ .rows = rows, .dims = dims, .data = data };
 }
+
+const Neighbor = struct {
+    id: usize,
+    distance: f64,
+
+    fn lessThan(_: void, a: Neighbor, b: Neighbor) bool {
+        if (a.distance != b.distance) return a.distance < b.distance;
+        return a.id < b.id;
+    }
+};
 
 fn benchRecall(io: Io, gpa: std.mem.Allocator, root: []const u8) !void {
     var corpus_path_buffer: [128]u8 = undefined;
@@ -394,111 +518,135 @@ fn benchRecall(io: Io, gpa: std.mem.Allocator, root: []const u8) !void {
         "{s}/corpus.f32.npy",
         .{fixture_dir},
     ) catch unreachable;
-    Io.Dir.cwd().access(io, corpus_path, .{}) catch {
-        std.debug.print(
-            "recall: fixture {s} absent; skipping (generate it offline)\n",
-            .{fixture_dir},
-        );
-        return;
-    };
-
     const corpus = try readNpy(io, gpa, corpus_path);
     defer corpus.deinit(gpa);
-    var queries_path_buffer: [128]u8 = undefined;
-    const queries = try readNpy(io, gpa, std.fmt.bufPrint(
-        &queries_path_buffer,
-        "{s}/text-queries.f32.npy",
-        .{fixture_dir},
-    ) catch unreachable);
-    defer queries.deinit(gpa);
-    if (queries.dims != corpus.dims) return error.BadNpy;
-
     var path_buffer: [128]u8 = undefined;
     const db_path = try std.fmt.bufPrintZ(&path_buffer, "{s}/recall.db", .{root});
-    {
-        var db = try sqlite.Db.open(db_path);
-        defer db.close();
-        try db.exec("pragma journal_mode = wal");
-        var ddl_buffer: [256]u8 = undefined;
-        try db.exec(try std.fmt.bufPrintZ(
-            &ddl_buffer,
-            "create virtual table v using vec0(" ++
-                "item_id integer primary key, " ++
-                "embedding float[{d}], embedding_coarse bit[{d}])",
-            .{ corpus.dims, corpus.dims },
-        ));
-        var insert = try db.prepare(
-            "insert into v(item_id, embedding, embedding_coarse) " ++
-                "values (?1, ?2, vec_quantize_binary(?2))",
-        );
-        defer insert.finalize();
-        try db.exec("begin");
-        for (0..corpus.rows) |i| {
-            try insert.reset();
-            try insert.bindInt64(1, @intCast(i));
-            try insert.bindBlob(2, std.mem.sliceAsBytes(
-                corpus.data[i * corpus.dims .. (i + 1) * corpus.dims],
-            ));
-            _ = try insert.step();
-        }
-        try db.exec("commit");
-    }
+    try buildRecallDb(db_path, corpus);
 
+    inline for (.{ "text", "image" }) |modality| {
+        var queries_path_buffer: [128]u8 = undefined;
+        const queries_path = std.fmt.bufPrint(
+            &queries_path_buffer,
+            "{s}/{s}-queries.f32.npy",
+            .{ fixture_dir, modality },
+        ) catch unreachable;
+        const queries = try readNpy(io, gpa, queries_path);
+        defer queries.deinit(gpa);
+        if (queries.dims != corpus.dims) return error.BadNpy;
+        try measureRecall(gpa, db_path, corpus, queries, modality);
+    }
+}
+
+fn buildRecallDb(db_path: [:0]const u8, corpus: Npy) !void {
     var db = try sqlite.Db.open(db_path);
     defer db.close();
+    try db.exec("pragma journal_mode = wal");
+    var ddl_buffer: [256]u8 = undefined;
+    try db.exec(try std.fmt.bufPrintZ(
+        &ddl_buffer,
+        "create virtual table v using vec0(" ++
+            "item_id integer primary key, " ++
+            "embedding float[{d}], embedding_coarse bit[{d}])",
+        .{ corpus.dims, corpus.dims },
+    ));
+    var insert = try db.prepare(
+        "insert into v(item_id, embedding, embedding_coarse) " ++
+            "values (?1, ?2, vec_quantize_binary(?2))",
+    );
+    defer insert.finalize();
+    try db.exec("begin");
+    for (0..corpus.rows) |i| {
+        try insert.reset();
+        try insert.bindInt64(1, @intCast(i));
+        try insert.bindBlob(2, std.mem.sliceAsBytes(
+            corpus.data[i * corpus.dims .. (i + 1) * corpus.dims],
+        ));
+        _ = try insert.step();
+    }
+    try db.exec("commit");
+}
+
+fn measureRecall(
+    gpa: std.mem.Allocator,
+    db_path: [:0]const u8,
+    corpus: Npy,
+    queries: Npy,
+    modality: []const u8,
+) !void {
     const k = 10;
-    const Neighbor = struct { id: usize, distance: f64 };
+    if (corpus.rows < k) return error.BadNpy;
+    var db = try sqlite.Db.open(db_path);
+    defer db.close();
     const exact = try gpa.alloc(Neighbor, corpus.rows);
     defer gpa.free(exact);
-
     for ([_]usize{ 4, 8, 16 }) |factor| {
         var hits: usize = 0;
         var total: usize = 0;
         for (0..queries.rows) |q| {
-            const query_vector =
-                queries.data[q * queries.dims .. (q + 1) * queries.dims];
-            const query_bytes = std.mem.sliceAsBytes(query_vector);
-            // Exact ground truth by full float32 scan.
-            for (0..corpus.rows) |i| {
-                exact[i] = .{ .id = i, .distance = try search.vector
-                    .cosineDistanceScalar(query_bytes, std.mem.sliceAsBytes(
-                    corpus.data[i * corpus.dims .. (i + 1) * corpus.dims],
-                )) };
-            }
-            std.mem.sort(Neighbor, exact, {}, struct {
-                fn lessThan(_: void, a: Neighbor, b: Neighbor) bool {
-                    if (a.distance != b.distance) return a.distance < b.distance;
-                    return a.id < b.id;
-                }
-            }.lessThan);
-
-            var stmt = try db.prepare(coarse_rerank_sql);
-            defer stmt.finalize();
-            try stmt.bindBlob(1, query_bytes);
-            try stmt.bindInt64(2, @intCast(@min(factor * k, 4096)));
-            try stmt.bindInt64(3, k);
-            while (try stmt.step()) {
-                const id: usize = @intCast(stmt.columnInt64(0));
-                for (exact[0..k]) |neighbor| {
-                    if (neighbor.id == id) {
-                        hits += 1;
-                        break;
-                    }
-                }
-                total += 1;
-            }
+            const query = queries.data[q * queries.dims .. (q + 1) * queries.dims];
+            const counts = try queryRecall(&db, corpus, query, exact, factor, k);
+            hits += counts.hits;
+            total += counts.total;
         }
+        if (total == 0) return error.BadNpy;
+        const recall = @as(f64, @floatFromInt(hits)) /
+            @as(f64, @floatFromInt(total));
         var name_buffer: [64]u8 = undefined;
         record(
             std.fmt.bufPrint(
                 &name_buffer,
-                "recall_at_{d}_oversample_{d}",
-                .{ k, factor },
+                "recall_{s}_at_{d}_oversample_{d}",
+                .{ modality, k, factor },
             ) catch unreachable,
-            @as(f64, @floatFromInt(hits)) / @as(f64, @floatFromInt(total)),
+            recall,
             "fraction",
         );
+        // The checked fixture is deliberately separable. Any miss is a
+        // mechanical regression in coarse selection or exact reranking,
+        // not model-quality variance.
+        if (hits != total) return error.RecallRegression;
     }
+}
+
+fn queryRecall(
+    db: *sqlite.Db,
+    corpus: Npy,
+    query: []const f32,
+    exact: []Neighbor,
+    factor: usize,
+    k: usize,
+) !struct { hits: usize, total: usize } {
+    const query_bytes = std.mem.sliceAsBytes(query);
+    for (0..corpus.rows) |i| {
+        const candidate = corpus.data[i * corpus.dims .. (i + 1) * corpus.dims];
+        exact[i] = .{
+            .id = i,
+            .distance = try search.vector.cosineDistanceScalar(
+                query_bytes,
+                std.mem.sliceAsBytes(candidate),
+            ),
+        };
+    }
+    std.mem.sort(Neighbor, exact, {}, Neighbor.lessThan);
+    var stmt = try db.prepare(coarse_rerank_sql);
+    defer stmt.finalize();
+    try stmt.bindBlob(1, query_bytes);
+    try stmt.bindInt64(2, @intCast(@min(factor * k, 4096)));
+    try stmt.bindInt64(3, @intCast(k));
+    var hits: usize = 0;
+    var total: usize = 0;
+    while (try stmt.step()) {
+        const id: usize = @intCast(stmt.columnInt64(0));
+        for (exact[0..k]) |neighbor| {
+            if (neighbor.id == id) {
+                hits += 1;
+                break;
+            }
+        }
+        total += 1;
+    }
+    return .{ .hits = hits, .total = total };
 }
 
 // ----------------------------------------------------------------------
@@ -514,7 +662,7 @@ fn writeResults(io: Io, path: []const u8) !void {
         if (index > 0) try writer.writeAll(",");
         try writer.print(
             "{{\"name\":\"{s}\",\"value\":{d},\"unit\":\"{s}\"}}",
-            .{ result.name, result.value, result.unit },
+            .{ result.name(), result.value, result.unit },
         );
     }
     try writer.writeAll("]}\n");

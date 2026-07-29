@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Offline generator for the pinned GME retrieval-quality fixture (ZDS 0009).
+"""Optional GME/Qwen 2B retrieval-quality qualification harness (ZDS 0009).
 
 Never run in CI. This script loads Alibaba-NLP/gme-Qwen2-VL-2B-Instruct
 (2.21B parameters; expect roughly 2.2 to 4 GiB in reduced precision),
 embeds a corpus plus text and image queries, and writes the bounded
-fixture that routine benchmarks consume:
+qualification fixture used for explicit model-quality runs:
 
     benchmarks/data/gme-qwen2-vl-2b-1536/
       manifest.json         model revision, config, hashes, licenses
@@ -23,10 +23,13 @@ Usage:
   python3 benchmarks/generate-gme-fixture.py \
     --corpus corpus.jsonl --text-queries tq.jsonl \
     --image-queries iq.jsonl --relevance relevance.json \
-    --revision <model-commit-sha> --license-note "<source licenses>"
+    --revision <model-commit-sha> --license-note "<source licenses>" \
+    --prompt-config prompts.json \
+    --preprocessing-note "<text/image preprocessing>"
 
-CI verifies the recorded SHA-256 hashes only (verify-fixture.py); the
-model, weights, and source media never enter the repository.
+This is deliberately separate from the checked representative fixture
+created by generate-representative-fixture.py. Routine CI never loads
+the model; the model, weights, and source media do not enter the repository.
 """
 
 import argparse
@@ -53,19 +56,55 @@ def load_jsonl(path: str):
         return [json.loads(line) for line in handle if line.strip()]
 
 
+def as_numpy(value):
+    """Copy a model result to a CPU NumPy array."""
+    if hasattr(value, "detach"):
+        value = value.detach()
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    if hasattr(value, "numpy"):
+        value = value.numpy()
+    return value
+
+
 def embed(model, items):
     import numpy as np
 
-    texts = [item["text"] for item in items if "text" in item]
-    images = [item["image"] for item in items if "image" in item]
-    vectors = []
-    if texts:
-        vectors.append(model.get_text_embeddings(texts=texts))
-    if images:
-        vectors.append(model.get_image_embeddings(images=images))
-    matrix = np.concatenate(vectors, axis=0).astype(np.float32)
-    if matrix.shape[1] != DIMS:
-        raise SystemExit(f"expected {DIMS} dimensions, got {matrix.shape[1]}")
+    if not items:
+        raise SystemExit("embedding input must contain at least one item")
+    text_rows = []
+    image_rows = []
+    for index, item in enumerate(items):
+        has_text = "text" in item
+        has_image = "image" in item
+        if has_text == has_image:
+            raise SystemExit(
+                f"item {index} must contain exactly one of text or image"
+            )
+        target = text_rows if has_text else image_rows
+        target.append((index, item["text"] if has_text else item["image"]))
+
+    matrix = np.empty((len(items), DIMS), dtype=np.float32)
+    if text_rows:
+        values = np.asarray(as_numpy(model.get_text_embeddings(
+            texts=[value for _, value in text_rows],
+        )), dtype=np.float32)
+        if values.shape != (len(text_rows), DIMS):
+            raise SystemExit(
+                f"text embeddings have shape {values.shape}, "
+                f"expected {(len(text_rows), DIMS)}"
+            )
+        matrix[[index for index, _ in text_rows]] = values
+    if image_rows:
+        values = np.asarray(as_numpy(model.get_image_embeddings(
+            images=[value for _, value in image_rows],
+        )), dtype=np.float32)
+        if values.shape != (len(image_rows), DIMS):
+            raise SystemExit(
+                f"image embeddings have shape {values.shape}, "
+                f"expected {(len(image_rows), DIMS)}"
+            )
+        matrix[[index for index, _ in image_rows]] = values
     norms = np.linalg.norm(matrix, axis=1, keepdims=True)
     return matrix / np.maximum(norms, 1e-12)
 
@@ -80,6 +119,10 @@ def main() -> int:
                         help="exact model repository commit")
     parser.add_argument("--license-note", required=True,
                         help="source-dataset license statement")
+    parser.add_argument("--prompt-config", required=True,
+                        help="JSON file describing query/corpus prompts")
+    parser.add_argument("--preprocessing-note", required=True,
+                        help="image and text preprocessing configuration")
     args = parser.parse_args()
 
     import numpy as np
@@ -97,13 +140,12 @@ def main() -> int:
         "image-queries.f32.npy": embed(model, load_jsonl(args.image_queries)),
     }
     for name, matrix in outputs.items():
-        np.save(OUT_DIR / name.removesuffix(".npy"), matrix)
-        # np.save appends .npy to the stem; normalize the final name.
-        produced = OUT_DIR / (name.removesuffix(".npy") + ".npy")
-        produced.rename(OUT_DIR / name)
+        np.save(OUT_DIR / name, matrix)
 
     with open(args.relevance, "r", encoding="utf-8") as handle:
         relevance = json.load(handle)
+    with open(args.prompt_config, "r", encoding="utf-8") as handle:
+        prompt_config = json.load(handle)
     (OUT_DIR / "relevance.json").write_text(
         json.dumps(relevance, indent=1, sort_keys=True) + "\n"
     )
@@ -115,6 +157,8 @@ def main() -> int:
         "dtype": "float32",
         "normalization": "l2-unit",
         "distance": "cosine",
+        "prompt_config": prompt_config,
+        "preprocessing": args.preprocessing_note,
         "licenses": args.license_note,
         "row_ids": [item["id"] for item in corpus_items],
         "artifacts": {
