@@ -1330,3 +1330,113 @@ test "typed search matches the hand-written hybrid statement" {
         .candidate_count = 4097,
     }, .{}));
 }
+
+test "live transaction: read-your-writes, returning, savepoints, durability" {
+    const gpa = testing.allocator;
+    var test_dir = try TestDir.init(gpa);
+    defer test_dir.deinit(gpa);
+    const dir = try test_dir.nodeDir(gpa);
+    defer gpa.free(dir);
+
+    {
+        const node = try openNode(dir);
+        defer node.close();
+        _ = try node.exec("create table items(id integer primary key, v text)");
+
+        try node.beginLive();
+        try testing.expect(node.inLiveTransaction());
+
+        // Insert with RETURNING before commit.
+        var returning: ?zaxonlite.TypedResult = null;
+        const first = try node.liveExec(
+            gpa,
+            "insert into items(v) values (?1) returning id",
+            &.{.{ .text = "tea" }},
+            &returning,
+        );
+        try testing.expectEqual(@as(i64, 1), first.changes);
+        try testing.expect(first.last_insert_rowid != null);
+        try testing.expect(returning != null);
+        try testing.expectEqual(
+            first.last_insert_rowid.?,
+            returning.?.rows[0][0].integer,
+        );
+        returning.?.deinit();
+
+        // Read-your-writes on the same connection before commit.
+        var count_rows: ?zaxonlite.TypedResult = null;
+        _ = try node.liveExec(
+            gpa,
+            "select count(*) from items",
+            &.{},
+            &count_rows,
+        );
+        try testing.expectEqual(@as(i64, 1), count_rows.?.rows[0][0].integer);
+        count_rows.?.deinit();
+
+        // Savepoint, insert, roll back to the savepoint.
+        try node.liveSavepoint(1);
+        var discard: ?zaxonlite.TypedResult = null;
+        _ = try node.liveExec(
+            gpa,
+            "insert into items(v) values ('discarded')",
+            &.{},
+            &discard,
+        );
+        try node.liveRollbackToSavepoint(1);
+        try node.liveReleaseSavepoint(1);
+
+        // A one-shot write is refused while the transaction is open.
+        try testing.expectError(
+            error.TransactionOpen,
+            node.exec("insert into items(v) values ('blocked')"),
+        );
+
+        // Total-changes semantics: the savepoint-discarded insert still
+        // counts toward the transaction total; the table itself holds one
+        // row. Per-statement counts from liveExec stay precise.
+        const committed = try node.commitLive();
+        try testing.expectEqual(@as(i64, 2), committed.changes);
+        try testing.expect(!node.inLiveTransaction());
+        try testing.expectEqual(@as(i64, 1), try countItems(node));
+    }
+
+    // Commit survives close and reopen.
+    {
+        const node = try openNode(dir);
+        defer node.close();
+        try testing.expectEqual(@as(i64, 1), try countItems(node));
+        const report = try node.integrityCheck();
+        try testing.expect(report.ok());
+    }
+}
+
+test "live transaction: rollback publishes nothing" {
+    const gpa = testing.allocator;
+    var test_dir = try TestDir.init(gpa);
+    defer test_dir.deinit(gpa);
+    const dir = try test_dir.nodeDir(gpa);
+    defer gpa.free(dir);
+
+    const node = try openNode(dir);
+    defer node.close();
+    _ = try node.exec("create table items(id integer primary key, v text)");
+
+    try node.beginLive();
+    var discard: ?zaxonlite.TypedResult = null;
+    _ = try node.liveExec(
+        gpa,
+        "insert into items(v) values ('vanishes')",
+        &.{},
+        &discard,
+    );
+    try node.rollbackLive();
+    try testing.expect(!node.inLiveTransaction());
+    try testing.expectEqual(@as(i64, 0), try countItems(node));
+
+    // The node is fully usable afterwards.
+    _ = try node.exec("insert into items(v) values ('kept')");
+    try testing.expectEqual(@as(i64, 1), try countItems(node));
+    try testing.expectError(error.NoTransaction, node.commitLive());
+    try testing.expectError(error.NoTransaction, node.rollbackLive());
+}
