@@ -31,6 +31,7 @@ const wire = @import("wire.zig");
 const transport_auth = @import("transport_auth.zig");
 const tls = @import("tls.zig");
 const node_mod = @import("node.zig");
+const sqlite = @import("sqlite.zig");
 const prepared = @import("prepared.zig");
 const search_api = @import("search_api.zig");
 const payload_store_mod = @import("payload_store.zig");
@@ -322,6 +323,9 @@ pub fn serve(
     options: ServeOptions,
     err_out: *Io.Writer,
 ) !u8 {
+    if (options.mmap_size > sqlite.max_mmap_bytes) {
+        return reportMmapSize(err_out, options.mmap_size);
+    }
     if (options.test_faults.enabled() and !options.enable_failpoints) {
         return reportConfig(err_out, "test fault schedules require --enable-failpoints");
     }
@@ -822,6 +826,23 @@ fn reportConfig(err_out: *Io.Writer, message: []const u8) !u8 {
         "invalid cluster configuration",
         message,
         "Give every node the same role registry and a unique non-zero ID.",
+    );
+    try err_out.flush();
+    return 2;
+}
+
+fn reportMmapSize(err_out: *Io.Writer, requested: u64) !u8 {
+    var message_buffer: [160]u8 = undefined;
+    const message = std.fmt.bufPrint(
+        &message_buffer,
+        "The requested mmap limit is {d} bytes; the maximum is {d} bytes.",
+        .{ requested, sqlite.max_mmap_bytes },
+    ) catch unreachable;
+    try diagnostic.write(
+        err_out,
+        "invalid mmap size",
+        message,
+        "Use --mmap-size 0 to disable mapped I/O, or choose at most 1073741824.",
     );
     try err_out.flush();
     return 2;
@@ -3012,6 +3033,9 @@ pub const Server = struct {
         fusion: ?[]const u8 = null,
         text_weight: ?f64 = null,
         vector_weight: ?f64 = null,
+        metadata_table: ?[]const u8 = null,
+        metadata_id_column: ?[]const u8 = null,
+        metadata_columns: ?[]const []const u8 = null,
     };
 
     fn dispatch(
@@ -3456,18 +3480,18 @@ pub const Server = struct {
                 "\"mmap_size\":{d}," ++
                 "\"candidate_hard_limit\":{d},",
             .{
-                status.node_id,               status.database_id,
-                status.configuration_id,      status.role,
-                status.node_type,             leader,
-                phase,                        quorum_available,
-                installation_state,           status.ballot.round,
-                status.ballot.priority,       status.ballot.node,
-                status.decided_slot,          status.applied_slot,
-                status.journal_records,       status.epoch_capacity,
-                &chain_hex,                   status.page_size,
-                status.fts5_enabled,          status.sqlite_vec_version,
+                status.node_id,                status.database_id,
+                status.configuration_id,       status.role,
+                status.node_type,              leader,
+                phase,                         quorum_available,
+                installation_state,            status.ballot.round,
+                status.ballot.priority,        status.ballot.node,
+                status.decided_slot,           status.applied_slot,
+                status.journal_records,        status.epoch_capacity,
+                &chain_hex,                    status.page_size,
+                status.fts5_enabled,           status.sqlite_vec_version,
                 status.search_feature_version, status.simd_backend,
-                status.mmap_size,             status.candidate_hard_limit,
+                status.mmap_size,              status.candidate_hard_limit,
             },
         );
         try writeMembershipOperation(out, pending, installation_error);
@@ -3814,6 +3838,9 @@ pub const Server = struct {
             .fusion = fusion,
             .text_weight = request.text_weight orelse 1.0,
             .vector_weight = request.vector_weight orelse 1.0,
+            .metadata_table = request.metadata_table,
+            .metadata_id_column = request.metadata_id_column,
+            .metadata_columns = request.metadata_columns orelse &.{},
         }) catch |err| {
             return writeErrorResponse(out, "bad_request", switch (err) {
                 error.NoRetriever => "search needs text with fts_table, " ++
@@ -3828,6 +3855,8 @@ pub const Server = struct {
                 error.InvalidEmbedding => "embedding must be float32 with " ++
                     "a dimension divisible by eight",
                 error.InvalidWeight => "weights must be finite and nonnegative",
+                error.InvalidMetadata => "metadata needs a table and 1 to 16 " ++
+                    "plain identifier columns",
                 error.OutOfMemory => return err,
             });
         };
@@ -4700,6 +4729,23 @@ test "derive database id is order independent" {
         deriveDatabaseId(&b, null),
     );
     try std.testing.expect(deriveDatabaseId(&a, "x") != deriveDatabaseId(&a, null));
+}
+
+test "invalid mmap size has an Elm-style operator diagnostic" {
+    var buffer: [512]u8 = undefined;
+    var writer = Io.Writer.fixed(&buffer);
+    try std.testing.expectEqual(
+        @as(u8, 2),
+        try reportMmapSize(&writer, sqlite.max_mmap_bytes + 1),
+    );
+    const text = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        text,
+        "-- INVALID MMAP SIZE --",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "maximum is 1073741824") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Hint: Use --mmap-size 0") != null);
 }
 
 test "connection admission is sized for a small cluster" {

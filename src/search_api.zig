@@ -2,8 +2,9 @@
 //! candidate cap. Raw application SQL cannot be bounded at the vec0 `k`
 //! constraint, so this module validates a typed request — identifiers,
 //! `k`, `candidate_count`, weights, and the embedding shape — and builds
-//! the canonical hybrid CTE the record documents. Results carry item IDs
-//! and scores, never embedding BLOBs.
+//! the canonical hybrid CTE the record documents. Results carry item IDs,
+//! scores, and bounded application-selected metadata, never implicit
+//! embedding BLOBs.
 //!
 //! Table contract: the vector table is a vec0 virtual table with columns
 //! `item_id` (integer primary key), `embedding` (float32), and
@@ -15,6 +16,8 @@ const prepared = @import("prepared.zig");
 
 /// Hard ceiling for vector KNN candidate counts (ZDS 0009).
 pub const candidate_hard_limit: u32 = 4096;
+/// Bound on application metadata columns added to a typed result.
+pub const metadata_column_limit: usize = 16;
 
 pub const Fusion = enum { rrf, dbsf };
 
@@ -36,6 +39,12 @@ pub const Request = struct {
     fusion: Fusion = .rrf,
     text_weight: f64 = 1.0,
     vector_weight: f64 = 1.0,
+    /// Optional application table joined by item ID after ranking.
+    metadata_table: ?[]const u8 = null,
+    /// Item-ID column in `metadata_table`; defaults to `id`.
+    metadata_id_column: ?[]const u8 = null,
+    /// Selected metadata columns. Raw embeddings are never implicit.
+    metadata_columns: []const []const u8 = &.{},
 };
 
 pub const RequestError = error{
@@ -47,6 +56,7 @@ pub const RequestError = error{
     InvalidCandidateCount,
     InvalidEmbedding,
     InvalidWeight,
+    InvalidMetadata,
 };
 
 /// The ZDS 0009 default oversampling rule.
@@ -124,7 +134,29 @@ fn validate(request: Request) RequestError!u32 {
             return error.InvalidEmbedding;
         }
     }
+    try validateMetadata(request);
     return candidates;
+}
+
+fn validateMetadata(request: Request) RequestError!void {
+    const configured = request.metadata_table != null or
+        request.metadata_id_column != null or request.metadata_columns.len != 0;
+    if (!configured) return;
+    const table = request.metadata_table orelse return error.InvalidMetadata;
+    if (request.metadata_columns.len == 0 or
+        request.metadata_columns.len > metadata_column_limit)
+    {
+        return error.InvalidMetadata;
+    }
+    if (request.vec_table) |vec| {
+        if (std.ascii.eqlIgnoreCase(table, vec)) return error.InvalidMetadata;
+    }
+    validateIdentifier(table) catch return error.InvalidMetadata;
+    validateIdentifier(request.metadata_id_column orelse "id") catch
+        return error.InvalidMetadata;
+    for (request.metadata_columns) |column| {
+        validateIdentifier(column) catch return error.InvalidMetadata;
+    }
 }
 
 /// Builds the canonical statement for the request: lexical-only,
@@ -136,105 +168,63 @@ pub fn plan(gpa: std.mem.Allocator, request: Request) (RequestError ||
     const candidates = try validate(request);
     const lexical = request.fts_table != null;
     const semantic = request.vec_table != null;
+    if (lexical and !semantic) return planLexical(gpa, request);
+    if (semantic and !lexical) return planSemantic(gpa, request, candidates);
 
-    if (lexical and !semantic) {
-        const fts = request.fts_table.?;
-        var result = Plan{ .sql = try std.fmt.allocPrint(
-            gpa,
-            "select rowid as item_id, -bm25({s}) as score " ++
-                "from {s} where {s} match ?1 " ++
-                "order by bm25({s}), rowid limit ?2",
-            .{ fts, fts, fts, fts },
-        ) };
-        result.values_buffer[0] = .{ .text = request.text.? };
-        result.values_buffer[1] = .{ .integer = request.k };
-        result.value_count = 2;
-        return result;
-    }
-
-    if (semantic and !lexical) {
-        const vec = request.vec_table.?;
-        var result = Plan{ .sql = try std.fmt.allocPrint(
-            gpa,
-            "with coarse as (" ++
-                "select item_id, embedding from {s} " ++
-                "where embedding_coarse match vec_quantize_binary(?1) " ++
-                "and k = ?2) " ++
-                "select item_id, " ++
-                "zaxon_vec_distance_cosine(embedding, ?1) as exact_distance " ++
-                "from coarse order by exact_distance, item_id limit ?3",
-            .{vec},
-        ) };
-        result.values_buffer[0] = .{ .blob = request.embedding.? };
-        result.values_buffer[1] = .{ .integer = candidates };
-        result.values_buffer[2] = .{ .integer = request.k };
-        result.value_count = 3;
-        return result;
-    }
-
-    const fts = request.fts_table.?;
-    const vec = request.vec_table.?;
-    const sql = switch (request.fusion) {
-        .rrf => try std.fmt.allocPrint(
-            gpa,
-            "with lexical as (" ++
-                "select rowid as item_id, " ++
-                "row_number() over (order by bm25({s}), rowid) as rank " ++
-                "from {s} where {s} match ?1 " ++
-                "order by bm25({s}), rowid limit ?2), " ++
-                "coarse as (" ++
-                "select item_id, embedding from {s} " ++
-                "where embedding_coarse match vec_quantize_binary(?3) " ++
-                "and k = ?2), " ++
-                "reranked as (" ++
-                "select item_id, " ++
-                "zaxon_vec_distance_cosine(embedding, ?3) as exact_distance " ++
-                "from coarse order by exact_distance, item_id limit ?4), " ++
-                "semantic as (" ++
-                "select item_id, " ++
-                "row_number() over (order by exact_distance, item_id) as rank " ++
-                "from reranked), " ++
-                "contributions as (" ++
-                "select item_id, rrf(rank, 60, ?5) as score from lexical " ++
-                "union all " ++
-                "select item_id, rrf(rank, 60, ?6) as score from semantic) " ++
-                "select item_id, sum(score) as fused_score " ++
-                "from contributions group by item_id " ++
-                "order by fused_score desc, item_id limit ?4",
-            .{ fts, fts, fts, fts, vec },
-        ),
-        .dbsf => try std.fmt.allocPrint(
-            gpa,
-            "with lexical_raw as (" ++
-                "select rowid as item_id, -bm25({s}) as score " ++
-                "from {s} where {s} match ?1 " ++
-                "order by bm25({s}), rowid limit ?2), " ++
-                "lexical as (" ++
-                "select item_id, dbsf(score, avg(score) over (), " ++
-                "stddev_samp(score) over (), ?5) as score from lexical_raw), " ++
-                "coarse as (" ++
-                "select item_id, embedding from {s} " ++
-                "where embedding_coarse match vec_quantize_binary(?3) " ++
-                "and k = ?2), " ++
-                "reranked as (" ++
-                "select item_id, " ++
-                "zaxon_vec_distance_cosine(embedding, ?3) as exact_distance " ++
-                "from coarse order by exact_distance, item_id limit ?4), " ++
-                "semantic_raw as (" ++
-                "select item_id, -exact_distance as score from reranked), " ++
-                "semantic as (" ++
-                "select item_id, dbsf(score, avg(score) over (), " ++
-                "stddev_samp(score) over (), ?6) as score from semantic_raw), " ++
-                "contributions as (" ++
-                "select item_id, score from lexical " ++
-                "union all " ++
-                "select item_id, score from semantic) " ++
-                "select item_id, sum(score) as fused_score " ++
-                "from contributions group by item_id " ++
-                "order by fused_score desc, item_id limit ?4",
-            .{ fts, fts, fts, fts, vec },
-        ),
+    const base_sql = switch (request.fusion) {
+        .rrf => try buildRrfSql(gpa, request.fts_table.?, request.vec_table.?),
+        .dbsf => try buildDbsfSql(gpa, request.fts_table.?, request.vec_table.?),
     };
+    const sql = try addMetadata(gpa, base_sql, request, "fused_score", false);
+    return bindHybrid(sql, request, candidates);
+}
+
+fn planLexical(gpa: std.mem.Allocator, request: Request) std.mem.Allocator.Error!Plan {
+    const fts = request.fts_table.?;
+    const base_sql = try std.fmt.allocPrint(
+        gpa,
+        "select rowid as item_id, -bm25({s}) as score " ++
+            "from {s} where {s} match ?1 " ++
+            "order by bm25({s}), rowid limit ?2",
+        .{ fts, fts, fts, fts },
+    );
+    var result = Plan{
+        .sql = try addMetadata(gpa, base_sql, request, "score", false),
+    };
+    result.values_buffer[0] = .{ .text = request.text.? };
+    result.values_buffer[1] = .{ .integer = request.k };
+    result.value_count = 2;
+    return result;
+}
+
+fn planSemantic(
+    gpa: std.mem.Allocator,
+    request: Request,
+    candidates: u32,
+) std.mem.Allocator.Error!Plan {
+    const vec = request.vec_table.?;
+    const base_sql = try std.fmt.allocPrint(
+        gpa,
+        "with coarse as (" ++
+            "select item_id, embedding from {s} " ++
+            "where embedding_coarse match vec_quantize_binary(?1) " ++
+            "and k = ?2) " ++
+            "select item_id, " ++
+            "zaxon_vec_distance_cosine(embedding, ?1) as exact_distance " ++
+            "from coarse order by exact_distance, item_id limit ?3",
+        .{vec},
+    );
+    var result = Plan{
+        .sql = try addMetadata(gpa, base_sql, request, "exact_distance", true),
+    };
+    result.values_buffer[0] = .{ .blob = request.embedding.? };
+    result.values_buffer[1] = .{ .integer = candidates };
+    result.values_buffer[2] = .{ .integer = request.k };
+    result.value_count = 3;
+    return result;
+}
+
+fn bindHybrid(sql: []u8, request: Request, candidates: u32) Plan {
     var result = Plan{ .sql = sql };
     result.values_buffer[0] = .{ .text = request.text.? };
     result.values_buffer[1] = .{ .integer = candidates };
@@ -244,6 +234,113 @@ pub fn plan(gpa: std.mem.Allocator, request: Request) (RequestError ||
     result.values_buffer[5] = .{ .real = request.vector_weight };
     result.value_count = 6;
     return result;
+}
+
+fn addMetadata(
+    gpa: std.mem.Allocator,
+    base_sql: []u8,
+    request: Request,
+    score_column: []const u8,
+    ascending: bool,
+) std.mem.Allocator.Error![]u8 {
+    const table = request.metadata_table orelse return base_sql;
+    defer gpa.free(base_sql);
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    errdefer output.deinit();
+    const writer = &output.writer;
+    writer.print(
+        "select search_results.item_id, search_results.{s}",
+        .{score_column},
+    ) catch return error.OutOfMemory;
+    for (request.metadata_columns) |column| {
+        writer.print(", metadata.{s}", .{column}) catch
+            return error.OutOfMemory;
+    }
+    writer.print(
+        " from ({s}) as search_results " ++
+            "left join {s} as metadata on metadata.{s} = search_results.item_id " ++
+            "order by search_results.{s} {s}, search_results.item_id",
+        .{
+            base_sql,
+            table,
+            request.metadata_id_column orelse "id",
+            score_column,
+            if (ascending) "asc" else "desc",
+        },
+    ) catch return error.OutOfMemory;
+    return output.toOwnedSlice();
+}
+
+fn buildRrfSql(
+    gpa: std.mem.Allocator,
+    fts: []const u8,
+    vec: []const u8,
+) std.mem.Allocator.Error![]u8 {
+    return std.fmt.allocPrint(
+        gpa,
+        "with lexical as (" ++
+            "select rowid as item_id, " ++
+            "row_number() over (order by bm25({s}), rowid) as rank " ++
+            "from {s} where {s} match ?1 " ++
+            "order by bm25({s}), rowid limit ?2), " ++
+            "coarse as (" ++
+            "select item_id, embedding from {s} " ++
+            "where embedding_coarse match vec_quantize_binary(?3) " ++
+            "and k = ?2), " ++
+            "reranked as (" ++
+            "select item_id, " ++
+            "zaxon_vec_distance_cosine(embedding, ?3) as exact_distance " ++
+            "from coarse order by exact_distance, item_id limit ?4), " ++
+            "semantic as (" ++
+            "select item_id, " ++
+            "row_number() over (order by exact_distance, item_id) as rank " ++
+            "from reranked), " ++
+            "contributions as (" ++
+            "select item_id, rrf(rank, 60, ?5) as score from lexical " ++
+            "union all " ++
+            "select item_id, rrf(rank, 60, ?6) as score from semantic) " ++
+            "select item_id, sum(score) as fused_score " ++
+            "from contributions group by item_id " ++
+            "order by fused_score desc, item_id limit ?4",
+        .{ fts, fts, fts, fts, vec },
+    );
+}
+
+fn buildDbsfSql(
+    gpa: std.mem.Allocator,
+    fts: []const u8,
+    vec: []const u8,
+) std.mem.Allocator.Error![]u8 {
+    return std.fmt.allocPrint(
+        gpa,
+        "with lexical_raw as (" ++
+            "select rowid as item_id, -bm25({s}) as score " ++
+            "from {s} where {s} match ?1 " ++
+            "order by bm25({s}), rowid limit ?2), " ++
+            "lexical as (" ++
+            "select item_id, dbsf(score, avg(score) over (), " ++
+            "stddev_samp(score) over (), ?5) as score from lexical_raw), " ++
+            "coarse as (" ++
+            "select item_id, embedding from {s} " ++
+            "where embedding_coarse match vec_quantize_binary(?3) " ++
+            "and k = ?2), " ++
+            "reranked as (" ++
+            "select item_id, " ++
+            "zaxon_vec_distance_cosine(embedding, ?3) as exact_distance " ++
+            "from coarse order by exact_distance, item_id limit ?4), " ++
+            "semantic_raw as (" ++
+            "select item_id, -exact_distance as score from reranked), " ++
+            "semantic as (" ++
+            "select item_id, dbsf(score, avg(score) over (), " ++
+            "stddev_samp(score) over (), ?6) as score from semantic_raw), " ++
+            "contributions as (" ++
+            "select item_id, score from lexical union all " ++
+            "select item_id, score from semantic) " ++
+            "select item_id, sum(score) as fused_score " ++
+            "from contributions group by item_id " ++
+            "order by fused_score desc, item_id limit ?4",
+        .{ fts, fts, fts, fts, vec },
+    );
 }
 
 // ----------------------------------------------------------------------
@@ -336,6 +433,43 @@ test "request validation rejects malformed branches" {
             .embedding = &embedding,
         }),
     );
+}
+
+test "metadata projection is bounded and cannot expose the vector table" {
+    const embedding = [_]u8{0} ** 32;
+    const with_metadata = try plan(testing.allocator, .{
+        .vec_table = "media_vec",
+        .embedding = &embedding,
+        .metadata_table = "media",
+        .metadata_columns = &.{ "title", "uri" },
+    });
+    defer with_metadata.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        with_metadata.sql,
+        "left join media as metadata",
+    ) != null);
+    try testing.expect(std.mem.indexOf(u8, with_metadata.sql, "metadata.title") != null);
+
+    try testing.expectError(error.InvalidMetadata, plan(testing.allocator, .{
+        .vec_table = "media_vec",
+        .embedding = &embedding,
+        .metadata_table = "media_vec",
+        .metadata_columns = &.{"embedding"},
+    }));
+    try testing.expectError(error.InvalidMetadata, plan(testing.allocator, .{
+        .vec_table = "media_vec",
+        .embedding = &embedding,
+        .metadata_table = "media",
+        .metadata_columns = &.{"title; drop table media"},
+    }));
+    const too_many = [_][]const u8{"field"} ** (metadata_column_limit + 1);
+    try testing.expectError(error.InvalidMetadata, plan(testing.allocator, .{
+        .vec_table = "media_vec",
+        .embedding = &embedding,
+        .metadata_table = "media",
+        .metadata_columns = &too_many,
+    }));
 }
 
 test "plans bind every parameter and never splice values" {

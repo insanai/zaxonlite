@@ -248,6 +248,22 @@ pub const Db = struct {
         );
     }
 
+    /// Returns SQLite page-cache misses since this connection opened.
+    /// Benchmarks use the delta around a query batch as the number of
+    /// pages SQLite had to read from its VFS (ZDS 0009).
+    pub fn cacheMisses(self: *Db) Error!u64 {
+        var current: c_int = 0;
+        var highwater: c_int = 0;
+        try check(self.handle, c.sqlite3_db_status(
+            self.handle,
+            c.SQLITE_DBSTATUS_CACHE_MISS,
+            &current,
+            &highwater,
+            0,
+        ));
+        return @intCast(current);
+    }
+
     /// Runs a TRUNCATE checkpoint; the WAL is empty afterwards. Requires no
     /// other connections and no open read transaction.
     pub fn checkpointTruncate(self: *Db) Error!void {

@@ -31,81 +31,83 @@ pub fn viewOf(result: *const zaxonlite.QueryResult) View {
 
 pub fn printStatus(node: *zaxonlite.Node, json: bool, out: *std.Io.Writer) !void {
     const status = node.status();
+    if (json) return printStatusJson(status, out);
+    return printStatusPlain(status, out);
+}
+
+fn printStatusJson(status: zaxonlite.node.Status, out: *std.Io.Writer) !void {
     const chain_hex = std.fmt.bytesToHex(status.chain, .lower);
-    if (json) {
-        try out.print(
-            "{{\"node_id\":{d},\"database_id\":\"{x:0>32}\"," ++
-                "\"configuration_id\":{d},\"role\":\"{s}\"," ++
-                "\"node_type\":\"{s}\"," ++
-                "\"leader\":{?d}," ++
-                "\"decided_slot\":{d},\"applied_slot\":{d}," ++
-                "\"journal_records\":{d},\"epoch_capacity\":{d}," ++
-                "\"chain\":\"{s}\",\"page_size\":{d}," ++
-                "\"fts5_enabled\":{}," ++
-                "\"sqlite_vec_version\":\"{s}\"," ++
-                "\"search_feature_version\":{d}," ++
-                "\"simd_backend\":\"{s}\"," ++
-                "\"mmap_size\":{d}," ++
-                "\"candidate_hard_limit\":{d},\"snapshot\":",
-            .{
-                status.node_id,               status.database_id,
-                status.configuration_id,      status.role,
-                status.node_type,             status.leader,
-                status.decided_slot,          status.applied_slot,
-                status.journal_records,       status.epoch_capacity,
-                &chain_hex,                   status.page_size,
-                status.fts5_enabled,          status.sqlite_vec_version,
-                status.search_feature_version, status.simd_backend,
-                status.mmap_size,             status.candidate_hard_limit,
-            },
-        );
-        if (status.snapshot) |name| {
-            try out.print("\"{s}\"}}\n", .{&name});
-        } else {
-            try out.writeAll("null}\n");
-        }
+    try out.print(
+        "{{\"node_id\":{d},\"database_id\":\"{x:0>32}\"," ++
+            "\"configuration_id\":{d},\"role\":\"{s}\"," ++
+            "\"node_type\":\"{s}\",\"leader\":{?d}," ++
+            "\"decided_slot\":{d},\"applied_slot\":{d}," ++
+            "\"journal_records\":{d},\"epoch_capacity\":{d}," ++
+            "\"chain\":\"{s}\",\"page_size\":{d}," ++
+            "\"fts5_enabled\":{},\"sqlite_vec_version\":\"{s}\"," ++
+            "\"search_feature_version\":{d},\"simd_backend\":\"{s}\"," ++
+            "\"mmap_size\":{d},\"candidate_hard_limit\":{d},\"snapshot\":",
+        .{
+            status.node_id,                status.database_id,
+            status.configuration_id,       status.role,
+            status.node_type,              status.leader,
+            status.decided_slot,           status.applied_slot,
+            status.journal_records,        status.epoch_capacity,
+            &chain_hex,                    status.page_size,
+            status.fts5_enabled,           status.sqlite_vec_version,
+            status.search_feature_version, status.simd_backend,
+            status.mmap_size,              status.candidate_hard_limit,
+        },
+    );
+    if (status.snapshot) |name| {
+        try out.print("\"{s}\"}}\n", .{&name});
     } else {
-        try out.print(
-            \\node id:          {d}
-            \\database id:      {x:0>32}
-            \\configuration id: {d}
-            \\role:             {s}
-            \\node type:        {s}
-            \\decided slot:     {d}
-            \\applied slot:     {d}
-            \\journal records:  {d}
-            \\epoch capacity:   {d}
-            \\chain:            {s}
-            \\page size:        {d}
-            \\fts5:             {s}
-            \\sqlite-vec:       {s}
-            \\search feature:   {d}
-            \\simd backend:     {s}
-            \\mmap size:        {d}
-            \\candidate limit:  {d}
-            \\snapshot:         {s}
-            \\
-        , .{
-            status.node_id,
-            status.database_id,
-            status.configuration_id,
-            status.role,
-            status.node_type,
-            status.decided_slot,
-            status.applied_slot,
-            status.journal_records,
-            status.epoch_capacity,
-            &chain_hex,
-            status.page_size,
-            if (status.fts5_enabled) "enabled" else "missing",
-            status.sqlite_vec_version,
-            status.search_feature_version,
-            status.simd_backend,
-            status.mmap_size,
-            status.candidate_hard_limit,
-            if (status.snapshot) |name| &name else "(none)",
-        });
+        try out.writeAll("null}\n");
     }
+}
+
+fn printStatusPlain(status: zaxonlite.node.Status, out: *std.Io.Writer) !void {
+    const chain_hex = std.fmt.bytesToHex(status.chain, .lower);
+    try out.print(
+        \\node id:          {d}
+        \\database id:      {x:0>32}
+        \\configuration id: {d}
+        \\role:             {s}
+        \\node type:        {s}
+        \\decided slot:     {d}
+        \\applied slot:     {d}
+        \\journal records:  {d}
+        \\epoch capacity:   {d}
+        \\chain:            {s}
+        \\page size:        {d}
+        \\fts5:             {s}
+        \\sqlite-vec:       {s}
+        \\search feature:   {d}
+        \\simd backend:     {s}
+        \\mmap size:        {d}
+        \\candidate limit:  {d}
+        \\snapshot:         {s}
+        \\
+    , .{
+        status.node_id,
+        status.database_id,
+        status.configuration_id,
+        status.role,
+        status.node_type,
+        status.decided_slot,
+        status.applied_slot,
+        status.journal_records,
+        status.epoch_capacity,
+        &chain_hex,
+        status.page_size,
+        if (status.fts5_enabled) "enabled" else "missing",
+        status.sqlite_vec_version,
+        status.search_feature_version,
+        status.simd_backend,
+        status.mmap_size,
+        status.candidate_hard_limit,
+        if (status.snapshot) |name| &name else "(none)",
+    });
 }
 
 pub fn remoteHint(code: []const u8) []const u8 {
