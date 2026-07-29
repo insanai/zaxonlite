@@ -66,6 +66,12 @@ operating zaxonlite, remember this one.
   registry, and `zaxon replace-voter` replaces one failed data voter
   online -- same database identity, client connections stay open, and the
   removed node ID is retired forever.
+- Hybrid search that replicates like any other table: SQLite FTS5 for
+  text, the statically linked sqlite-vec (v0.1.9, pinned) for vector
+  storage with a compact one-bit coarse scan reranked by an exact SIMD
+  cosine kernel, and `rrf`/`dbsf` fusion functions registered on every
+  connection. The application supplies embeddings; zaxonlite never runs a
+  model. A typed `search` operation enforces the 4,096-candidate ceiling.
 - Mutual TLS 1.3 on every production TCP listener, with short-lived
   single-use certificate enrollment (`zaxon enroll`).
 - A C ABI: `libzaxonlite.a` plus `include/zaxonlite.h`.
@@ -228,8 +234,8 @@ recovery target are deferred; the checked recovery fixture is 1 MiB.
 
 ## Build and test
 
-Requires Zig 0.16 and system OpenSSL 3. SQLite 3.50.4 is a pinned
-`build.zig.zon` dependency. The [paxos-zig](https://github.com/insanai/paxos-zig)
+Requires Zig 0.16 and system OpenSSL 3. SQLite 3.50.4 (built with FTS5)
+and sqlite-vec 0.1.9 are pinned `build.zig.zon` dependencies. The [paxos-zig](https://github.com/insanai/paxos-zig)
 library is declared as a path dependency, so a checkout expects it beside
 this one; released builds pin it by content hash with `zig fetch`.
 Cross-builds pass `-Dopenssl-prefix` for the
