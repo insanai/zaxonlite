@@ -852,7 +852,10 @@ fn remote(
     err_out: *std.Io.Writer,
 ) !u8 {
     var endpoints = parseEndpoints(gpa, options.connect.?) catch
-        return usageError(err_out, "--connect must be host:port[,host:port...]");
+        return usageError(
+            err_out,
+            "--connect entries must be host:port or unix:<path>",
+        );
     defer endpoints.deinit(gpa);
 
     const command = options.command;

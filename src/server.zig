@@ -974,7 +974,13 @@ pub const Server = struct {
     held: std.AutoHashMap(command.HashBytes, Held),
     held_total: usize = 0,
     write_waiter: ?*WriteWaiter = null,
-    writer_busy: bool = false,
+    /// FIFO writer-gate admission (ZDS 0010): the gate owner runs one
+    /// replicated write; contending writers park a ticket in an intrusive
+    /// queue and are granted strictly in arrival order, so a sustained
+    /// stream of writers cannot starve one caller into its deadline.
+    writer_gate_busy: bool = false,
+    writer_queue_head: ?*WriterTicket = null,
+    writer_queue_tail: ?*WriterTicket = null,
     writer_cond: std.Io.Condition = .init,
     fences: std.ArrayList(*FenceWaiter) = .empty,
     next_fence_id: u64 = 1,
@@ -3036,6 +3042,25 @@ pub const Server = struct {
         metadata_table: ?[]const u8 = null,
         metadata_id_column: ?[]const u8 = null,
         metadata_columns: ?[]const []const u8 = null,
+        // Typed client RPC (ZDS 0010). "typed-v1" requests carry tagged
+        // prepared parameters and receive tagged result cells; requests
+        // that omit `format` keep the legacy string/null contract.
+        format: ?[]const u8 = null,
+        params: ?[]const WireParam = null,
+        /// Atomic batch exec (remote `executemany`): one tagged
+        /// parameter array per row, every row binding the same `sql`.
+        /// Mutually exclusive with `params`.
+        param_batch: ?[]const []const WireParam = null,
+    };
+
+    /// One tagged prepared parameter on the wire: `t` is "null", "int",
+    /// "real", "text", or "blob"; text travels as a JSON string and blob
+    /// as standard base64 in `v`.
+    const WireParam = struct {
+        t: []const u8,
+        i: ?i64 = null,
+        r: ?f64 = null,
+        v: ?[]const u8 = null,
     };
 
     fn dispatch(
@@ -3478,7 +3503,9 @@ pub const Server = struct {
                 "\"search_feature_version\":{d}," ++
                 "\"simd_backend\":\"{s}\"," ++
                 "\"mmap_size\":{d}," ++
-                "\"candidate_hard_limit\":{d},",
+                "\"candidate_hard_limit\":{d}," ++
+                "\"write_gate\":\"fifo-v1\"," ++
+                "\"typed_v1\":true,",
             .{
                 status.node_id,                status.database_id,
                 status.configuration_id,       status.role,
@@ -3581,7 +3608,18 @@ pub const Server = struct {
         NotLeader,
         Ambiguous,
         OpTimeout,
+        /// The deadline expired while the write was still queued before the
+        /// gate (or before the epoch rollover completed): the statement
+        /// provably never executed, so a plain retry is safe.
+        OpTimeoutQueued,
         Unavailable,
+    };
+
+    /// One parked writer awaiting FIFO admission. Stack-allocated by the
+    /// waiting connection thread; all links are mutated under `mutex`.
+    const WriterTicket = struct {
+        granted: bool = false,
+        next: ?*WriterTicket = null,
     };
 
     const ExecOutcome = node_mod.ExecResult;
@@ -3598,22 +3636,37 @@ pub const Server = struct {
         if (self.failed) return error.Unavailable;
 
         // One replicated write at a time; a dependent slot is never built
-        // before its predecessor is chosen.
-        var start_tick: u64 = self.tick_count;
-        while (self.writer_busy) {
-            if (self.elapsedMs(start_tick) > op_timeout_ms) return error.OpTimeout;
-            self.writer_cond.waitUncancelable(self.io, &self.mutex);
+        // before its predecessor is chosen. Admission is first-in-first-out:
+        // the releasing owner hands the gate directly to the oldest ticket.
+        if (self.writer_gate_busy or self.writer_queue_head != null) {
+            var ticket = WriterTicket{};
+            if (self.writer_queue_tail) |tail| {
+                tail.next = &ticket;
+            } else {
+                self.writer_queue_head = &ticket;
+            }
+            self.writer_queue_tail = &ticket;
+            const queued_tick: u64 = self.tick_count;
+            while (!ticket.granted) {
+                if (self.failed) {
+                    self.removeWriterTicket(&ticket);
+                    return error.Unavailable;
+                }
+                if (self.elapsedMs(queued_tick) > op_timeout_ms) {
+                    self.removeWriterTicket(&ticket);
+                    return error.OpTimeoutQueued;
+                }
+                self.writer_cond.waitUncancelable(self.io, &self.mutex);
+            }
+        } else {
+            self.writer_gate_busy = true;
         }
-        self.writer_busy = true;
-        defer {
-            self.writer_busy = false;
-            self.writer_cond.signal(self.io);
-        }
+        defer self.releaseWriterGate();
 
         if (!self.node.isLeader()) return error.NotLeader;
 
         // Roll the epoch before it fills; wait out an in-progress rollover.
-        start_tick = self.tick_count;
+        var start_tick: u64 = self.tick_count;
         while (self.node.epochNearlyFull() or self.node.rollover_pending or
             self.node.log.stop_pending)
         {
@@ -3625,7 +3678,10 @@ pub const Server = struct {
                 self.pump();
                 continue;
             }
-            if (self.elapsedMs(start_tick) > op_timeout_ms) return error.OpTimeout;
+            // Still pre-execution: expiry here provably ran no SQL.
+            if (self.elapsedMs(start_tick) > op_timeout_ms) {
+                return error.OpTimeoutQueued;
+            }
             self.rollover_cond.waitUncancelable(self.io, &self.mutex);
             if (self.failed) return error.Unavailable;
             if (!self.node.isLeader()) return error.NotLeader;
@@ -3684,6 +3740,93 @@ pub const Server = struct {
         }
     }
 
+    /// Releases the writer gate, handing it directly to the oldest queued
+    /// ticket so admission stays first-in-first-out. Called under `mutex`.
+    fn releaseWriterGate(self: *Server) void {
+        if (self.writer_queue_head) |next| {
+            self.writer_queue_head = next.next;
+            if (self.writer_queue_head == null) self.writer_queue_tail = null;
+            next.next = null;
+            next.granted = true;
+        } else {
+            self.writer_gate_busy = false;
+        }
+        self.writer_cond.broadcast(self.io);
+    }
+
+    /// Unlinks an abandoned ticket (deadline expiry or node failure)
+    /// without disturbing queue order. Called under `mutex`.
+    fn removeWriterTicket(self: *Server, ticket: *WriterTicket) void {
+        var previous: ?*WriterTicket = null;
+        var cursor = self.writer_queue_head;
+        while (cursor) |current| : (cursor = current.next) {
+            if (current == ticket) {
+                if (previous) |before| {
+                    before.next = current.next;
+                } else {
+                    self.writer_queue_head = current.next;
+                }
+                if (self.writer_queue_tail == current) {
+                    self.writer_queue_tail = previous;
+                }
+                return;
+            }
+            previous = current;
+        }
+    }
+
+    /// Validates the request's `format` field. Returns true for the typed
+    /// contract, false for legacy, or null after writing an error response.
+    fn typedFormat(request: Request, out: *Io.Writer) !?bool {
+        if (request.format) |format| {
+            if (!std.mem.eql(u8, format, "typed-v1")) {
+                try writeErrorResponse(out, "bad_request", "unknown format");
+                return null;
+            }
+            return true;
+        }
+        if (request.params != null or request.param_batch != null) {
+            try writeErrorResponse(
+                out,
+                "bad_request",
+                "params require format typed-v1",
+            );
+            return null;
+        }
+        return false;
+    }
+
+    /// Decodes tagged wire parameters into prepared values. Text bytes
+    /// reference the parsed request; blob bytes are decoded into `arena`.
+    fn decodeWireParams(
+        arena: std.mem.Allocator,
+        params: []const WireParam,
+    ) ![]prepared.Value {
+        const values = try arena.alloc(prepared.Value, params.len);
+        for (params, values) |param, *value| {
+            if (std.mem.eql(u8, param.t, "null")) {
+                value.* = .null_value;
+            } else if (std.mem.eql(u8, param.t, "int")) {
+                value.* = .{ .integer = param.i orelse return error.BadParam };
+            } else if (std.mem.eql(u8, param.t, "real")) {
+                value.* = .{ .real = param.r orelse return error.BadParam };
+            } else if (std.mem.eql(u8, param.t, "text")) {
+                value.* = .{ .text = param.v orelse return error.BadParam };
+            } else if (std.mem.eql(u8, param.t, "blob")) {
+                const encoded = param.v orelse return error.BadParam;
+                const decoder = std.base64.standard.Decoder;
+                const size = decoder.calcSizeForSlice(encoded) catch
+                    return error.BadParam;
+                const bytes = try arena.alloc(u8, size);
+                decoder.decode(bytes, encoded) catch return error.BadParam;
+                value.* = .{ .blob = bytes };
+            } else {
+                return error.BadParam;
+            }
+        }
+        return values;
+    }
+
     fn opExec(self: *Server, request: Request, out: *Io.Writer) !void {
         const sql_text = request.sql orelse
             return writeErrorResponse(out, "bad_request", "exec needs sql");
@@ -3694,10 +3837,13 @@ pub const Server = struct {
                 "session and sequence go together",
             );
         }
+        const typed = (try typedFormat(request, out)) orelse return;
         const sql = try self.gpa.dupeZ(u8, sql_text);
         defer self.gpa.free(sql);
 
         if (try self.ensureSchemaForWrite(out) == null) return;
+
+        if (typed) return self.opExecTyped(request, sql, out);
 
         const Ctx = struct {
             sql: [:0]const u8,
@@ -3721,6 +3867,149 @@ pub const Server = struct {
             "{{\"ok\":true,\"changes\":{d},\"slot\":{d},\"replayed\":{}}}",
             .{ outcome.changes, outcome.slot, outcome.replayed },
         );
+    }
+
+    /// Typed-v1 exec: tagged prepared parameters, structured result with
+    /// the optional last insert rowid. Remote `RETURNING` rows stay
+    /// unsupported until they can be retained for session replay.
+    fn opExecTyped(
+        self: *Server,
+        request: Request,
+        sql: [:0]const u8,
+        out: *Io.Writer,
+    ) !void {
+        var params_arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer params_arena.deinit();
+        if (request.param_batch != null and request.params != null) {
+            return writeErrorResponse(
+                out,
+                "bad_request",
+                "params and param_batch are mutually exclusive",
+            );
+        }
+        if (request.param_batch) |batch| {
+            return self.opExecTypedBatch(
+                request,
+                sql,
+                batch,
+                params_arena.allocator(),
+                out,
+            );
+        }
+        const values = decodeWireParams(
+            params_arena.allocator(),
+            request.params orelse &.{},
+        ) catch {
+            return writeErrorResponse(out, "bad_request", "invalid params");
+        };
+
+        const Ctx = struct {
+            gpa: std.mem.Allocator,
+            sql: []const u8,
+            values: []const prepared.Value,
+            session: ?u64,
+            sequence: ?u64,
+        };
+        const outcome = self.runWrite(struct {
+            fn run(node: *Node, context: Ctx) !ExecOutcome {
+                if (context.session) |session| {
+                    return node.execIdempotentPrepared(
+                        session,
+                        context.sequence.?,
+                        context.sql,
+                        context.values,
+                    );
+                }
+                var returning: ?node_mod.TypedResult = null;
+                const result = try node.execPreparedResult(
+                    context.gpa,
+                    context.sql,
+                    context.values,
+                    &returning,
+                );
+                if (returning) |*rows| rows.deinit();
+                return result;
+            }
+        }.run, Ctx{
+            .gpa = self.gpa,
+            .sql = sql,
+            .values = values,
+            .session = request.session,
+            .sequence = request.sequence,
+        }) catch |err| return self.writeWriteError(err, out);
+
+        try writeTypedExecResponse(outcome, out);
+    }
+
+    /// Atomic typed-v1 batch exec (remote `executemany`): one bounded
+    /// batch of tagged parameter vectors, one replicated transaction,
+    /// one session sequence. `changes` is the whole batch's total; any
+    /// per-row failure rolls the entire batch back.
+    fn opExecTypedBatch(
+        self: *Server,
+        request: Request,
+        sql: [:0]const u8,
+        batch: []const []const WireParam,
+        arena: std.mem.Allocator,
+        out: *Io.Writer,
+    ) !void {
+        if (batch.len == 0) {
+            return writeErrorResponse(out, "bad_request", "param_batch is empty");
+        }
+        if (batch.len > prepared.maximum_statements) {
+            return writeErrorResponse(
+                out,
+                "bad_request",
+                "param_batch exceeds the statement limit",
+            );
+        }
+        const rows = try arena.alloc([]const prepared.Value, batch.len);
+        for (batch, rows) |wire_row, *row| {
+            row.* = decodeWireParams(arena, wire_row) catch {
+                return writeErrorResponse(out, "bad_request", "invalid params");
+            };
+        }
+
+        const Ctx = struct {
+            sql: [:0]const u8,
+            rows: []const []const prepared.Value,
+            session: ?u64,
+            sequence: ?u64,
+        };
+        const outcome = self.runWrite(struct {
+            fn run(node: *Node, context: Ctx) !ExecOutcome {
+                if (context.session) |session| {
+                    return node.execIdempotentPreparedBatch(
+                        session,
+                        context.sequence.?,
+                        context.sql,
+                        context.rows,
+                    );
+                }
+                return node.execPreparedBatch(context.sql, context.rows);
+            }
+        }.run, Ctx{
+            .sql = sql,
+            .rows = rows,
+            .session = request.session,
+            .sequence = request.sequence,
+        }) catch |err| return self.writeWriteError(err, out);
+
+        try writeTypedExecResponse(outcome, out);
+    }
+
+    /// The one typed-v1 exec response shape, shared by the single and
+    /// batch paths.
+    fn writeTypedExecResponse(outcome: ExecOutcome, out: *Io.Writer) !void {
+        try out.print(
+            "{{\"ok\":true,\"format\":\"typed-v1\",\"changes\":{d}," ++
+                "\"slot\":{d},\"replayed\":{}",
+            .{ outcome.changes, outcome.slot, outcome.replayed },
+        );
+        if (outcome.last_insert_rowid) |rowid| {
+            try out.print(",\"last_insert_rowid\":{d}", .{rowid});
+        }
+        try out.writeAll("}");
     }
 
     /// Bootstraps the replicated schema when absent. Returns null when a
@@ -3762,6 +4051,12 @@ pub const Server = struct {
                 "write fate unknown; retry idempotently",
             ),
             error.OpTimeout => try writeErrorResponse(out, "timeout", "operation timed out"),
+            // Additive discriminator (ZDS 0010): the statement never
+            // executed, so the client may retry without a session replay.
+            error.OpTimeoutQueued => try out.writeAll(
+                "{\"ok\":false,\"error\":\"timeout\",\"queued\":true," ++
+                    "\"message\":\"write queue wait expired before execution\"}",
+            ),
             error.Unavailable => try writeErrorResponse(out, "unavailable", "node failed"),
             error.SqliteError, error.SqliteBusy => {
                 self.mutex.lockUncancelable(self.io);
@@ -3796,7 +4091,15 @@ pub const Server = struct {
         if (sql.len > 1024 * 1024) {
             return writeErrorResponse(out, "too_large", "query SQL exceeds 1 MiB");
         }
-        return self.runReadQuery(request, sql, &.{}, out);
+        var params_arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer params_arena.deinit();
+        const values = decodeWireParams(
+            params_arena.allocator(),
+            request.params orelse &.{},
+        ) catch {
+            return writeErrorResponse(out, "bad_request", "invalid params");
+        };
+        return self.runReadQuery(request, sql, values, out);
     }
 
     /// Typed hybrid search (ZDS 0009): the enforced path for the vector
@@ -3879,6 +4182,7 @@ pub const Server = struct {
             if (std.mem.eql(u8, text, "linearizable")) break :blk .linearizable;
             return writeErrorResponse(out, "bad_request", "unknown level");
         };
+        const typed = (try typedFormat(request, out)) orelse return;
 
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -3933,28 +4237,46 @@ pub const Server = struct {
             };
         }
 
-        var result = self.node.queryPreparedWithLimits(self.gpa, sql, values, .{
+        const limits = node_mod.QueryLimits{
             .max_rows = self.options.max_query_rows,
             .max_bytes = self.options.max_query_bytes,
             .max_vm_steps = self.options.max_query_vm_steps,
-        }) catch |err| {
-            if (err == error.RoleCannotRead) {
-                return writeErrorResponse(
-                    out,
-                    "forbidden",
-                    "this node type does not serve SQLite reads",
-                );
-            }
-            const message = switch (err) {
-                error.WriteInReadQuery => "statement is not read-only; use exec",
-                error.NoDatabaseImage => "no database image on this member yet",
-                error.QueryRowLimit => "query exceeded the remote row limit",
-                error.QueryResultTooLarge => "query exceeded the remote byte limit",
-                error.SqliteInterrupted => "query exceeded the SQLite VM budget",
-                else => self.node.lastSqliteMessage(),
-            };
-            return writeSqlError(out, message);
         };
+
+        if (typed) {
+            var result = self.node.queryPreparedTypedWithLimits(
+                self.gpa,
+                sql,
+                values,
+                limits,
+            ) catch |err| return self.writeReadQueryError(err, out);
+            defer result.deinit();
+
+            try out.writeAll("{\"ok\":true,\"format\":\"typed-v1\",\"columns\":[");
+            for (result.columns, 0..) |column, index| {
+                if (index > 0) try out.writeAll(",");
+                try writeJsonString(out, column);
+            }
+            try out.writeAll("],\"rows\":[");
+            for (result.rows, 0..) |row, row_index| {
+                if (row_index > 0) try out.writeAll(",");
+                try out.writeAll("[");
+                for (row, 0..) |cell, index| {
+                    if (index > 0) try out.writeAll(",");
+                    try self.writeTypedCell(out, cell);
+                }
+                try out.writeAll("]");
+            }
+            try out.print("],\"level\":\"{s}\"}}", .{@tagName(level)});
+            return;
+        }
+
+        var result = self.node.queryPreparedWithLimits(
+            self.gpa,
+            sql,
+            values,
+            limits,
+        ) catch |err| return self.writeReadQueryError(err, out);
         defer result.deinit();
 
         try out.writeAll("{\"ok\":true,\"columns\":[");
@@ -3977,6 +4299,66 @@ pub const Server = struct {
             try out.writeAll("]");
         }
         try out.print("],\"level\":\"{s}\"}}", .{@tagName(level)});
+    }
+
+    fn writeReadQueryError(self: *Server, err: anyerror, out: *Io.Writer) !void {
+        if (err == error.RoleCannotRead) {
+            return writeErrorResponse(
+                out,
+                "forbidden",
+                "this node type does not serve SQLite reads",
+            );
+        }
+        const message = switch (err) {
+            error.WriteInReadQuery => "statement is not read-only; use exec",
+            error.NoDatabaseImage => "no database image on this member yet",
+            error.QueryRowLimit => "query exceeded the remote row limit",
+            error.QueryResultTooLarge => "query exceeded the remote byte limit",
+            error.SqliteInterrupted => "query exceeded the SQLite VM budget",
+            else => self.node.lastSqliteMessage(),
+        };
+        return writeSqlError(out, message);
+    }
+
+    /// One typed-v1 result cell: null, {"t":"i","i":n}, {"t":"r","r":x}
+    /// (or {"t":"r","x":"<16 hex>"} for non-finite reals, which JSON
+    /// cannot express as numbers), {"t":"t","v":"text"}, or
+    /// {"t":"b","v":"<base64>"}.
+    fn writeTypedCell(
+        self: *Server,
+        out: *Io.Writer,
+        value: prepared.Value,
+    ) !void {
+        switch (value) {
+            .null_value => try out.writeAll("null"),
+            .integer => |number| try out.print(
+                "{{\"t\":\"i\",\"i\":{d}}}",
+                .{number},
+            ),
+            .real => |number| {
+                if (std.math.isFinite(number)) {
+                    try out.print("{{\"t\":\"r\",\"r\":{d}}}", .{number});
+                } else {
+                    const bits: u64 = @bitCast(number);
+                    try out.print("{{\"t\":\"r\",\"x\":\"{x:0>16}\"}}", .{bits});
+                }
+            },
+            .text => |bytes| {
+                try out.writeAll("{\"t\":\"t\",\"v\":");
+                try writeJsonString(out, bytes);
+                try out.writeAll("}");
+            },
+            .blob => |bytes| {
+                const encoder = std.base64.standard.Encoder;
+                const encoded = try self.gpa.alloc(
+                    u8,
+                    encoder.calcSize(bytes.len),
+                );
+                defer self.gpa.free(encoded);
+                _ = encoder.encode(encoded, bytes);
+                try out.print("{{\"t\":\"b\",\"v\":\"{s}\"}}", .{encoded});
+            },
+        }
     }
 
     /// Confirms this exact Paxos ballot with a distinct-member read quorum.

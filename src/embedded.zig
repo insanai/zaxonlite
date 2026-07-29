@@ -64,6 +64,10 @@ pub const OpenOptions = struct {
     /// Test harness escape hatch for plaintext/PSK TCP. Production callers
     /// must use the CLI mTLS host or a local Unix-domain socket.
     allow_insecure_test_tcp: bool = false,
+    /// Development-only PSK transport without TLS (ZDS 0010). Requires
+    /// `auth_secret`, forbids `tls`, and every member address must be a
+    /// numeric loopback endpoint; mirrors the CLI's `--dev-psk` policy.
+    allow_psk_only_loopback: bool = false,
     test_faults: server.TestFaults = .{},
 };
 
@@ -99,8 +103,9 @@ pub const Embedded = struct {
     /// `options.startup_timeout_ms` elapses (`error.ServerStartupTimeout`);
     /// a server thread that exits during startup is `error.ServerStartupFailed`.
     /// Membership faults (`InvalidMemberCount`, `InvalidNodeId`,
-    /// `DuplicateNodeId`, `InvalidVoterCount`, `CampaignerRequired`,
-    /// `NotMember`) are reported before any thread or file is touched.
+    /// `DuplicateNodeId`, `DuplicateEndpoint`, `InvalidVoterCount`,
+    /// `CampaignerRequired`, `NotMember`) are reported before any thread
+    /// or file is touched.
     ///
     /// The returned facade is allocated from `gpa` and owned by the caller;
     /// release it with `close`, never with `gpa.destroy`. `gpa` and `io` must
@@ -114,10 +119,16 @@ pub const Embedded = struct {
         var campaigner_count: usize = 0;
         var ids = std.AutoHashMap(u32, void).init(gpa);
         defer ids.deinit();
+        var addresses = std.StringHashMap(void).init(gpa);
+        defer addresses.deinit();
         for (options.members) |member| {
             if (member.id == 0) return error.InvalidNodeId;
             const inserted = try ids.getOrPut(member.id);
             if (inserted.found_existing) return error.DuplicateNodeId;
+            // Two members sharing one address would be one process
+            // answering for two identities; refuse the registry.
+            const inserted_address = try addresses.getOrPut(member.address);
+            if (inserted_address.found_existing) return error.DuplicateEndpoint;
             if (member.role.capabilities().votes) voter_count += 1;
             if (member.role.capabilities().campaigns) campaigner_count += 1;
         }
@@ -167,6 +178,35 @@ pub const Embedded = struct {
         const own_role = parsed_members.self_role orelse return error.NotMember;
         const peers = parsed_members.peers;
         const endpoints = parsed_members.endpoints;
+
+        // A unix member address names a single-node local service, never a
+        // way to connect Paxos members. This replaces the earlier silent
+        // degradation that left the socket path in `host` with port zero.
+        for (endpoints, 0..) |endpoint, index| {
+            if (endpoint.unix_path) |path| {
+                if (options.members.len != 1) return error.UnixSocketNeedsSingleMember;
+                if (options.members[index].role == .gateway) {
+                    return error.UnixSocketGateway;
+                }
+                if (path.len == 0 or path[0] != '/') return error.InvalidEndpoint;
+                if (std.mem.indexOfScalar(u8, path, 0) != null) {
+                    return error.InvalidEndpoint;
+                }
+                if (options.allow_psk_only_loopback) {
+                    return error.DevPskWithUnixSocket;
+                }
+            }
+        }
+        if (options.allow_psk_only_loopback) {
+            if (options.auth_secret == null) return error.DevPskNeedsSecret;
+            if (options.tls != null) return error.DevPskWithTls;
+            if (options.allow_insecure_test_tcp) return error.DevPskWithInsecureTcp;
+            for (endpoints) |endpoint| {
+                if (!isNumericLoopback(endpoint.host)) {
+                    return error.DevPskNeedsLoopback;
+                }
+            }
+        }
         const backends = parsed_members.backends;
         const backend_count = parsed_members.backend_count;
         const secret = if (options.auth_secret) |bytes| try allocator.dupe(u8, bytes) else null;
@@ -186,6 +226,7 @@ pub const Embedded = struct {
             .node_id = options.node_id,
             .listen_host = own.host,
             .listen_port = own.port,
+            .listen_unix = own.unix_path,
             .members = peers,
             .database_id = server.deriveDatabaseId(peers, cluster_id),
             .auth_secret = secret,
@@ -193,6 +234,7 @@ pub const Embedded = struct {
             .enrollment_ca_key = enrollment_ca_key,
             .enable_failpoints = options.enable_test_faults or options.allow_insecure_test_tcp,
             .allow_insecure_test_tcp = options.allow_insecure_test_tcp,
+            .allow_psk_only_loopback = options.allow_psk_only_loopback,
             .test_faults = options.test_faults,
         };
         self.gateway_shutdown = .init(false);
@@ -211,6 +253,13 @@ pub const Embedded = struct {
             self.tls_client = try tls.Context.initClient(config);
         }
         errdefer if (self.tls_client) |*context| context.deinit();
+    }
+
+    /// Matches the server's development-PSK constraint exactly: only the
+    /// numeric loopback literals qualify, never hostnames or other ranges.
+    fn isNumericLoopback(host: []const u8) bool {
+        return std.mem.eql(u8, host, "127.0.0.1") or
+            std.mem.eql(u8, host, "::1");
     }
 
     const ParsedMembers = struct {

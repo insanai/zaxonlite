@@ -79,10 +79,18 @@ pub const Role = roles.Role;
 pub const ExecResult = node.ExecResult;
 /// Arena-owned query rows; the caller must call `deinit` to free them.
 pub const QueryResult = node.QueryResult;
+
+pub const TypedResult = node.TypedResult;
+
+pub const WriteCapture = node.WriteCapture;
+
+pub const StatementInfo = node.StatementInfo;
 /// The `zaxon serve` transport host: one node behind a TCP endpoint.
 pub const server = @import("server.zig");
 /// JSON RPC client with leader-redirect following; used by the CLI and tests.
 pub const client = @import("client.zig");
+/// External-client remote pool over ClusterConnection (ZDS 0010 Gate B).
+pub const remote = @import("remote.zig");
 /// Stateless TCP gateway that routes clients to serving cluster backends.
 pub const gateway = @import("gateway.zig");
 /// Transport-owning embedded facade: an in-process cluster member with TCP.
@@ -116,6 +124,7 @@ test {
     _ = @import("roles.zig");
     _ = @import("server.zig");
     _ = @import("client.zig");
+    _ = @import("remote.zig");
     _ = @import("gateway.zig");
     _ = @import("embedded.zig");
 }

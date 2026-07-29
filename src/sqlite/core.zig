@@ -16,6 +16,22 @@ pub const Error = error{
     SqliteInterrupted,
 };
 
+/// SQLite's five storage classes as observed on a result column.
+pub const ColumnType = enum { null, integer, real, text, blob };
+
+/// Renders a REAL exactly as SQLite's own text conversion does
+/// ("%!.15g" through sqlite3_snprintf), so typed results and the legacy
+/// text presentation agree byte for byte.
+pub fn formatReal(buffer: []u8, value: f64) []const u8 {
+    _ = c.sqlite3_snprintf(
+        @intCast(buffer.len),
+        @ptrCast(buffer.ptr),
+        "%!.15g",
+        value,
+    );
+    return std.mem.sliceTo(@as([*:0]const u8, @ptrCast(buffer.ptr)), 0);
+}
+
 fn check(db: ?*c.sqlite3, rc: c_int) Error!void {
     switch (rc) {
         c.SQLITE_OK, c.SQLITE_DONE, c.SQLITE_ROW => {},
@@ -169,6 +185,12 @@ pub const Db = struct {
         return std.mem.span(c.sqlite3_errmsg(self.handle));
     }
 
+    /// The extended result code of the most recent failed call on this
+    /// connection; drives stable host error categories.
+    pub fn extendedErrcode(self: *const Db) i32 {
+        return @intCast(c.sqlite3_extended_errcode(self.handle));
+    }
+
     /// Executes SQL statements without result rows (or discarding them).
     pub fn exec(self: *Db, sql: [:0]const u8) Error!void {
         try check(self.handle, c.sqlite3_exec(self.handle, sql.ptr, null, null, null));
@@ -186,6 +208,32 @@ pub const Db = struct {
         ));
         if (stmt == null) return error.SqliteMisuse;
         return .{ .handle = stmt.?, .db = self.handle };
+    }
+
+    pub const PreparedStmt = struct {
+        stmt: Stmt,
+        /// The unconsumed remainder of the input after the first statement.
+        tail: []const u8,
+    };
+
+    /// Prepares the first statement and reports the unconsumed tail, so a
+    /// host can detect trailing statements without parsing SQL itself.
+    pub fn prepareWithTail(self: *Db, sql: []const u8) Error!PreparedStmt {
+        var stmt: ?*c.sqlite3_stmt = null;
+        var tail: [*c]const u8 = null;
+        try check(self.handle, c.sqlite3_prepare_v2(
+            self.handle,
+            sql.ptr,
+            @intCast(sql.len),
+            &stmt,
+            &tail,
+        ));
+        if (stmt == null) return error.SqliteMisuse;
+        const consumed = @intFromPtr(tail) - @intFromPtr(sql.ptr);
+        return .{
+            .stmt = .{ .handle = stmt.?, .db = self.handle },
+            .tail = sql[consumed..],
+        };
     }
 
     pub fn changes(self: *const Db) i64 {
@@ -371,6 +419,17 @@ pub const Stmt = struct {
         try check(self.db, c.sqlite3_bind_null(self.handle, @intCast(index)));
     }
 
+    /// The name of one bound parameter (":name", "@name", or "$name"),
+    /// or null for a positional parameter. Indexes are 1-based, matching
+    /// SQLite's binding convention.
+    pub fn parameterName(self: *const Stmt, index: u32) ?[]const u8 {
+        const name = c.sqlite3_bind_parameter_name(
+            self.handle,
+            @intCast(index),
+        ) orelse return null;
+        return std.mem.span(name);
+    }
+
     pub fn parameterCount(self: *const Stmt) u32 {
         return @intCast(c.sqlite3_bind_parameter_count(self.handle));
     }
@@ -383,6 +442,17 @@ pub const Stmt = struct {
         const name = c.sqlite3_column_name(self.handle, @intCast(index));
         if (name == null) return "";
         return std.mem.span(name);
+    }
+
+    /// The storage class of one result cell in the current row.
+    pub fn columnValueType(self: *const Stmt, index: u32) ColumnType {
+        return switch (self.columnType(index)) {
+            c.SQLITE_INTEGER => .integer,
+            c.SQLITE_FLOAT => .real,
+            c.SQLITE_TEXT => .text,
+            c.SQLITE_BLOB => .blob,
+            else => .null,
+        };
     }
 
     pub fn columnType(self: *const Stmt, index: u32) c_int {

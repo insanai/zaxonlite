@@ -104,6 +104,9 @@ pub const ExecResult = struct {
     changes: i64,
     slot: paxos.Slot,
     replayed: bool = false,
+    /// Set when the caller's statements observably updated SQLite's last
+    /// insert rowid; absent for updates, deletes, DDL, and replays.
+    last_insert_rowid: ?i64 = null,
 };
 
 pub const Status = struct {
@@ -163,6 +166,38 @@ pub const QueryResult = struct {
         self.arena.deinit();
         self.* = undefined;
     }
+};
+
+/// Typed query result: one tagged SQLite value per cell. This is the
+/// source form; the text `QueryResult` and every JSON encoding are
+/// presentation adapters derived from it.
+pub const TypedResult = struct {
+    arena: std.heap.ArenaAllocator,
+    columns: []const []const u8,
+    rows: []const []const prepared.Value,
+
+    pub fn deinit(self: *TypedResult) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Optional write-result capture: typed `RETURNING` rows and the last
+/// insert rowid observed for the caller's statements.
+pub const WriteCapture = struct {
+    gpa: std.mem.Allocator,
+    returning: ?TypedResult = null,
+    last_insert_rowid: ?i64 = null,
+};
+
+/// Prepared-statement facts a host needs before executing: parameter
+/// count, result shape, read-only classification, and whether the input
+/// holds a trailing second statement.
+pub const StatementInfo = struct {
+    parameter_count: u32,
+    column_count: u32,
+    read_only: bool,
+    has_tail: bool,
 };
 
 /// Optional result and SQLite VM budgets. Zero means unlimited, which remains
@@ -254,6 +289,15 @@ pub const Node = struct {
     /// captured before the rollback statement clears it.
     saved_error: [512]u8 = undefined,
     saved_error_len: usize = 0,
+    /// Extended SQLite result code captured with `saved_error`.
+    saved_error_code: i32 = 0,
+    /// Gate C (ZDS 0010): true while a caller holds a live SQLite
+    /// transaction on the writer connection. Single-member nodes only.
+    live_transaction: bool = false,
+    /// Total-change baseline recorded at `beginLive`.
+    live_changes_base: i64 = 0,
+    /// Batch identity reserved at `beginLive` and replicated at commit.
+    live_batch_id_bytes: [16]u8 = undefined,
     /// Set after a journal/payload durability failure. A cluster host must
     /// stop voting and serving; continuing after a failed fsync would violate
     /// the effects contract.
@@ -650,6 +694,58 @@ pub const Node = struct {
         return self.writePreparedTransaction(.application, &statements, null);
     }
 
+    /// Executes one prepared statement as a replicated transaction and
+    /// captures the structured write result: the change count, the last
+    /// insert rowid when the statement set one, and typed `RETURNING` rows
+    /// when the statement produces them. The returned rows complete before
+    /// the write is acknowledged; the caller owns `out_returning`.
+    pub fn execPreparedResult(
+        self: *Node,
+        gpa: std.mem.Allocator,
+        sql: []const u8,
+        values: []const prepared.Value,
+        out_returning: *?TypedResult,
+    ) !ExecResult {
+        if (!self.capabilities.serves_writes) return error.RoleCannotWrite;
+        out_returning.* = null;
+        var capture = WriteCapture{ .gpa = gpa };
+        errdefer if (capture.returning) |*rows| rows.deinit();
+        const statements = [_]prepared.Statement{.{
+            .sql = sql,
+            .values = values,
+        }};
+        var result = try self.writeRequest(
+            .application,
+            .{ .prepared = &statements },
+            null,
+            &capture,
+        );
+        result.last_insert_rowid = capture.last_insert_rowid;
+        out_returning.* = capture.returning;
+        return result;
+    }
+
+    /// Executes one prepared statement once per parameter vector in `batch`
+    /// as ONE replicated transaction (the typed client RPC's atomic
+    /// `executemany`). Every statement shares `sql`; the reported change
+    /// count is the whole batch's total, and any per-row failure rolls the
+    /// entire transaction back. The caller bounds `batch` (the wire path
+    /// enforces `prepared.maximum_statements`).
+    pub fn execPreparedBatch(
+        self: *Node,
+        sql: []const u8,
+        batch: []const []const prepared.Value,
+    ) !ExecResult {
+        if (!self.capabilities.serves_writes) return error.RoleCannotWrite;
+        if (batch.len == 0) return error.EmptyTransaction;
+        const statements = try self.gpa.alloc(prepared.Statement, batch.len);
+        defer self.gpa.free(statements);
+        for (batch, statements) |values, *statement| {
+            statement.* = .{ .sql = sql, .values = values };
+        }
+        return self.writePreparedTransaction(.application, statements, null);
+    }
+
     /// Commits a completed multi-call transaction builder as one replicated
     /// WAL transition. A builder is single-use even when execution fails,
     /// preventing accidental retry without an idempotent session.
@@ -751,6 +847,76 @@ pub const Node = struct {
         });
     }
 
+    /// Prepared-statement variant of `execIdempotent` for the typed client
+    /// RPC: same session and sequence semantics, positional bound values.
+    /// A fresh execution reports the last insert rowid when the statement
+    /// set one; a replay retains only the change count (the session table
+    /// does not persist the rowid yet).
+    pub fn execIdempotentPrepared(
+        self: *Node,
+        session_id: u64,
+        sequence: u64,
+        sql: []const u8,
+        values: []const prepared.Value,
+    ) !ExecResult {
+        switch (try self.checkSession(session_id, sequence)) {
+            .replay => |result| return result,
+            .execute => {},
+        }
+        const statements = [_]prepared.Statement{.{
+            .sql = sql,
+            .values = values,
+        }};
+        return self.execIdempotentStatements(&statements, session_id, sequence);
+    }
+
+    /// Batch variant of `execIdempotentPrepared` for the typed client
+    /// RPC's atomic `executemany`: every parameter vector in `batch` binds
+    /// the same `sql`, the whole batch is ONE replicated transaction under
+    /// ONE session sequence, and the recorded result is the batch's total
+    /// change count.
+    pub fn execIdempotentPreparedBatch(
+        self: *Node,
+        session_id: u64,
+        sequence: u64,
+        sql: []const u8,
+        batch: []const []const prepared.Value,
+    ) !ExecResult {
+        if (batch.len == 0) return error.EmptyTransaction;
+        switch (try self.checkSession(session_id, sequence)) {
+            .replay => |result| return result,
+            .execute => {},
+        }
+        const statements = try self.gpa.alloc(prepared.Statement, batch.len);
+        defer self.gpa.free(statements);
+        for (batch, statements) |values, *statement| {
+            statement.* = .{ .sql = sql, .values = values };
+        }
+        return self.execIdempotentStatements(statements, session_id, sequence);
+    }
+
+    /// Shared session-write tail: one replicated transaction with the
+    /// session update, capturing the last insert rowid for fresh
+    /// executions. Any captured `RETURNING` rows are discarded; the
+    /// session RPC does not retain them for replay.
+    fn execIdempotentStatements(
+        self: *Node,
+        statements: []const prepared.Statement,
+        session_id: u64,
+        sequence: u64,
+    ) !ExecResult {
+        var capture = WriteCapture{ .gpa = self.gpa };
+        defer if (capture.returning) |*rows| rows.deinit();
+        var result = try self.writeRequest(
+            .application,
+            .{ .prepared = statements },
+            .{ .session_id = session_id, .sequence = sequence },
+            &capture,
+        );
+        result.last_insert_rowid = capture.last_insert_rowid;
+        return result;
+    }
+
     /// Deletes sessions whose last activity is more than `retain` session
     /// writes behind the newest session write.
     pub fn expireSessions(self: *Node, retain: u64) !ExecResult {
@@ -808,6 +974,31 @@ pub const Node = struct {
         return self.queryPreparedWithLimits(gpa, plan.sql, plan.values(), limits);
     }
 
+    /// Typed search over the same validated planner as `search`.
+    pub fn searchTyped(
+        self: *Node,
+        gpa: std.mem.Allocator,
+        request: search_api.Request,
+        limits: QueryLimits,
+    ) !TypedResult {
+        const plan = try search_api.plan(gpa, request);
+        defer plan.deinit(gpa);
+        return self.queryPreparedTypedWithLimits(gpa, plan.sql, plan.values(), limits);
+    }
+
+    /// Runs one read-only prepared query and returns tagged SQLite values.
+    pub fn queryPreparedTyped(
+        self: *Node,
+        gpa: std.mem.Allocator,
+        sql: []const u8,
+        values: []const prepared.Value,
+    ) !TypedResult {
+        return self.queryPreparedTypedWithLimits(gpa, sql, values, .{});
+    }
+
+    /// Legacy text presentation of the typed read path. Integer and real
+    /// cells are rendered exactly as SQLite's own text conversion renders
+    /// them, so existing JSON consumers keep byte-identical responses.
     pub fn queryPreparedWithLimits(
         self: *Node,
         gpa: std.mem.Allocator,
@@ -815,6 +1006,43 @@ pub const Node = struct {
         values: []const prepared.Value,
         limits: QueryLimits,
     ) !QueryResult {
+        var typed = try self.queryPreparedTypedWithLimits(gpa, sql, values, limits);
+        errdefer typed.deinit();
+        const alloc = typed.arena.allocator();
+        const rows = try alloc.alloc([]const ?[]const u8, typed.rows.len);
+        for (typed.rows, rows) |typed_row, *text_row| {
+            const cells = try alloc.alloc(?[]const u8, typed_row.len);
+            for (typed_row, cells) |value, *cell| {
+                cell.* = switch (value) {
+                    .null_value => null,
+                    .integer => |number| try std.fmt.allocPrint(
+                        alloc,
+                        "{d}",
+                        .{number},
+                    ),
+                    .real => |number| blk: {
+                        var buffer: [32]u8 = undefined;
+                        break :blk try alloc.dupe(
+                            u8,
+                            sqlite.formatReal(&buffer, number),
+                        );
+                    },
+                    .text => |bytes| bytes,
+                    .blob => |bytes| bytes,
+                };
+            }
+            text_row.* = cells;
+        }
+        return .{ .arena = typed.arena, .columns = typed.columns, .rows = rows };
+    }
+
+    pub fn queryPreparedTypedWithLimits(
+        self: *Node,
+        gpa: std.mem.Allocator,
+        sql: []const u8,
+        values: []const prepared.Value,
+        limits: QueryLimits,
+    ) !TypedResult {
         if (!self.capabilities.serves_reads) return error.RoleCannotRead;
         if (self.fatal_storage_error) return error.StorageFailed;
         if (self.needs_resync) try self.resyncImage();
@@ -881,7 +1109,7 @@ pub const Node = struct {
             column.* = try alloc.dupe(u8, name);
         }
 
-        var rows: std.ArrayList([]const ?[]const u8) = .empty;
+        var rows: std.ArrayList([]const prepared.Value) = .empty;
         while (stmt.step() catch |err| {
             self.saveErrorFrom(&lease.db);
             return err;
@@ -889,24 +1117,36 @@ pub const Node = struct {
             if (limits.max_rows != 0 and rows.items.len >= limits.max_rows) {
                 return error.QueryRowLimit;
             }
-            const row = try alloc.alloc(?[]const u8, column_count);
+            const row = try alloc.alloc(prepared.Value, column_count);
             for (row, 0..) |*cell, index| {
-                if (stmt.isColumnNull(@intCast(index))) {
-                    cell.* = null;
-                } else {
-                    const text = stmt.columnText(@intCast(index));
-                    result_bytes = std.math.add(
-                        usize,
-                        result_bytes,
-                        text.len,
-                    ) catch return error.QueryResultTooLarge;
-                    if (limits.max_bytes != 0 and
-                        result_bytes > limits.max_bytes)
-                    {
-                        return error.QueryResultTooLarge;
-                    }
-                    cell.* = try alloc.dupe(u8, text);
+                const column: u32 = @intCast(index);
+                // Integers and reals count as their storage width; text and
+                // blob count their byte length, as the text path always did.
+                const cell_bytes: usize = switch (stmt.columnValueType(column)) {
+                    .null => 0,
+                    .integer, .real => 8,
+                    .text => stmt.columnText(column).len,
+                    .blob => stmt.columnBlob(column).len,
+                };
+                result_bytes = std.math.add(
+                    usize,
+                    result_bytes,
+                    cell_bytes,
+                ) catch return error.QueryResultTooLarge;
+                if (limits.max_bytes != 0 and result_bytes > limits.max_bytes) {
+                    return error.QueryResultTooLarge;
                 }
+                cell.* = switch (stmt.columnValueType(column)) {
+                    .null => .null_value,
+                    .integer => .{ .integer = stmt.columnInt64(column) },
+                    .real => .{ .real = stmt.columnDouble(column) },
+                    .text => .{
+                        .text = try alloc.dupe(u8, stmt.columnText(column)),
+                    },
+                    .blob => .{
+                        .blob = try alloc.dupe(u8, stmt.columnBlob(column)),
+                    },
+                };
             }
             try rows.append(alloc, row);
         }
@@ -915,6 +1155,76 @@ pub const Node = struct {
             .arena = arena,
             .columns = columns,
             .rows = try rows.toOwnedSlice(alloc),
+        };
+    }
+
+    /// Copies the name of one bound parameter (1-based index) into
+    /// `buffer` and returns its length; zero for positional parameters.
+    /// Resolved by SQLite itself so `:name`, `@name`, and `$name` all work
+    /// without the host parsing SQL.
+    pub fn statementParameterName(
+        self: *Node,
+        sql: []const u8,
+        index: u32,
+        buffer: []u8,
+    ) !usize {
+        if (!self.capabilities.serves_reads) return error.RoleCannotRead;
+        if (self.fatal_storage_error) return error.StorageFailed;
+        if (self.needs_resync) try self.resyncImage();
+        var lease = try self.readLease();
+        defer lease.release();
+
+        var lease_guard = guard_mod.Guard{};
+        const read_guard: *guard_mod.Guard = if (lease.owned) blk: {
+            lease_guard.install(&lease.db);
+            break :blk &lease_guard;
+        } else &self.guard;
+        read_guard.scope = .application;
+        defer read_guard.scope = .internal;
+
+        var stmt = lease.db.prepare(sql) catch |err| {
+            self.saveErrorFrom(&lease.db);
+            return err;
+        };
+        defer stmt.finalize();
+        if (index == 0 or index > stmt.parameterCount()) {
+            return error.ParameterCountMismatch;
+        }
+        const name = stmt.parameterName(index) orelse return 0;
+        const len = @min(name.len, buffer.len);
+        @memcpy(buffer[0..len], name[0..len]);
+        return len;
+    }
+
+    /// Prepares (without executing) the first statement of `sql` under the
+    /// application guard and reports its shape. Hosts use this to reject
+    /// multi-statement `execute()` input and to size parameter binding.
+    pub fn statementInfo(self: *Node, sql: []const u8) !StatementInfo {
+        if (!self.capabilities.serves_reads) return error.RoleCannotRead;
+        if (self.fatal_storage_error) return error.StorageFailed;
+        if (self.needs_resync) try self.resyncImage();
+        var lease = try self.readLease();
+        defer lease.release();
+
+        var lease_guard = guard_mod.Guard{};
+        const read_guard: *guard_mod.Guard = if (lease.owned) blk: {
+            lease_guard.install(&lease.db);
+            break :blk &lease_guard;
+        } else &self.guard;
+        read_guard.scope = .application;
+        defer read_guard.scope = .internal;
+
+        var first = lease.db.prepareWithTail(sql) catch |err| {
+            self.saveErrorFrom(&lease.db);
+            return err;
+        };
+        defer first.stmt.finalize();
+        const tail = std.mem.trim(u8, first.tail, " \t\r\n;");
+        return .{
+            .parameter_count = first.stmt.parameterCount(),
+            .column_count = first.stmt.columnCount(),
+            .read_only = first.stmt.isReadOnly(),
+            .has_tail = tail.len != 0,
         };
     }
 
@@ -1587,7 +1897,7 @@ pub const Node = struct {
         sql: [:0]const u8,
         session: ?SessionUpdate,
     ) !ExecResult {
-        return self.writeRequest(scope, .{ .raw = sql }, session);
+        return self.writeRequest(scope, .{ .raw = sql }, session, null);
     }
 
     fn writePreparedTransaction(
@@ -1596,7 +1906,7 @@ pub const Node = struct {
         statements: []const prepared.Statement,
         session: ?SessionUpdate,
     ) !ExecResult {
-        return self.writeRequest(scope, .{ .prepared = statements }, session);
+        return self.writeRequest(scope, .{ .prepared = statements }, session, null);
     }
 
     fn writeRequest(
@@ -1604,6 +1914,7 @@ pub const Node = struct {
         scope: guard_mod.Scope,
         request: WriteRequest,
         session: ?SessionUpdate,
+        capture: ?*WriteCapture,
     ) !ExecResult {
         if (self.fatal_storage_error) return error.StorageFailed;
         if (self.needs_resync) try self.resyncImage();
@@ -1619,23 +1930,19 @@ pub const Node = struct {
         }
         try self.ensureWriter();
         if (self.capture_batch_id != null) return error.WriteInFlight;
+        if (self.live_transaction) return error.TransactionOpen;
 
         var batch_id_bytes: [16]u8 = undefined;
         self.io.random(&batch_id_bytes);
-        const batch_id = std.mem.readInt(u128, &batch_id_bytes, .little);
 
         // Execute the transaction. The replicated session and batch marker
         // rows are updated inside the same SQLite transaction, so captured
         // frames carry them atomically with the user's changes.
         try self.db.exec("begin immediate");
         errdefer self.db.exec("rollback") catch {};
-        var committed_without_log = false;
-        errdefer if (committed_without_log) {
-            self.capture_batch_id = null;
-            self.needs_resync = true;
-        };
 
         const changes_before = self.totalChanges();
+        const rowid_before = self.db.lastInsertRowId();
         self.saved_error_len = 0;
         {
             // Only the caller's SQL runs in its scope; the metadata and
@@ -1644,12 +1951,21 @@ pub const Node = struct {
             defer self.guard.scope = .internal;
             const execution = switch (request) {
                 .raw => |sql| self.db.exec(sql),
-                .prepared => |statements| prepared.execute(&self.db, statements),
+                .prepared => |statements| if (capture) |sink|
+                    self.executePreparedCapture(statements, sink)
+                else
+                    prepared.execute(&self.db, statements),
             };
             execution catch |err| {
                 self.saveErrorFrom(&self.db);
                 return err;
             };
+        }
+        // Read the rowid before the session and batch-marker inserts below
+        // overwrite it with reserved-table bookkeeping.
+        if (capture) |sink| {
+            const rowid_after = self.db.lastInsertRowId();
+            if (rowid_after != rowid_before) sink.last_insert_rowid = rowid_after;
         }
         if (scope == .application) {
             // The authorizer already denied contract-changing statements;
@@ -1665,6 +1981,25 @@ pub const Node = struct {
             };
         }
         const changes: i64 = self.totalChanges() - changes_before;
+        return self.sealCapturedTransaction(batch_id_bytes, changes, session);
+    }
+
+    /// Commits the open writer transaction, captures its WAL frames, and
+    /// replicates them as one transaction batch. Shared by the one-shot
+    /// write path and Gate C live-transaction commit. A failure after the
+    /// SQLite commit marks the image for resync.
+    fn sealCapturedTransaction(
+        self: *Node,
+        batch_id_bytes: [16]u8,
+        changes: i64,
+        session: ?SessionUpdate,
+    ) !ExecResult {
+        const batch_id = std.mem.readInt(u128, &batch_id_bytes, .little);
+        var committed_without_log = false;
+        errdefer if (committed_without_log) {
+            self.capture_batch_id = null;
+            self.needs_resync = true;
+        };
 
         if (session) |update| {
             try self.db.exec(
@@ -1777,6 +2112,215 @@ pub const Node = struct {
         return self.capture_batch_id;
     }
 
+    // ------------------------------------------------------------------
+    // Gate C: live transactions (single-member nodes only)
+    // ------------------------------------------------------------------
+
+    pub const LiveStatementResult = struct {
+        changes: i64,
+        last_insert_rowid: ?i64,
+    };
+
+    /// Opens a live SQLite transaction on the writer connection. Later
+    /// `liveExec` calls observe earlier uncommitted writes; nothing is
+    /// replicated until `commitLive`. Restricted to a single-member node,
+    /// which cannot lose leadership while the caller holds the transaction.
+    pub fn beginLive(self: *Node) !void {
+        if (!self.single) return error.ClusterTransactionUnsupported;
+        if (!self.capabilities.serves_writes) return error.RoleCannotWrite;
+        if (self.live_transaction) return error.TransactionOpen;
+        if (self.fatal_storage_error) return error.StorageFailed;
+        if (self.needs_resync) try self.resyncImage();
+        if (self.rollover_pending) try self.completeClusterRollover();
+        try self.ensureEpochCapacity();
+        if (self.log.stop_pending or self.log.isReconfigured() != null) {
+            return error.LogSealed;
+        }
+        try self.ensureWriter();
+        if (self.capture_batch_id != null) return error.WriteInFlight;
+
+        self.io.random(&self.live_batch_id_bytes);
+        self.saved_error_len = 0;
+        try self.db.exec("begin immediate");
+        self.live_changes_base = self.totalChanges();
+        self.live_transaction = true;
+    }
+
+    /// Executes one statement inside the live transaction under the
+    /// application guard. Read statements run on the writer connection and
+    /// observe uncommitted writes; DML `RETURNING` rows are captured into
+    /// `out_returning`, which the caller owns.
+    pub fn liveExec(
+        self: *Node,
+        gpa: std.mem.Allocator,
+        sql: []const u8,
+        values: []const prepared.Value,
+        out_returning: *?TypedResult,
+    ) !LiveStatementResult {
+        if (!self.live_transaction) return error.NoTransaction;
+        out_returning.* = null;
+        var capture = WriteCapture{ .gpa = gpa };
+        errdefer if (capture.returning) |*rows| rows.deinit();
+        const changes_before = self.totalChanges();
+        const rowid_before = self.db.lastInsertRowId();
+        self.saved_error_len = 0;
+        {
+            self.guard.scope = .application;
+            defer self.guard.scope = .internal;
+            const statements = [_]prepared.Statement{.{
+                .sql = sql,
+                .values = values,
+            }};
+            self.executePreparedCapture(&statements, &capture) catch |err| {
+                self.saveErrorFrom(&self.db);
+                // A conflict-rollback or similar abort can end the whole
+                // transaction inside SQLite; reflect that state so the
+                // host sees the transaction as closed.
+                if (!self.db.inTransaction()) self.live_transaction = false;
+                return err;
+            };
+        }
+        const rowid_after = self.db.lastInsertRowId();
+        out_returning.* = capture.returning;
+        return .{
+            .changes = self.totalChanges() - changes_before,
+            .last_insert_rowid = if (rowid_after != rowid_before)
+                rowid_after
+            else
+                null,
+        };
+    }
+
+    /// Host-managed savepoint operations. Names are SDK-generated ordinal
+    /// identifiers executed under internal scope, so arbitrary application
+    /// transaction-control SQL stays denied.
+    pub fn liveSavepoint(self: *Node, index: u32) !void {
+        try self.liveSavepointControl("savepoint zx_sp_{d}", index);
+    }
+
+    pub fn liveReleaseSavepoint(self: *Node, index: u32) !void {
+        try self.liveSavepointControl("release zx_sp_{d}", index);
+    }
+
+    pub fn liveRollbackToSavepoint(self: *Node, index: u32) !void {
+        try self.liveSavepointControl("rollback to zx_sp_{d}", index);
+    }
+
+    fn liveSavepointControl(
+        self: *Node,
+        comptime format: []const u8,
+        index: u32,
+    ) !void {
+        if (!self.live_transaction) return error.NoTransaction;
+        var buffer: [48]u8 = undefined;
+        const sql = std.fmt.bufPrintZ(&buffer, format, .{index}) catch
+            unreachable;
+        self.db.exec(sql) catch |err| {
+            self.saveErrorFrom(&self.db);
+            return err;
+        };
+    }
+
+    /// Commits the live transaction: verifies the capture contract, seals
+    /// the batch marker, commits SQLite, and acknowledges only when the
+    /// captured transition is decided and applied. The returned change
+    /// count follows SQLite's total-changes semantics: work undone by a
+    /// savepoint rollback still counts; per-statement counts from
+    /// `liveExec` are the precise ones.
+    pub fn commitLive(self: *Node) !ExecResult {
+        if (!self.live_transaction) return error.NoTransaction;
+        if (self.log.stop_pending or self.log.isReconfigured() != null) {
+            return error.LogSealed;
+        }
+        const changes = self.totalChanges() - self.live_changes_base;
+        self.live_transaction = false;
+        errdefer self.db.exec("rollback") catch {};
+        guard_mod.verifyCaptureContract(
+            &self.db,
+            self.page_size,
+            &self.committed_frames,
+        ) catch |err| {
+            self.saveErrorText("application SQL broke the capture contract");
+            return err;
+        };
+        return self.sealCapturedTransaction(
+            self.live_batch_id_bytes,
+            changes,
+            null,
+        );
+    }
+
+    /// Rolls the live transaction back; nothing is replicated. A rollback
+    /// failure marks the image for resync so the connection cannot reuse
+    /// an unknown writer state.
+    pub fn rollbackLive(self: *Node) !void {
+        if (!self.live_transaction) return error.NoTransaction;
+        self.live_transaction = false;
+        self.db.exec("rollback") catch |err| {
+            self.saveErrorFrom(&self.db);
+            self.needs_resync = true;
+            return err;
+        };
+    }
+
+    /// True while a Gate C live transaction is open on this node.
+    pub fn inLiveTransaction(self: *const Node) bool {
+        return self.live_transaction;
+    }
+
+    /// Executes prepared statements like `prepared.execute`, additionally
+    /// collecting typed rows from the last row-producing statement (a DML
+    /// `RETURNING` clause in the single-statement caller).
+    fn executePreparedCapture(
+        self: *Node,
+        statements: []const prepared.Statement,
+        capture: *WriteCapture,
+    ) !void {
+        for (statements) |statement| {
+            var stmt = try self.db.prepare(statement.sql);
+            defer stmt.finalize();
+            try prepared.bind(&stmt, statement.values);
+            const column_count = stmt.columnCount();
+            if (column_count == 0) {
+                while (try stmt.step()) {}
+                continue;
+            }
+            if (capture.returning) |*previous| previous.deinit();
+            capture.returning = null;
+            var arena = std.heap.ArenaAllocator.init(capture.gpa);
+            errdefer arena.deinit();
+            const alloc = arena.allocator();
+            const columns = try alloc.alloc([]const u8, column_count);
+            for (columns, 0..) |*column, index| {
+                column.* = try alloc.dupe(u8, stmt.columnName(@intCast(index)));
+            }
+            var rows: std.ArrayList([]const prepared.Value) = .empty;
+            while (try stmt.step()) {
+                const row = try alloc.alloc(prepared.Value, column_count);
+                for (row, 0..) |*cell, index| {
+                    const column: u32 = @intCast(index);
+                    cell.* = switch (stmt.columnValueType(column)) {
+                        .null => .null_value,
+                        .integer => .{ .integer = stmt.columnInt64(column) },
+                        .real => .{ .real = stmt.columnDouble(column) },
+                        .text => .{
+                            .text = try alloc.dupe(u8, stmt.columnText(column)),
+                        },
+                        .blob => .{
+                            .blob = try alloc.dupe(u8, stmt.columnBlob(column)),
+                        },
+                    };
+                }
+                try rows.append(alloc, row);
+            }
+            capture.returning = .{
+                .arena = arena,
+                .columns = columns,
+                .rows = try rows.toOwnedSlice(alloc),
+            };
+        }
+    }
+
     /// The result of the most recent append made through this node. Hosts
     /// use it to await commitment of compound operations (session open)
     /// whose public API does not surface the slot.
@@ -1849,6 +2393,7 @@ pub const Node = struct {
 
     fn saveErrorFrom(self: *Node, db: *const sqlite.Db) void {
         self.saveErrorText(db.errmsg());
+        self.saved_error_code = db.extendedErrcode();
     }
 
     fn saveErrorText(self: *Node, message: []const u8) void {
@@ -1857,6 +2402,16 @@ pub const Node = struct {
             self.saved_error[0..self.saved_error_len],
             message[0..self.saved_error_len],
         );
+        self.saved_error_code = 0;
+    }
+
+    /// SQLite extended result code of the most recent saved SQL error, or
+    /// the live connection's when nothing is saved. Hosts derive stable
+    /// error categories from it instead of parsing message text.
+    pub fn lastSqliteExtendedCode(self: *const Node) i32 {
+        if (self.saved_error_len > 0) return self.saved_error_code;
+        if (self.db_open) return self.db.extendedErrcode();
+        return 0;
     }
 
     // ------------------------------------------------------------------
