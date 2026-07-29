@@ -1,0 +1,83 @@
+# Python SDK CI for the zaxonlite repository (insanai/zaxonlite).
+#
+# Same two-checkout layout as ci.yml: build.zig.zon declares paxos as
+# `.path = ".."`, so insanai/paxos-zig sits at the workspace root and this
+# repository in zaxonlite/ beside it. The SDK's build_ext runs the Zig
+# build itself; this job provides Zig, uv, and a CPython floor.
+name: Python SDK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "languages/python/**"
+      - "src/**"
+      - "include/**"
+      - "build.zig"
+      - "build.zig.zon"
+      - ".github/workflows/python.yml"
+  pull_request:
+    paths:
+      - "languages/python/**"
+      - "src/**"
+      - "include/**"
+      - "build.zig"
+      - "build.zig.zon"
+      - ".github/workflows/python.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: sdk (${{ matrix.os }}, py${{ matrix.python }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.12", "3.13", "3.14"]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: zaxonlite/languages/python
+    steps:
+      - name: Checkout paxos-zig (path dependency parent)
+        uses: actions/checkout@v4
+        with:
+          repository: insanai/paxos-zig
+          token: ${{ secrets.CROSS_REPO_TOKEN || github.token }}
+          path: .
+
+      - name: Checkout zaxonlite
+        uses: actions/checkout@v4
+        with:
+          path: zaxonlite
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Prepare Zig fetch cache directory
+        run: mkdir -p "$HOME/.cache/zig/tmp"
+
+      - name: Lint gate
+        run: |
+          uv sync --group dev
+          uv run ruff format --check .
+          uv run ruff check .
+
+      - name: Build native extension and run tests
+        run: |
+          uv run python setup.py build_ext --inplace
+          uv run pytest -x -q

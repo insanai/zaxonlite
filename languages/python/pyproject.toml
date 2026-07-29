@@ -1,0 +1,60 @@
+[project]
+name = "zxlite"
+version = "0.1.0"
+description = "DB-API 2.0 driver for zaxonlite, an embeddable SQLite service replicated by Multi-Paxos (Gate A: local autocommit)"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+authors = [
+    { name = "Vikrant Rathore" },
+    { name = "Ronak Rathore" },
+]
+keywords = ["sqlite", "paxos", "replication", "dbapi", "database"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Database :: Database Engines/Servers",
+]
+
+[project.optional-dependencies]
+sqlalchemy = ["sqlalchemy>=2.0,<2.2"]
+
+[project.entry-points."sqlalchemy.dialects"]
+zxlite = "zxlite.sqlalchemy:ZxLiteDialect"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[dependency-groups]
+dev = ["ruff", "pytest", "sqlalchemy>=2.0,<2.2"]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["zxlite*"]
+
+[tool.setuptools.package-data]
+zxlite = ["py.typed"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not slow'"
+markers = [
+    "slow: multi-process cluster tests (run with -m slow)",
+]
