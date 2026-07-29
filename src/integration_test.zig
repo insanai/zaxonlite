@@ -1110,3 +1110,211 @@ test "recovery completes registry rollover after the pointer advances" {
     try testing.expectEqual(@as(u64, 2), reopened.decidedRegistry().?.configuration_id);
     try testing.expectEqual(@as(i64, 1), try countItems(reopened));
 }
+
+test "a transaction above the protocol hard limit is rejected" {
+    // The 64 MiB - 73 byte protocol payload bound (ZDS 0009): a single
+    // oversized transaction is refused before it reaches the journal, and
+    // the node keeps serving afterwards.
+    const gpa = testing.allocator;
+    var test_dir = try TestDir.init(gpa);
+    defer test_dir.deinit(gpa);
+    const dir = try test_dir.nodeDir(gpa);
+    defer gpa.free(dir);
+
+    const node = try openNode(dir);
+    defer node.close();
+    _ = try node.exec("create table big(b blob)");
+    try testing.expectError(
+        error.TransactionTooLarge,
+        node.exec("insert into big values (randomblob(70000000))"),
+    );
+    const after = try node.exec("insert into big values (randomblob(16))");
+    try testing.expectEqual(@as(i64, 1), after.changes);
+}
+
+test "replicated multimodal search state survives restart" {
+    // FTS5 tokens, float vectors, and coarse bit vectors commit in one
+    // replicated transaction; a reopened node rebuilds its image from the
+    // journal and answers the hybrid query identically (ZDS 0009).
+    const gpa = testing.allocator;
+    var test_dir = try TestDir.init(gpa);
+    defer test_dir.deinit(gpa);
+    const dir = try test_dir.nodeDir(gpa);
+    defer gpa.free(dir);
+
+    const hybrid_sql =
+        \\with coarse as (
+        \\  select item_id, embedding from media_vec
+        \\  where embedding_coarse match
+        \\    vec_quantize_binary(vec_f32('[1,-1,-1,-1,-1,-1,-1,-1]'))
+        \\  and k = 2)
+        \\select item_id,
+        \\  zaxon_vec_distance_cosine(embedding, vec_f32('[1,0,0,0,0,0,0,0]'))
+        \\    as exact_distance
+        \\from coarse order by exact_distance, item_id
+    ;
+
+    {
+        const node = try openNode(dir);
+        defer node.close();
+        _ = try node.exec(
+            \\create table media(id integer primary key, title text);
+            \\create virtual table media_fts using fts5(
+            \\  title, content='media', content_rowid='id');
+            \\create virtual table media_vec using vec0(
+            \\  item_id integer primary key,
+            \\  embedding float[8],
+            \\  embedding_coarse bit[8]);
+        );
+        _ = try node.exec(
+            \\insert into media(id, title) values
+            \\  (1, 'paxos replicates sqlite'),
+            \\  (2, 'vectors rank media'),
+            \\  (3, 'hamming coarse scan');
+            \\insert into media_fts(rowid, title) select id, title from media;
+            \\insert into media_vec(item_id, embedding, embedding_coarse) values
+            \\  (1, vec_f32('[1,0,0,0,0,0,0,0]'),
+            \\      vec_quantize_binary(vec_f32('[1,-1,-1,-1,-1,-1,-1,-1]'))),
+            \\  (2, vec_f32('[0,1,0,0,0,0,0,0]'),
+            \\      vec_quantize_binary(vec_f32('[-1,1,-1,-1,-1,-1,-1,-1]'))),
+            \\  (3, vec_f32('[1,1,0,0,0,0,0,0]'),
+            \\      vec_quantize_binary(vec_f32('[1,1,-1,-1,-1,-1,-1,-1]')));
+        );
+        var result = try node.query(gpa, hybrid_sql);
+        defer result.deinit();
+        try testing.expectEqual(@as(usize, 2), result.rows.len);
+        try testing.expectEqualStrings("1", result.rows[0][0].?);
+        try testing.expectEqualStrings("3", result.rows[1][0].?);
+    }
+
+    // Reopen: the journal-authoritative rebuild must reproduce the same
+    // search state, and the search-feature version keeps serving.
+    const node = try openNode(dir);
+    defer node.close();
+    var result = try node.query(gpa, hybrid_sql);
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 2), result.rows.len);
+    try testing.expectEqualStrings("1", result.rows[0][0].?);
+    try testing.expectEqualStrings("3", result.rows[1][0].?);
+
+    var fts = try node.query(
+        gpa,
+        "select rowid from media_fts where media_fts match 'paxos'",
+    );
+    defer fts.deinit();
+    try testing.expectEqual(@as(usize, 1), fts.rows.len);
+    try testing.expectEqualStrings("1", fts.rows[0][0].?);
+}
+
+test "typed search matches the hand-written hybrid statement" {
+    const gpa = testing.allocator;
+    var test_dir = try TestDir.init(gpa);
+    defer test_dir.deinit(gpa);
+    const dir = try test_dir.nodeDir(gpa);
+    defer gpa.free(dir);
+
+    const node = try openNode(dir);
+    defer node.close();
+    _ = try node.exec(
+        \\create table media(id integer primary key, title text);
+        \\create virtual table media_fts using fts5(
+        \\  title, content='media', content_rowid='id');
+        \\create virtual table media_vec using vec0(
+        \\  item_id integer primary key,
+        \\  embedding float[8],
+        \\  embedding_coarse bit[8]);
+        \\insert into media(id, title) values
+        \\  (1, 'paxos replicates sqlite'),
+        \\  (2, 'vectors rank media'),
+        \\  (3, 'sqlite stores vectors');
+        \\insert into media_fts(rowid, title) select id, title from media;
+        \\insert into media_vec(item_id, embedding, embedding_coarse) values
+        \\  (1, vec_f32('[1,0,0,0,0,0,0,0]'),
+        \\      vec_quantize_binary(vec_f32('[1,-1,-1,-1,-1,-1,-1,-1]'))),
+        \\  (2, vec_f32('[0,1,0,0,0,0,0,0]'),
+        \\      vec_quantize_binary(vec_f32('[-1,1,-1,-1,-1,-1,-1,-1]'))),
+        \\  (3, vec_f32('[1,1,0,0,0,0,0,0]'),
+        \\      vec_quantize_binary(vec_f32('[1,1,-1,-1,-1,-1,-1,-1]')));
+    );
+
+    const query_embedding = [_]f32{ 1, 0, 0, 0, 0, 0, 0, 0 };
+    const embedding_bytes = std.mem.sliceAsBytes(&query_embedding);
+
+    // The typed API result must match the ZDS hybrid CTE run as raw SQL
+    // with the same parameters bound.
+    var typed = try node.search(gpa, .{
+        .fts_table = "media_fts",
+        .vec_table = "media_vec",
+        .text = "sqlite",
+        .embedding = embedding_bytes,
+        .k = 3,
+        .candidate_count = 64,
+    }, .{});
+    defer typed.deinit();
+
+    var raw = try node.queryPrepared(gpa,
+        \\with lexical as (
+        \\  select rowid as item_id,
+        \\    row_number() over (order by bm25(media_fts), rowid) as rank
+        \\  from media_fts where media_fts match ?1
+        \\  order by bm25(media_fts), rowid limit ?2),
+        \\coarse as (
+        \\  select item_id, embedding from media_vec
+        \\  where embedding_coarse match vec_quantize_binary(?3) and k = ?2),
+        \\reranked as (
+        \\  select item_id,
+        \\    zaxon_vec_distance_cosine(embedding, ?3) as exact_distance
+        \\  from coarse order by exact_distance, item_id limit ?4),
+        \\semantic as (
+        \\  select item_id,
+        \\    row_number() over (order by exact_distance, item_id) as rank
+        \\  from reranked),
+        \\contributions as (
+        \\  select item_id, rrf(rank, 60, ?5) as score from lexical
+        \\  union all
+        \\  select item_id, rrf(rank, 60, ?6) as score from semantic)
+        \\select item_id, sum(score) as fused_score
+        \\from contributions group by item_id
+        \\order by fused_score desc, item_id limit ?4
+    , &.{
+        .{ .text = "sqlite" },
+        .{ .integer = 64 },
+        .{ .blob = embedding_bytes },
+        .{ .integer = 3 },
+        .{ .real = 1.0 },
+        .{ .real = 1.0 },
+    });
+    defer raw.deinit();
+
+    try testing.expectEqual(raw.rows.len, typed.rows.len);
+    for (raw.rows, typed.rows) |raw_row, typed_row| {
+        try testing.expectEqualStrings(raw_row[0].?, typed_row[0].?);
+        try testing.expectEqualStrings(raw_row[1].?, typed_row[1].?);
+    }
+
+    // Single-branch requests skip fusion (ZDS fusion-selection flow).
+    var vector_only = try node.search(gpa, .{
+        .vec_table = "media_vec",
+        .embedding = embedding_bytes,
+        .k = 2,
+    }, .{});
+    defer vector_only.deinit();
+    try testing.expectEqual(@as(usize, 2), vector_only.rows.len);
+    try testing.expectEqualStrings("1", vector_only.rows[0][0].?);
+
+    var text_only = try node.search(gpa, .{
+        .fts_table = "media_fts",
+        .text = "vectors",
+        .k = 5,
+    }, .{});
+    defer text_only.deinit();
+    try testing.expectEqual(@as(usize, 2), text_only.rows.len);
+
+    // The candidate cap is enforced before any SQL exists.
+    try testing.expectError(error.InvalidCandidateCount, node.search(gpa, .{
+        .vec_table = "media_vec",
+        .embedding = embedding_bytes,
+        .k = 2,
+        .candidate_count = 4097,
+    }, .{}));
+}

@@ -566,6 +566,27 @@ fn runScenario(
     step("create schema");
     execSql(&cluster, "create table t(a integer primary key, b text)", 15_000);
 
+    step("create multimodal search schema and rows (ZDS 0009)");
+    execSql(
+        &cluster,
+        "create virtual table media_fts using fts5(body); " ++
+            "create virtual table media_vec using vec0(" ++
+            "item_id integer primary key, " ++
+            "embedding float[8], embedding_coarse bit[8]);",
+        15_000,
+    );
+    execSql(
+        &cluster,
+        "insert into media_fts(rowid, body) values " ++
+            "(1, 'paxos replicates sqlite'), (2, 'vectors rank media'); " ++
+            "insert into media_vec(item_id, embedding, embedding_coarse) values " ++
+            "(1, vec_f32('[1,0,0,0,0,0,0,0]'), " ++
+            "vec_quantize_binary(vec_f32('[1,-1,-1,-1,-1,-1,-1,-1]'))), " ++
+            "(2, vec_f32('[0,1,0,0,0,0,0,0]'), " ++
+            "vec_quantize_binary(vec_f32('[-1,1,-1,-1,-1,-1,-1,-1]')));",
+        15_000,
+    );
+
     step("open sessions");
     const session_body = mustCall(&cluster, "{\"op\":\"session\"}", 10_000);
     const session_id: u64 = blk: {
@@ -687,6 +708,86 @@ fn runScenario(
 
     step("compare logical database hashes on all three nodes");
     expectAllDigestsEqual(&cluster, "after catch-up");
+
+    step("hybrid search answers identically on every endpoint");
+    {
+        // Every node applied the same pages, so the coarse bit scan plus
+        // exact rerank must return byte-identical results everywhere.
+        const hybrid =
+            "{\"op\":\"query\",\"level\":\"any\",\"freshness_ms\":60000," ++
+            "\"sql\":\"with coarse as (select item_id, embedding " ++
+            "from media_vec where embedding_coarse match " ++
+            "vec_quantize_binary(vec_f32('[1,-1,-1,-1,-1,-1,-1,-1]')) " ++
+            "and k = 2) select item_id from coarse order by " ++
+            "zaxon_vec_distance_cosine(embedding, " ++
+            "vec_f32('[1,0,0,0,0,0,0,0]')), item_id\"}";
+        var reference: ?[]u8 = null;
+        defer if (reference) |body| cluster.gpa.free(body);
+        for (cluster.endpoints) |endpoint| {
+            const body = rpcTry(&cluster, endpoint, hybrid) orelse
+                fail(&cluster, "hybrid query unreachable at port {d}", .{endpoint.port});
+            if (std.mem.indexOf(u8, body, "\"ok\":true") == null) {
+                fail(&cluster, "hybrid query failed: {s}", .{body});
+            }
+            if (reference) |expected| {
+                if (!std.mem.eql(u8, expected, body)) {
+                    fail(&cluster, "hybrid results diverge: {s}", .{body});
+                }
+                cluster.gpa.free(body);
+            } else {
+                reference = body;
+            }
+        }
+    }
+
+    step("typed search op round-trips on every endpoint");
+    {
+        // Base64 of the little-endian float32 vector [1,0,0,0,0,0,0,0].
+        const typed =
+            "{\"op\":\"search\",\"level\":\"any\",\"freshness_ms\":60000," ++
+            "\"vec_table\":\"media_vec\"," ++
+            "\"embedding\":\"AACAPwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"," ++
+            "\"k\":2,\"candidate_count\":64}";
+        for (cluster.endpoints) |endpoint| {
+            const body = rpcTry(&cluster, endpoint, typed) orelse
+                fail(&cluster, "search op unreachable at port {d}", .{endpoint.port});
+            defer cluster.gpa.free(body);
+            if (std.mem.indexOf(u8, body, "\"ok\":true") == null or
+                std.mem.indexOf(u8, body, "[\"1\",") == null)
+            {
+                fail(&cluster, "search op failed: {s}", .{body});
+            }
+        }
+        // The candidate cap rejects before any SQL runs.
+        const over_cap =
+            "{\"op\":\"search\",\"vec_table\":\"media_vec\"," ++
+            "\"embedding\":\"AACAPwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"," ++
+            "\"k\":2,\"candidate_count\":4097}";
+        const body = rpcTry(&cluster, cluster.endpoints[0], over_cap) orelse
+            fail(&cluster, "search cap rpc unreachable", .{});
+        defer cluster.gpa.free(body);
+        if (std.mem.indexOf(u8, body, "candidate_count must be") == null) {
+            fail(&cluster, "candidate cap not enforced: {s}", .{body});
+        }
+    }
+
+    step("status reports the search capability manifest");
+    {
+        const body = mustCall(&cluster, "{\"op\":\"status\"}", 10_000);
+        defer cluster.gpa.free(body);
+        for ([_][]const u8{
+            "\"fts5_enabled\":true",
+            "\"sqlite_vec_version\":\"v0.1.9\"",
+            "\"search_feature_version\":1",
+            "\"simd_backend\":\"",
+            "\"mmap_size\":0",
+            "\"candidate_hard_limit\":4096",
+        }) |needle| {
+            if (std.mem.indexOf(u8, body, needle) == null) {
+                fail(&cluster, "status missing {s}: {s}", .{ needle, body });
+            }
+        }
+    }
 
     step("arm leader failpoint: after quorum choice, before client reply");
     const leader_now = leaderIndex(&cluster);
