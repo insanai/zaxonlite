@@ -1249,6 +1249,8 @@ test "typed search matches the hand-written hybrid statement" {
         .embedding = embedding_bytes,
         .k = 3,
         .candidate_count = 64,
+        .metadata_table = "media",
+        .metadata_columns = &.{"title"},
     }, .{});
     defer typed.deinit();
 
@@ -1290,6 +1292,16 @@ test "typed search matches the hand-written hybrid statement" {
     for (raw.rows, typed.rows) |raw_row, typed_row| {
         try testing.expectEqualStrings(raw_row[0].?, typed_row[0].?);
         try testing.expectEqualStrings(raw_row[1].?, typed_row[1].?);
+    }
+    try testing.expectEqualStrings("title", typed.columns[2]);
+    for (typed.rows) |row| {
+        const expected_title: []const u8 = if (std.mem.eql(u8, row[0].?, "1"))
+            "paxos replicates sqlite"
+        else if (std.mem.eql(u8, row[0].?, "2"))
+            "vectors rank media"
+        else
+            "sqlite stores vectors";
+        try testing.expectEqualStrings(expected_title, row[2].?);
     }
 
     // Single-branch requests skip fusion (ZDS fusion-selection flow).

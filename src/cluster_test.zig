@@ -569,7 +569,8 @@ fn runScenario(
     step("create multimodal search schema and rows (ZDS 0009)");
     execSql(
         &cluster,
-        "create virtual table media_fts using fts5(body); " ++
+        "create table media(id integer primary key, title text); " ++
+            "create virtual table media_fts using fts5(body); " ++
             "create virtual table media_vec using vec0(" ++
             "item_id integer primary key, " ++
             "embedding float[8], embedding_coarse bit[8]);",
@@ -577,7 +578,9 @@ fn runScenario(
     );
     execSql(
         &cluster,
-        "insert into media_fts(rowid, body) values " ++
+        "insert into media(id, title) values " ++
+            "(1, 'paxos replicates sqlite'), (2, 'vectors rank media'); " ++
+            "insert into media_fts(rowid, body) values " ++
             "(1, 'paxos replicates sqlite'), (2, 'vectors rank media'); " ++
             "insert into media_vec(item_id, embedding, embedding_coarse) values " ++
             "(1, vec_f32('[1,0,0,0,0,0,0,0]'), " ++
@@ -747,13 +750,15 @@ fn runScenario(
             "{\"op\":\"search\",\"level\":\"any\",\"freshness_ms\":60000," ++
             "\"vec_table\":\"media_vec\"," ++
             "\"embedding\":\"AACAPwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"," ++
-            "\"k\":2,\"candidate_count\":64}";
+            "\"k\":2,\"candidate_count\":64,\"metadata_table\":\"media\"," ++
+            "\"metadata_columns\":[\"title\"]}";
         for (cluster.endpoints) |endpoint| {
             const body = rpcTry(&cluster, endpoint, typed) orelse
                 fail(&cluster, "search op unreachable at port {d}", .{endpoint.port});
             defer cluster.gpa.free(body);
             if (std.mem.indexOf(u8, body, "\"ok\":true") == null or
-                std.mem.indexOf(u8, body, "[\"1\",") == null)
+                std.mem.indexOf(u8, body, "[\"1\",") == null or
+                std.mem.indexOf(u8, body, "\"paxos replicates sqlite\"") == null)
             {
                 fail(&cluster, "search op failed: {s}", .{body});
             }
