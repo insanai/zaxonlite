@@ -1,17 +1,46 @@
 const std = @import("std");
 
-fn addSqliteLibrary(
+const ProductGraph = struct {
+    sqlite_lib: *std.Build.Step.Compile,
+    c_mod: *std.Build.Module,
+    search: *std.Build.Module,
+    zaxonlite: *std.Build.Module,
+};
+
+/// One optimization mode's full product graph: the static SQLite library
+/// (FTS5 plus the pinned sqlite-vec compiled in), the translated C import,
+/// the pure `zaxon_search` module, and the zaxonlite module itself. The
+/// normal and benchmark builds share this helper so extension and SIMD
+/// flags can never diverge (ZDS 0009).
+fn addProductGraph(
     b: *std.Build,
-    sqlite_dep: *std.Build.Dependency,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
-) *std.Build.Step.Compile {
+    tls_enabled: bool,
+    openssl_prefix: []const u8,
+    public_name: ?[]const u8,
+) ProductGraph {
+    const sqlite_dep = b.dependency("sqlite", .{});
+    const vec_dep = b.dependency("sqlite_vec", .{});
+    const paxos = b.dependency("paxos", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("paxos");
+
     const sqlite_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
     sqlite_mod.addIncludePath(sqlite_dep.path(""));
+    sqlite_mod.addIncludePath(vec_dep.path(""));
+    // The compile-time mmap ceiling permits the runtime opt-in profiles on
+    // 64-bit targets; the runtime default stays zero everywhere, and
+    // 32-bit or wasm targets compile mapped I/O out entirely (ZDS 0009).
+    const mmap_flag = if (target.result.ptrBitWidth() >= 64)
+        "-DSQLITE_MAX_MMAP_SIZE=1073741824"
+    else
+        "-DSQLITE_MAX_MMAP_SIZE=0";
     sqlite_mod.addCSourceFile(.{
         .file = sqlite_dep.path("sqlite3.c"),
         .flags = &.{
@@ -21,12 +50,65 @@ fn addSqliteLibrary(
             "-DSQLITE_DQS=0",
             "-DSQLITE_DEFAULT_WAL_SYNCHRONOUS=1",
             "-DHAVE_USLEEP=1",
+            "-DSQLITE_ENABLE_FTS5",
+            mmap_flag,
         },
     });
-    return b.addLibrary(.{
+    // Pinned sqlite-vec, statically registered per connection. The
+    // filesystem helpers stay out, and no AVX or NEON flag is set: the
+    // portable artifact must never contain instructions the resolved
+    // target does not guarantee (ZDS 0009).
+    sqlite_mod.addCSourceFile(.{
+        .file = vec_dep.path("sqlite-vec.c"),
+        .flags = &.{
+            "-DSQLITE_CORE",
+            "-DSQLITE_VEC_STATIC",
+            "-DSQLITE_VEC_OMIT_FS",
+        },
+    });
+    const sqlite_lib = b.addLibrary(.{
         .name = "sqlite3",
         .root_module = sqlite_mod,
     });
+
+    const translate_c = b.addTranslateC(.{
+        .root_source_file = sqlite_dep.path("sqlite3.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const c_mod = translate_c.createModule();
+
+    // Pure fusion and distance kernels: deliberately created with no
+    // imports so a SQLite, Paxos, or network dependency cannot creep in.
+    const search = b.createModule(.{
+        .root_source_file = b.path("src/search/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const module_options: std.Build.Module.CreateOptions = .{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "paxos", .module = paxos },
+            .{ .name = "c", .module = c_mod },
+            .{ .name = "zaxon_search", .module = search },
+        },
+    };
+    const zaxonlite = if (public_name) |name|
+        b.addModule(name, module_options)
+    else
+        b.createModule(module_options);
+    zaxonlite.linkLibrary(sqlite_lib);
+    if (tls_enabled) linkOpenSsl(b, zaxonlite, target, openssl_prefix);
+
+    return .{
+        .sqlite_lib = sqlite_lib,
+        .c_mod = c_mod,
+        .search = search,
+        .zaxonlite = zaxonlite,
+    };
 }
 
 /// Links the system OpenSSL 3 (libssl/libcrypto) that backs the optional
@@ -89,8 +171,15 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }).module("paxos");
 
-    const sqlite_dep = b.dependency("sqlite", .{});
-    const sqlite_lib = addSqliteLibrary(b, sqlite_dep, target, optimize);
+    const graph = addProductGraph(
+        b,
+        target,
+        optimize,
+        tls_enabled,
+        openssl_prefix,
+        "zaxonlite",
+    );
+    const zaxonlite = graph.zaxonlite;
 
     // Terminal layer for the interactive shell (ZDS 0005). Confined to the
     // CLI: the zaxonlite library module never imports it.
@@ -111,25 +200,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "vaxis", .module = vaxis },
         },
     });
-
-    const translate_c = b.addTranslateC(.{
-        .root_source_file = sqlite_dep.path("sqlite3.h"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const c_mod = translate_c.createModule();
-
-    const zaxonlite = b.addModule("zaxonlite", .{
-        .root_source_file = b.path("src/root.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "paxos", .module = paxos },
-            .{ .name = "c", .module = c_mod },
-        },
-    });
-    zaxonlite.linkLibrary(sqlite_lib);
-    if (tls_enabled) linkOpenSsl(b, zaxonlite, target, openssl_prefix);
 
     const zaxon = b.addExecutable(.{
         .name = "zaxon",
@@ -156,6 +226,17 @@ pub fn build(b: *std.Build) void {
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run the zaxonlite test suite");
     test_step.dependOn(&run_unit_tests.step);
+
+    // The pure search kernels test as their own module: compiling them
+    // without any imports proves the SQLite-free boundary (ZDS 0009).
+    const search_tests = b.addTest(.{ .root_module = graph.search });
+    const run_search_tests = b.addRunArtifact(search_tests);
+    const search_test_step = b.step(
+        "test-search",
+        "Run the pure zaxon_search kernel tests",
+    );
+    search_test_step.dependOn(&run_search_tests.step);
+    test_step.dependOn(&run_search_tests.step);
 
     // Pure state machines of the shared terminal UI: editor, history,
     // highlighter, renderers. No TTY or node is spawned.
@@ -372,23 +453,18 @@ pub fn build(b: *std.Build) void {
     const soak_step = b.step("soak", "Run the sustained mixed-load soak");
     soak_step.dependOn(&run_soak.step);
 
-    // Benchmarks always build ReleaseFast regardless of -Doptimize.
-    const bench_paxos = b.dependency("paxos", .{
-        .target = target,
-        .optimize = std.builtin.OptimizeMode.ReleaseFast,
-    }).module("paxos");
-    const bench_sqlite = addSqliteLibrary(b, sqlite_dep, target, .ReleaseFast);
-    const bench_zaxonlite = b.createModule(.{
-        .root_source_file = b.path("src/root.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-        .imports = &.{
-            .{ .name = "paxos", .module = bench_paxos },
-            .{ .name = "c", .module = c_mod },
-        },
-    });
-    bench_zaxonlite.linkLibrary(bench_sqlite);
-    if (tls_enabled) linkOpenSsl(b, bench_zaxonlite, target, openssl_prefix);
+    // Benchmarks always build ReleaseFast regardless of -Doptimize. The
+    // shared helper guarantees the benchmark SQLite carries exactly the
+    // same extension and SIMD flags as the product build.
+    const bench_graph = addProductGraph(
+        b,
+        target,
+        .ReleaseFast,
+        tls_enabled,
+        openssl_prefix,
+        null,
+    );
+    const bench_zaxonlite = bench_graph.zaxonlite;
     const bench_exe = b.addExecutable(.{
         .name = "zaxon-bench",
         .root_module = b.createModule(.{
@@ -405,6 +481,33 @@ pub fn build(b: *std.Build) void {
         "Run write/read/recovery benchmarks (ReleaseFast)",
     );
     bench_step.dependOn(&run_bench.step);
+
+    // Search benchmarks (ZDS 0009 performance gates): kernel throughput,
+    // storage ratio, heap bounds, mmap profiles, and fixture-gated recall.
+    const search_bench_exe = b.addExecutable(.{
+        .name = "zaxon-search-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/search_bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "zaxonlite", .module = bench_zaxonlite },
+                .{ .name = "zaxon_search", .module = bench_graph.search },
+            },
+        }),
+    });
+    const run_search_bench = b.addRunArtifact(search_bench_exe);
+    // Recorded runs update the JSON the Zaxonlite book compiles in.
+    run_search_bench.addArgs(&.{
+        "--record",
+        "benchmarks/results/search-latest.json",
+    });
+    if (b.args) |args| run_search_bench.addArgs(args);
+    const search_bench_step = b.step(
+        "bench-search",
+        "Run the search kernel, storage, heap, mmap, and recall benchmarks",
+    );
+    search_bench_step.dependOn(&run_search_bench.step);
 
     // Three-node cluster benchmark: ReleaseFast server binary driven by a
     // ReleaseFast controller, in plaintext, PSK, or mTLS transport mode.
@@ -448,6 +551,63 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&zaxon_fast.step);
     check_step.dependOn(&cluster_bench_exe.step);
     check_step.dependOn(&bench_exe.step);
+    check_step.dependOn(&search_bench_exe.step);
+
+    // Cross-target compile gate for the pure search kernels: the module
+    // has no dependencies, so it must build for every supported vector
+    // target, including the scalar fallbacks (ZDS 0009).
+    const kernel_targets = [_][]const u8{
+        "aarch64-linux-gnu",
+        "aarch64-windows-gnu",
+        "x86_64-linux-gnu",
+        "x86_64-windows-gnu",
+        "x86-linux-gnu",
+        "arm-linux-musleabi",
+        "arm-linux-musleabihf",
+        "wasm32-wasi",
+        "riscv64-linux-gnu",
+    };
+    // Disassembly gate (ZDS 0009): a ReleaseFast object exporting the
+    // SIMD cosine kernel; benchmarks/verify-simd.sh greps its
+    // disassembly for packed float multiply/add instructions.
+    const probe_obj = b.addObject(.{
+        .name = "zaxon-search-probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/search/disasm_probe.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    const install_probe = b.addInstallFile(
+        probe_obj.getEmittedBin(),
+        "disasm/zaxon-search-probe.o",
+    );
+    const probe_step = b.step(
+        "disasm-probe",
+        "Emit the SIMD kernel probe object for disassembly verification",
+    );
+    probe_step.dependOn(&install_probe.step);
+
+    const kernels_step = b.step(
+        "check-kernels",
+        "Cross-compile the pure search kernels for the vector target matrix",
+    );
+    for (kernel_targets) |triple| {
+        const query = std.Target.Query.parse(
+            .{ .arch_os_abi = triple },
+        ) catch unreachable;
+        const kernel_mod = b.createModule(.{
+            .root_source_file = b.path("src/search/root.zig"),
+            .target = b.resolveTargetQuery(query),
+            .optimize = optimize,
+        });
+        const kernel_obj = b.addObject(.{
+            .name = b.fmt("zaxon-search-{s}", .{triple}),
+            .root_module = kernel_mod,
+        });
+        kernels_step.dependOn(&kernel_obj.step);
+    }
+    check_step.dependOn(kernels_step);
 
     const run_cluster_bench = b.addRunArtifact(cluster_bench_exe);
     run_cluster_bench.addArtifactArg(zaxon_fast);

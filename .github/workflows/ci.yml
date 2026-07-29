@@ -65,8 +65,29 @@ jobs:
           mkdir -p "${ZIG_GLOBAL_CACHE_DIR:-$HOME/.cache/zig}/tmp"
           rm -rf "${ZIG_LOCAL_CACHE_DIR:-.zig-cache}/zx-capi-smoke"
 
+      # Only src/sqlite/ may import the translated SQLite C module
+      # (ZDS 0009). A plain grep keeps that boundary honest.
+      - name: SQLite C import boundary
+        run: |
+          if grep -rn '@import("c")' src --include='*.zig' | grep -v '^src/sqlite/'; then
+            echo 'translated C import outside src/sqlite/' >&2
+            exit 1
+          fi
+
       - name: Compile every binary
         run: zig build check
+
+      # Supported release targets must carry packed float multiply/add in
+      # the Zig cosine kernel; a benchmark alone is not proof of SIMD.
+      - name: SIMD disassembly gate
+        run: |
+          zig build disasm-probe
+          sh benchmarks/verify-simd.sh
+
+      # The pinned retrieval fixture is generated offline; CI only proves
+      # the recorded artifact hashes still match.
+      - name: Benchmark fixture hashes
+        run: python3 benchmarks/verify-fixture.py
 
       - name: Unit and single-process integration tests
         run: zig build test

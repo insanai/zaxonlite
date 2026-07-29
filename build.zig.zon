@@ -9,6 +9,14 @@
             .url = "https://sqlite.org/2025/sqlite-amalgamation-3500400.zip",
             .hash = "N-V-__8AAHCbqABM_X5RTjbDBDBWErxZE8tJzmtEnLOLRHGx",
         },
+        // Pinned sqlite-vec amalgamation (ZDS 0009), statically compiled
+        // into the SQLite library with the filesystem helpers omitted.
+        // Release zip SHA-256:
+        // b87cdda12112657ba5ab8842f0088a4090982eaf41f22b2bd6d495b81765a8c9
+        .sqlite_vec = .{
+            .url = "https://github.com/asg017/sqlite-vec/releases/download/v0.1.9/sqlite-vec-0.1.9-amalgamation.zip",
+            .hash = "N-V-__8AAFjlBACTHqSZPx-m0Y-NHDBK6_c28UfnIp9rxqgX",
+        },
         .vaxis = .{
             .url = "git+https://github.com/rockorager/libvaxis?ref=main#d63a23c593c9b82f0b2886840161fa1f1df983e9",
             .hash = "vaxis-0.6.0-BWNV_DsLCgCcKudOoFkyrSgjxUeLAOSf1LxwezEeVieH",
