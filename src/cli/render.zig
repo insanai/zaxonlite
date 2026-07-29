@@ -40,14 +40,23 @@ pub fn printStatus(node: *zaxonlite.Node, json: bool, out: *std.Io.Writer) !void
                 "\"leader\":{?d}," ++
                 "\"decided_slot\":{d},\"applied_slot\":{d}," ++
                 "\"journal_records\":{d},\"epoch_capacity\":{d}," ++
-                "\"chain\":\"{s}\",\"page_size\":{d},\"snapshot\":",
+                "\"chain\":\"{s}\",\"page_size\":{d}," ++
+                "\"fts5_enabled\":{}," ++
+                "\"sqlite_vec_version\":\"{s}\"," ++
+                "\"search_feature_version\":{d}," ++
+                "\"simd_backend\":\"{s}\"," ++
+                "\"mmap_size\":{d}," ++
+                "\"candidate_hard_limit\":{d},\"snapshot\":",
             .{
-                status.node_id,          status.database_id,
-                status.configuration_id, status.role,
-                status.node_type,        status.leader,
-                status.decided_slot,     status.applied_slot,
-                status.journal_records,  status.epoch_capacity,
-                &chain_hex,              status.page_size,
+                status.node_id,               status.database_id,
+                status.configuration_id,      status.role,
+                status.node_type,             status.leader,
+                status.decided_slot,          status.applied_slot,
+                status.journal_records,       status.epoch_capacity,
+                &chain_hex,                   status.page_size,
+                status.fts5_enabled,          status.sqlite_vec_version,
+                status.search_feature_version, status.simd_backend,
+                status.mmap_size,             status.candidate_hard_limit,
             },
         );
         if (status.snapshot) |name| {
@@ -68,6 +77,12 @@ pub fn printStatus(node: *zaxonlite.Node, json: bool, out: *std.Io.Writer) !void
             \\epoch capacity:   {d}
             \\chain:            {s}
             \\page size:        {d}
+            \\fts5:             {s}
+            \\sqlite-vec:       {s}
+            \\search feature:   {d}
+            \\simd backend:     {s}
+            \\mmap size:        {d}
+            \\candidate limit:  {d}
             \\snapshot:         {s}
             \\
         , .{
@@ -82,6 +97,12 @@ pub fn printStatus(node: *zaxonlite.Node, json: bool, out: *std.Io.Writer) !void
             status.epoch_capacity,
             &chain_hex,
             status.page_size,
+            if (status.fts5_enabled) "enabled" else "missing",
+            status.sqlite_vec_version,
+            status.search_feature_version,
+            status.simd_backend,
+            status.mmap_size,
+            status.candidate_hard_limit,
             if (status.snapshot) |name| &name else "(none)",
         });
     }

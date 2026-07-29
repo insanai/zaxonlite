@@ -106,6 +106,10 @@ const usage_text =
     \\                      Reloaded node-ID denylist (serve).
     \\  --sync <mode>       full (default; F_FULLFSYNC on macOS, survives power
     \\                      loss) or os (plain fsync; faster, development only).
+    \\  --mmap-size <bytes> SQLite-managed mapped-I/O limit (serve). Default 0
+    \\                      (disabled); maximum 1073741824 (1 GiB). A mapped
+    \\                      I/O fault can terminate the process; opting in
+    \\                      accepts that operational risk.
     \\  --enable-failpoints Honor failpoint RPCs (test controllers only).
     \\  --json              Machine-readable output on stdout.
     \\  --no-color          Plain shell output even on a color terminal.
@@ -152,6 +156,7 @@ const Options = struct {
     new_node: ?[]const u8 = null,
     revocation_file: ?[]const u8 = null,
     sync: ?[]const u8 = null,
+    mmap_size: ?u64 = null,
     enable_failpoints: bool = false,
     dev_psk: bool = false,
     insecure_test_tcp: bool = false,
@@ -768,6 +773,7 @@ fn serveCommand(
         .admin_principals = options.admins.items,
         .enable_failpoints = options.enable_failpoints,
         .allow_insecure_test_tcp = options.insecure_test_tcp,
+        .mmap_size = options.mmap_size orelse 0,
     }, err_out);
 }
 
@@ -1515,6 +1521,11 @@ fn parseOptionFlag(
             return optError(err_out, "--revocation-file needs a value");
     } else if (std.mem.eql(u8, arg, "--sync")) {
         options.sync = iterator.next() orelse return optError(err_out, "--sync needs a value");
+    } else if (std.mem.eql(u8, arg, "--mmap-size")) {
+        const text = iterator.next() orelse
+            return optError(err_out, "--mmap-size needs a value");
+        options.mmap_size = std.fmt.parseInt(u64, text, 10) catch
+            return optError(err_out, "--mmap-size must be an integer byte count");
     } else if (std.mem.eql(u8, arg, "--enable-failpoints")) {
         options.enable_failpoints = true;
     } else if (std.mem.eql(u8, arg, "--dev-psk")) {

@@ -36,6 +36,11 @@ pub const sqlite = @import("sqlite.zig");
 pub const guard = @import("guard.zig");
 /// Prepared parameter values and the copied, bounded transaction builder.
 pub const prepared = @import("prepared.zig");
+/// Typed hybrid search: validated requests, the enforced candidate cap,
+/// and the canonical fused CTE statements (ZDS 0009).
+pub const search_api = @import("search_api.zig");
+/// A typed hybrid-search request for `Node.search`.
+pub const SearchRequest = search_api.Request;
 /// One bound SQL parameter: null, integer, real, text, or blob.
 pub const Value = prepared.Value;
 /// Multi-statement builder committed as one replicated SQLite transaction.
@@ -98,6 +103,7 @@ test {
     _ = @import("sqlite.zig");
     _ = @import("guard.zig");
     _ = @import("prepared.zig");
+    _ = @import("search_api.zig");
     _ = @import("wal.zig");
     _ = @import("wire.zig");
     _ = @import("transport_auth.zig");
@@ -115,7 +121,6 @@ test {
 }
 
 test "sqlite is linked and recent" {
-    const c = @import("c");
     try std.testing.expectEqualStrings("0.1.2", version);
-    try std.testing.expect(c.sqlite3_libversion_number() >= 3050000);
+    try std.testing.expect(sqlite.libversionNumber() >= 3050000);
 }

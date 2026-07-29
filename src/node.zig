@@ -38,6 +38,8 @@ const journal_mod = @import("journal.zig");
 const payload_store_mod = @import("payload_store.zig");
 const checkpoint_proof = @import("checkpoint_proof.zig");
 const sqlite = @import("sqlite.zig");
+const search_api = @import("search_api.zig");
+const zaxon_search = @import("zaxon_search");
 const guard_mod = @import("guard.zig");
 const wal = @import("wal.zig");
 const failpoint = @import("failpoint.zig");
@@ -86,6 +88,10 @@ pub const OpenOptions = struct {
     registry_nodes: ?[]const registry.NodeRecord = null,
     /// Test-only delay injected immediately before each journal sync.
     test_storage_delay_ms: u64 = 0,
+    /// SQLite-managed mapped-I/O limit for every connection this node
+    /// opens. Zero (the default) disables mmap; a nonzero value is an
+    /// explicit operator opt-in bounded at 1 GiB (ZDS 0009).
+    mmap_size: u64 = 0,
 };
 
 pub const SessionError = error{
@@ -115,7 +121,21 @@ pub const Status = struct {
     chain: command.HashBytes,
     page_size: u32,
     snapshot: ?[16]u8,
+    /// Search capability manifest (ZDS 0009).
+    fts5_enabled: bool,
+    sqlite_vec_version: []const u8,
+    search_feature_version: i64,
+    simd_backend: []const u8,
+    /// The mapped-I/O limit SQLite accepted on the most recent
+    /// connection; zero when mmap is disabled or unsupported.
+    mmap_size: i64,
+    candidate_hard_limit: u32,
 };
+
+/// Hard ceiling for vector KNN candidate counts (ZDS 0009). The typed
+/// search API enforces it; raw SQL treats it as a documented contract
+/// backed by the query row, byte, and VM-step budgets.
+pub const candidate_hard_limit: u32 = search_api.candidate_hard_limit;
 
 pub const IntegrityReport = struct {
     sqlite_ok: bool,
@@ -239,6 +259,16 @@ pub const Node = struct {
     /// the effects contract.
     fatal_storage_error: bool = false,
     test_storage_delay_ms: u64 = 0,
+    /// Operator-selected mapped-I/O limit applied to every connection.
+    mmap_size: u64 = 0,
+    /// The limit SQLite actually accepted on the most recent connection.
+    effective_mmap_size: i64 = 0,
+    /// Recorded search-feature version of the served image; zero means
+    /// the image predates the search feature.
+    search_feature_version: i64 = 0,
+    /// Cached `vec_version()` of the statically linked sqlite-vec.
+    sqlite_vec_version_buffer: [32]u8 = undefined,
+    sqlite_vec_version_len: usize = 0,
 
     // ------------------------------------------------------------------
     // Lifecycle
@@ -386,6 +416,7 @@ pub const Node = struct {
             .leader_priority = options.leader_priority,
             .last_chain = command.genesisChain(identity.database_id),
             .test_storage_delay_ms = options.test_storage_delay_ms,
+            .mmap_size = options.mmap_size,
         };
         @memcpy(self.members[0..members.len], members);
 
@@ -493,6 +524,16 @@ pub const Node = struct {
             try self.bootstrapSchema();
         }
         try self.validateMaterializedBatch();
+
+        // A mixed binary whose search feature manifest is incompatible
+        // fails closed before serving anything (ZDS 0009).
+        try self.verifySearchFeatureVersion();
+
+        if (sqlite.vecVersion(&self.sqlite_vec_version_buffer)) |text| {
+            self.sqlite_vec_version_len = text.len;
+        } else |_| {
+            self.sqlite_vec_version_len = 0;
+        }
 
         return self;
     }
@@ -752,6 +793,21 @@ pub const Node = struct {
         return self.queryPreparedWithLimits(gpa, sql, values, .{});
     }
 
+    /// Typed hybrid search (ZDS 0009): validates the request — including
+    /// the 4096 candidate cap — builds the canonical lexical, vector, or
+    /// fused statement, and runs it through the standard read path so
+    /// leases, guards, and query budgets apply unchanged.
+    pub fn search(
+        self: *Node,
+        gpa: std.mem.Allocator,
+        request: search_api.Request,
+        limits: QueryLimits,
+    ) !QueryResult {
+        const plan = try search_api.plan(gpa, request);
+        defer plan.deinit(gpa);
+        return self.queryPreparedWithLimits(gpa, plan.sql, plan.values(), limits);
+    }
+
     pub fn queryPreparedWithLimits(
         self: *Node,
         gpa: std.mem.Allocator,
@@ -873,6 +929,15 @@ pub const Node = struct {
     // ------------------------------------------------------------------
 
     pub fn status(self: *Node) Status {
+        // The gate caches the version at open, which precedes lazy schema
+        // bootstrap on hosts and page-applied bootstrap on followers;
+        // refresh while it still reads zero.
+        if (self.search_feature_version == 0) {
+            if (self.schemaReady() catch false) {
+                self.search_feature_version =
+                    self.metaInt("search_feature_version") catch 0;
+            }
+        }
         var snapshot_name: ?[16]u8 = null;
         if (self.dir.readFileAlloc(self.io, current_file_name, self.gpa, .limited(64))) |bytes| {
             defer self.gpa.free(bytes);
@@ -896,7 +961,17 @@ pub const Node = struct {
             .chain = self.last_chain,
             .page_size = self.page_size,
             .snapshot = snapshot_name,
+            .fts5_enabled = sqlite.compileOptionUsed("ENABLE_FTS5"),
+            .sqlite_vec_version = self.sqliteVecVersion(),
+            .search_feature_version = self.search_feature_version,
+            .simd_backend = zaxon_search.vector.backend.name(),
+            .mmap_size = self.effective_mmap_size,
+            .candidate_hard_limit = candidate_hard_limit,
         };
+    }
+
+    fn sqliteVecVersion(self: *const Node) []const u8 {
+        return self.sqlite_vec_version_buffer[0..self.sqlite_vec_version_len];
     }
 
     pub fn memberIds(self: *const Node) []const paxos.NodeId {
@@ -1492,6 +1567,7 @@ pub const Node = struct {
             \\  last_activity_slot integer not null default 0);
             \\insert into __zaxon_meta(key, value) values
             \\  ('schema_version', '1'),
+            \\  ('search_feature_version', '1'),
             \\  ('database_id', '{x:0>32}'),
             \\  ('session_counter', '0'),
             \\  ('write_seq', '0');
@@ -1715,8 +1791,48 @@ pub const Node = struct {
     }
 
     fn totalChanges(self: *Node) i64 {
-        const c = @import("c");
-        return c.sqlite3_total_changes64(self.db.handle);
+        return self.db.totalChanges64();
+    }
+
+    /// The newest replicated search-feature version this binary serves
+    /// (ZDS 0009). Version 1: FTS5, statically linked sqlite-vec, and the
+    /// Zig fusion and distance SQL functions.
+    pub const supported_search_feature_version: i64 = 1;
+
+    /// Refuses to serve an image whose recorded search-feature version is
+    /// newer than this binary implements. An image without the key
+    /// predates the feature and serves normally; a directory without an
+    /// image (witness, fresh member) has nothing to gate.
+    fn verifySearchFeatureVersion(self: *Node) !void {
+        if (!(self.schemaReady() catch false)) return;
+        const stored = self.metaInt("search_feature_version") catch |err|
+            switch (err) {
+                error.MetaMissing => 0,
+                else => return err,
+            };
+        self.search_feature_version = stored;
+        if (stored > supported_search_feature_version) {
+            self.saveErrorText(
+                "image search-feature version is newer than this binary",
+            );
+            return error.SearchFeatureTooNew;
+        }
+    }
+
+    /// Records search-feature version 1 in an image that predates it, as
+    /// one replicated internal-scope write. Idempotent; an operator runs
+    /// this only after every member serves a compatible binary (ZDS 0009
+    /// rolling-upgrade rule). New databases record it at bootstrap.
+    pub fn enableSearchFeature(self: *Node) !ExecResult {
+        const result = try self.writeTransaction(
+            .internal,
+            "insert into __zaxon_meta(key, value) " ++
+                "values ('search_feature_version', '1') " ++
+                "on conflict(key) do nothing",
+            null,
+        );
+        self.search_feature_version = supported_search_feature_version;
+        return result;
     }
 
     fn metaInt(self: *Node, key: []const u8) !i64 {
@@ -1765,7 +1881,11 @@ pub const Node = struct {
         self.dir.access(self.io, db_file_name, .{}) catch {
             return error.NoDatabaseImage;
         };
-        const db = try sqlite.Db.open(self.db_path);
+        const db = try sqlite.Db.openWithOptions(
+            self.db_path,
+            .{ .mmap_size = self.mmap_size },
+        );
+        self.effective_mmap_size = db.effective_mmap_size;
         return .{ .node = self, .db = db, .owned = true };
     }
 
@@ -2108,7 +2228,11 @@ pub const Node = struct {
     }
 
     fn openLiveDatabase(self: *Node) !void {
-        self.db = try sqlite.Db.open(self.db_path);
+        self.db = try sqlite.Db.openWithOptions(
+            self.db_path,
+            .{ .mmap_size = self.mmap_size },
+        );
+        self.effective_mmap_size = self.db.effective_mmap_size;
         errdefer self.db.close();
         try self.db.exec("pragma page_size = 4096");
         try self.db.exec("pragma journal_mode = wal");
@@ -3565,4 +3689,43 @@ fn fileSha256(io: Io, dir: Io.Dir, name: []const u8) ![32]u8 {
     var digest: [32]u8 = undefined;
     hasher.final(&digest);
     return digest;
+}
+
+// ----------------------------------------------------------------------
+// Tests
+// ----------------------------------------------------------------------
+
+const node_testing = std.testing;
+
+test "an image with a newer search-feature version refuses to serve" {
+    const gpa = node_testing.allocator;
+    var tmp = node_testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [Io.Dir.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(node_testing.io, &buffer);
+    const dir = try std.fmt.allocPrint(gpa, "{s}/node", .{buffer[0..len]});
+    defer gpa.free(dir);
+
+    {
+        const node = try Node.open(gpa, node_testing.io, .{ .directory = dir });
+        defer node.close();
+        // A fresh database records the supported version at bootstrap.
+        try node_testing.expectEqual(
+            Node.supported_search_feature_version,
+            node.status().search_feature_version,
+        );
+        // Simulate a future binary having activated version 2 through the
+        // replicated internal write path.
+        _ = try node.writeTransaction(
+            .internal,
+            "update __zaxon_meta set value = '2' " ++
+                "where key = 'search_feature_version'",
+            null,
+        );
+    }
+    // This binary must fail closed rather than serve the newer image.
+    try node_testing.expectError(
+        error.SearchFeatureTooNew,
+        Node.open(gpa, node_testing.io, .{ .directory = dir }),
+    );
 }

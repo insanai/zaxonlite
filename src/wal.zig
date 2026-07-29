@@ -487,6 +487,174 @@ test "captured frames rebuild a byte-identical database" {
     try testing.expect(audit_stmt.columnInt64(0) >= 4);
 }
 
+test "fts5 and vec0 shadow state rebuilds byte-identically" {
+    // The load-bearing determinism proof for ZDS 0009: FTS5 segment pages
+    // and vec0 shadow-table pages captured from the leader's WAL must
+    // materialize the same bytes on a replica, including index
+    // maintenance. Nondeterminism here forbids the search feature.
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const spike = try SpikeDb.open(gpa, tmp.dir, "search-source.db");
+    defer spike.close(gpa);
+
+    var payloads: std.ArrayList([]u8) = .empty;
+    defer {
+        for (payloads.items) |payload| gpa.free(payload);
+        payloads.deinit(gpa);
+    }
+
+    const commits = [_][:0]const u8{
+        // Base rows, an external-content FTS5 index, and one vec0 table
+        // holding both vector representations (ZDS 0009 layout).
+        \\create table media(id integer primary key, title text, uri text);
+        \\create virtual table media_fts using fts5(
+        \\  title, content='media', content_rowid='id');
+        \\create virtual table media_vec using vec0(
+        \\  item_id integer primary key,
+        \\  embedding float[8],
+        \\  embedding_coarse bit[8]);
+        ,
+        // One atomic multimodal insert: base + tokens + float + bit.
+        \\begin;
+        \\insert into media(id, title, uri) values
+        \\  (1, 'paxos replicates sqlite', 'zx://one'),
+        \\  (2, 'vectors rank media', 'zx://two'),
+        \\  (3, 'hamming coarse scan', 'zx://three');
+        \\insert into media_fts(rowid, title) select id, title from media;
+        \\insert into media_vec(item_id, embedding, embedding_coarse) values
+        \\  (1, vec_f32('[1,0,0,0,0,0,0,0]'),
+        \\      vec_quantize_binary(vec_f32('[1,-1,-1,-1,-1,-1,-1,-1]'))),
+        \\  (2, vec_f32('[0,1,0,0,0,0,0,0]'),
+        \\      vec_quantize_binary(vec_f32('[-1,1,-1,-1,-1,-1,-1,-1]'))),
+        \\  (3, vec_f32('[1,1,0,0,0,0,0,0]'),
+        \\      vec_quantize_binary(vec_f32('[1,1,-1,-1,-1,-1,-1,-1]')));
+        \\commit;
+        ,
+        // Update and delete flow through all three representations.
+        \\begin;
+        \\insert into media_fts(media_fts, rowid, title)
+        \\  values ('delete', 1, 'paxos replicates sqlite');
+        \\update media set title = 'paxos replicates pages' where id = 1;
+        \\insert into media_fts(rowid, title) values (1, 'paxos replicates pages');
+        \\insert into media_fts(media_fts, rowid, title)
+        \\  values ('delete', 2, 'vectors rank media');
+        \\delete from media where id = 2;
+        \\delete from media_vec where item_id = 2;
+        \\update media_vec set embedding = vec_f32('[0.5,0.5,0,0,0,0,0,0]')
+        \\  where item_id = 3;
+        \\commit;
+        ,
+        // Bounded FTS5 maintenance exactly as ZDS 0009 prescribes.
+        \\begin;
+        \\insert into media_fts(media_fts, rank) values ('usermerge', 4);
+        \\insert into media_fts(media_fts, rank) values ('merge', 10);
+        \\commit;
+        ,
+        // Index compaction inside one replicated commit.
+        "insert into media_fts(media_fts) values ('optimize')",
+    };
+    for (commits) |sql| {
+        const payload = try spike.commitAndCapture(gpa, tmp.dir, sql);
+        try payloads.append(gpa, payload);
+    }
+
+    try rebuildFromPayloads(tmp.dir, "search-rebuilt.db", payloads.items);
+    try spike.db.checkpointTruncate();
+    try expectSameFileBytes(tmp.dir, "search-source.db", "search-rebuilt.db");
+
+    // The rebuilt image answers the hybrid coarse + exact-rerank query
+    // identically to the source.
+    var path_buffer: [Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(testing.io, &path_buffer);
+    const rebuilt_path = try std.fmt.allocPrintSentinel(
+        gpa,
+        "{s}/search-rebuilt.db",
+        .{path_buffer[0..dir_len]},
+        0,
+    );
+    defer gpa.free(rebuilt_path);
+    var rebuilt = try sqlite.Db.open(rebuilt_path);
+    defer rebuilt.close();
+    try testing.expect(try rebuilt.integrityCheckOk());
+
+    const hybrid_sql =
+        \\with coarse as (
+        \\  select item_id, embedding from media_vec
+        \\  where embedding_coarse match
+        \\    vec_quantize_binary(vec_f32('[1,-1,-1,-1,-1,-1,-1,-1]'))
+        \\  and k = 2)
+        \\select item_id,
+        \\  zaxon_vec_distance_cosine(embedding, vec_f32('[1,0,0,0,0,0,0,0]'))
+        \\from coarse order by 2, item_id
+    ;
+    var source_query = try spike.db.prepare(hybrid_sql);
+    defer source_query.finalize();
+    var rebuilt_query = try rebuilt.prepare(hybrid_sql);
+    defer rebuilt_query.finalize();
+    while (try source_query.step()) {
+        try testing.expect(try rebuilt_query.step());
+        try testing.expectEqual(
+            source_query.columnInt64(0),
+            rebuilt_query.columnInt64(0),
+        );
+        try testing.expectEqual(
+            source_query.columnDouble(1),
+            rebuilt_query.columnDouble(1),
+        );
+    }
+    try testing.expect(!try rebuilt_query.step());
+
+    var fts_query = try rebuilt.prepare(
+        "select rowid from media_fts where media_fts match 'paxos'",
+    );
+    defer fts_query.finalize();
+    try testing.expect(try fts_query.step());
+    try testing.expectEqual(@as(i64, 1), fts_query.columnInt64(0));
+    try testing.expect(!try fts_query.step());
+}
+
+test "a byte-budgeted vector batch stays under the payload target" {
+    // ZDS 0009 operational rule: bulk vector writes are byte-budgeted at
+    // a 16 MiB captured-payload target. A 1500-row batch of
+    // 1536-dimensional float32 plus coarse bit vectors must fit.
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const spike = try SpikeDb.open(gpa, tmp.dir, "batch.db");
+    defer spike.close(gpa);
+
+    const schema_payload = try spike.commitAndCapture(
+        gpa,
+        tmp.dir,
+        "create virtual table media_vec using vec0(" ++
+            "item_id integer primary key, " ++
+            "embedding float[1536], " ++
+            "embedding_coarse bit[1536])",
+    );
+    defer gpa.free(schema_payload);
+
+    const batch_payload = try spike.commitAndCapture(
+        gpa,
+        tmp.dir,
+        \\begin;
+        \\with recursive n(i) as
+        \\  (select 1 union all select i + 1 from n where i < 1500)
+        \\insert into media_vec(item_id, embedding, embedding_coarse)
+        \\  select i, randomblob(6144), vec_bit(randomblob(192)) from n;
+        \\commit;
+        ,
+    );
+    defer gpa.free(batch_payload);
+
+    // The payload really carries the vector bytes...
+    try testing.expect(batch_payload.len > 1500 * 6144);
+    // ...and stays inside the 16 MiB captured-payload target.
+    try testing.expect(batch_payload.len <= 16 * 1024 * 1024);
+}
+
 test "payload parser rejects malformed shapes" {
     const gpa = testing.allocator;
     var infos = [_]FrameInfo{

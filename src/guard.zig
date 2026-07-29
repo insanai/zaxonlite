@@ -15,8 +15,8 @@
 //! screens at prepare time, before any side effect.
 
 const std = @import("std");
-const c = @import("c");
 const sqlite = @import("sqlite.zig");
+const auth = sqlite.auth;
 
 /// Object names beginning with this prefix are zaxonlite's replicated
 /// metadata and are invisible to application statements.
@@ -46,6 +46,10 @@ const write_denied_pragmas = [_][]const u8{
     "auto_vacuum",
     "writable_schema",
     "query_only",
+    // The mapped-I/O limit is connection policy owned by the host
+    // (ZDS 0009): changing it mid-statement can silently no-op and would
+    // make query memory behavior unpredictable. Reading stays allowed.
+    "mmap_size",
 };
 
 /// Pure authorization rule for one application-scope action, separated
@@ -55,11 +59,11 @@ pub fn decide(action: c_int, arg1: ?[]const u8, arg2: ?[]const u8) Decision {
     switch (action) {
         // Ending or nesting the transaction detaches the commit from the
         // WAL capture that must represent it.
-        c.SQLITE_TRANSACTION, c.SQLITE_SAVEPOINT => return .deny,
+        auth.transaction, auth.savepoint => return .deny,
         // Attached databases produce WAL frames zaxonlite does not
         // replicate, so their writes would silently diverge replicas.
-        c.SQLITE_ATTACH, c.SQLITE_DETACH => return .deny,
-        c.SQLITE_PRAGMA => return decidePragma(arg1, arg2),
+        auth.attach, auth.detach => return .deny,
+        auth.pragma => return decidePragma(arg1, arg2),
         else => {
             if (namesReserved(arg1) or namesReserved(arg2)) return .deny;
             return .allow;
@@ -114,11 +118,11 @@ pub const Guard = struct {
         _ = database_name;
         _ = trigger_name;
         const self: *Guard = @ptrCast(@alignCast(context.?));
-        if (self.scope == .internal) return c.SQLITE_OK;
+        if (self.scope == .internal) return auth.ok;
         const decision = decide(action, spanOrNull(arg1), spanOrNull(arg2));
         return switch (decision) {
-            .allow => c.SQLITE_OK,
-            .deny => c.SQLITE_DENY,
+            .allow => auth.ok,
+            .deny => auth.deny,
         };
     }
 
@@ -158,79 +162,88 @@ pub fn verifyCaptureContract(
 const testing = std.testing;
 
 test "decision table denies transaction control and attachment" {
-    try testing.expectEqual(Decision.deny, decide(c.SQLITE_TRANSACTION, "BEGIN", null));
-    try testing.expectEqual(Decision.deny, decide(c.SQLITE_TRANSACTION, "COMMIT", null));
-    try testing.expectEqual(Decision.deny, decide(c.SQLITE_TRANSACTION, "ROLLBACK", null));
-    try testing.expectEqual(Decision.deny, decide(c.SQLITE_SAVEPOINT, "BEGIN", "sp1"));
-    try testing.expectEqual(Decision.deny, decide(c.SQLITE_ATTACH, ":memory:", null));
-    try testing.expectEqual(Decision.deny, decide(c.SQLITE_DETACH, "aux", null));
+    try testing.expectEqual(Decision.deny, decide(auth.transaction, "BEGIN", null));
+    try testing.expectEqual(Decision.deny, decide(auth.transaction, "COMMIT", null));
+    try testing.expectEqual(Decision.deny, decide(auth.transaction, "ROLLBACK", null));
+    try testing.expectEqual(Decision.deny, decide(auth.savepoint, "BEGIN", "sp1"));
+    try testing.expectEqual(Decision.deny, decide(auth.attach, ":memory:", null));
+    try testing.expectEqual(Decision.deny, decide(auth.detach, "aux", null));
 }
 
 test "decision table protects the reserved namespace case-insensitively" {
     try testing.expectEqual(
         Decision.deny,
-        decide(c.SQLITE_READ, "__zaxon_meta", "value"),
+        decide(auth.read, "__zaxon_meta", "value"),
     );
     try testing.expectEqual(
         Decision.deny,
-        decide(c.SQLITE_INSERT, "__ZAXON_sessions", null),
+        decide(auth.insert, "__ZAXON_sessions", null),
     );
     try testing.expectEqual(
         Decision.deny,
-        decide(c.SQLITE_CREATE_INDEX, "idx", "__zaxon_meta"),
+        decide(auth.create_index, "idx", "__zaxon_meta"),
     );
     try testing.expectEqual(
         Decision.deny,
-        decide(c.SQLITE_DROP_TABLE, "__zaxon_meta", null),
+        decide(auth.drop_table, "__zaxon_meta", null),
     );
-    try testing.expectEqual(Decision.allow, decide(c.SQLITE_READ, "users", "name"));
-    try testing.expectEqual(Decision.allow, decide(c.SQLITE_INSERT, "zaxon", null));
+    try testing.expectEqual(Decision.allow, decide(auth.read, "users", "name"));
+    try testing.expectEqual(Decision.allow, decide(auth.insert, "zaxon", null));
 }
 
 test "decision table screens pragmas by capture impact" {
     // Checkpoint control is denied in every form.
     try testing.expectEqual(
         Decision.deny,
-        decide(c.SQLITE_PRAGMA, "wal_checkpoint", null),
+        decide(auth.pragma, "wal_checkpoint", null),
     );
     try testing.expectEqual(
         Decision.deny,
-        decide(c.SQLITE_PRAGMA, "wal_autocheckpoint", "1000"),
+        decide(auth.pragma, "wal_autocheckpoint", "1000"),
     );
     try testing.expectEqual(
         Decision.allow,
-        decide(c.SQLITE_PRAGMA, "wal_autocheckpoint", null),
+        decide(auth.pragma, "wal_autocheckpoint", null),
     );
     // Capture-contract pragmas are read-only for applications.
     try testing.expectEqual(
         Decision.deny,
-        decide(c.SQLITE_PRAGMA, "journal_mode", "delete"),
+        decide(auth.pragma, "journal_mode", "delete"),
     );
     try testing.expectEqual(
         Decision.allow,
-        decide(c.SQLITE_PRAGMA, "journal_mode", null),
+        decide(auth.pragma, "journal_mode", null),
     );
     try testing.expectEqual(
         Decision.deny,
-        decide(c.SQLITE_PRAGMA, "Synchronous", "off"),
+        decide(auth.pragma, "Synchronous", "off"),
     );
-    try testing.expectEqual(Decision.deny, decide(c.SQLITE_PRAGMA, "page_size", "512"));
+    try testing.expectEqual(Decision.deny, decide(auth.pragma, "page_size", "512"));
     try testing.expectEqual(
         Decision.deny,
-        decide(c.SQLITE_PRAGMA, "writable_schema", "on"),
+        decide(auth.pragma, "writable_schema", "on"),
+    );
+    // Mapped-I/O policy is host-owned: reads allowed, writes denied.
+    try testing.expectEqual(
+        Decision.deny,
+        decide(auth.pragma, "mmap_size", "268435456"),
+    );
+    try testing.expectEqual(
+        Decision.allow,
+        decide(auth.pragma, "mmap_size", null),
     );
     // Ordinary application pragmas keep working.
     try testing.expectEqual(
         Decision.allow,
-        decide(c.SQLITE_PRAGMA, "user_version", "7"),
+        decide(auth.pragma, "user_version", "7"),
     );
     try testing.expectEqual(
         Decision.allow,
-        decide(c.SQLITE_PRAGMA, "foreign_keys", "on"),
+        decide(auth.pragma, "foreign_keys", "on"),
     );
     try testing.expectEqual(
         Decision.allow,
-        decide(c.SQLITE_PRAGMA, "integrity_check", null),
+        decide(auth.pragma, "integrity_check", null),
     );
 }
 
@@ -296,6 +309,12 @@ test "guarded connection denies invariant-breaking application SQL" {
         error.SqliteError,
         db.exec("pragma journal_mode = delete"),
     );
+    try testing.expectError(
+        error.SqliteError,
+        db.exec("pragma mmap_size = 268435456"),
+    );
+    // Reading the mapped-I/O limit stays available to applications.
+    try db.exec("pragma mmap_size");
 
     // A trigger reaching into the reserved namespace is rejected when the
     // firing statement is prepared, so the write never happens.

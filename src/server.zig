@@ -31,6 +31,8 @@ const wire = @import("wire.zig");
 const transport_auth = @import("transport_auth.zig");
 const tls = @import("tls.zig");
 const node_mod = @import("node.zig");
+const prepared = @import("prepared.zig");
+const search_api = @import("search_api.zig");
 const payload_store_mod = @import("payload_store.zig");
 const checkpoint_proof = @import("checkpoint_proof.zig");
 const enrollment = @import("enrollment.zig");
@@ -255,6 +257,10 @@ pub const ServeOptions = struct {
     max_query_bytes: usize = 16 * 1024 * 1024,
     /// Approximate SQLite VM instruction budget; 0 explicitly disables it.
     max_query_vm_steps: u64 = 10_000_000,
+    /// SQLite-managed mapped-I/O limit for every node connection. Zero
+    /// disables mmap; nonzero is an explicit operator opt-in bounded at
+    /// 1 GiB (ZDS 0009).
+    mmap_size: u64 = 0,
     /// Honor `failpoint` RPCs (test controllers only).
     enable_failpoints: bool = false,
     tick_ms: u64 = 25,
@@ -534,6 +540,7 @@ pub fn serve(
         .role = self_role,
         .registry_nodes = registry_nodes,
         .test_storage_delay_ms = options.test_faults.storage_delay_ms,
+        .mmap_size = options.mmap_size,
     }) catch |err| {
         try diagnostic.write(
             err_out,
@@ -2994,6 +3001,17 @@ pub const Server = struct {
         old_node: ?u32 = null,
         new_node: ?u32 = null,
         endpoint: ?[]const u8 = null,
+        // Typed hybrid search (ZDS 0009).
+        fts_table: ?[]const u8 = null,
+        vec_table: ?[]const u8 = null,
+        text: ?[]const u8 = null,
+        /// Base64-encoded little-endian float32 query embedding.
+        embedding: ?[]const u8 = null,
+        k: ?u32 = null,
+        candidate_count: ?u32 = null,
+        fusion: ?[]const u8 = null,
+        text_weight: ?f64 = null,
+        vector_weight: ?f64 = null,
     };
 
     fn dispatch(
@@ -3020,12 +3038,16 @@ pub const Server = struct {
             return self.opExec(request, out);
         } else if (std.mem.eql(u8, request.op, "query")) {
             return self.opQuery(request, out);
+        } else if (std.mem.eql(u8, request.op, "search")) {
+            return self.opSearch(request, out);
         } else if (std.mem.eql(u8, request.op, "session")) {
             return self.opSession(out);
         } else if (std.mem.eql(u8, request.op, "wait")) {
             return self.opWait(request, out);
         } else if (std.mem.eql(u8, request.op, "snapshot")) {
             return self.opSnapshot(out);
+        } else if (std.mem.eql(u8, request.op, "enable-search-feature")) {
+            return self.opEnableSearchFeature(out);
         } else if (std.mem.eql(u8, request.op, "integrity")) {
             return self.opIntegrity(out);
         } else if (std.mem.eql(u8, request.op, "hash")) {
@@ -3426,17 +3448,26 @@ pub const Server = struct {
                 "\"ballot\":{{\"round\":{d},\"priority\":{d},\"node\":{d}}}," ++
                 "\"decided_slot\":{d},\"applied_slot\":{d}," ++
                 "\"journal_records\":{d},\"epoch_capacity\":{d}," ++
-                "\"chain\":\"{s}\",\"page_size\":{d},",
+                "\"chain\":\"{s}\",\"page_size\":{d}," ++
+                "\"fts5_enabled\":{}," ++
+                "\"sqlite_vec_version\":\"{s}\"," ++
+                "\"search_feature_version\":{d}," ++
+                "\"simd_backend\":\"{s}\"," ++
+                "\"mmap_size\":{d}," ++
+                "\"candidate_hard_limit\":{d},",
             .{
-                status.node_id,          status.database_id,
-                status.configuration_id, status.role,
-                status.node_type,        leader,
-                phase,                   quorum_available,
-                installation_state,      status.ballot.round,
-                status.ballot.priority,  status.ballot.node,
-                status.decided_slot,     status.applied_slot,
-                status.journal_records,  status.epoch_capacity,
-                &chain_hex,              status.page_size,
+                status.node_id,               status.database_id,
+                status.configuration_id,      status.role,
+                status.node_type,             leader,
+                phase,                        quorum_available,
+                installation_state,           status.ballot.round,
+                status.ballot.priority,       status.ballot.node,
+                status.decided_slot,          status.applied_slot,
+                status.journal_records,       status.epoch_capacity,
+                &chain_hex,                   status.page_size,
+                status.fts5_enabled,          status.sqlite_vec_version,
+                status.search_feature_version, status.simd_backend,
+                status.mmap_size,             status.candidate_hard_limit,
             },
         );
         try writeMembershipOperation(out, pending, installation_error);
@@ -3741,6 +3772,76 @@ pub const Server = struct {
         if (sql.len > 1024 * 1024) {
             return writeErrorResponse(out, "too_large", "query SQL exceeds 1 MiB");
         }
+        return self.runReadQuery(request, sql, &.{}, out);
+    }
+
+    /// Typed hybrid search (ZDS 0009): the enforced path for the vector
+    /// candidate cap. Validation failures are client errors; the built
+    /// statement then follows the same read levels and budgets as query.
+    fn opSearch(self: *Server, request: Request, out: *Io.Writer) !void {
+        var embedding_buffer: ?[]u8 = null;
+        defer if (embedding_buffer) |buffer| self.gpa.free(buffer);
+        if (request.embedding) |encoded| {
+            const decoder = std.base64.standard.Decoder;
+            const size = decoder.calcSizeForSlice(encoded) catch
+                return writeErrorResponse(
+                    out,
+                    "bad_request",
+                    "embedding is not valid base64",
+                );
+            const buffer = try self.gpa.alloc(u8, size);
+            embedding_buffer = buffer;
+            decoder.decode(buffer, encoded) catch
+                return writeErrorResponse(
+                    out,
+                    "bad_request",
+                    "embedding is not valid base64",
+                );
+        }
+        const fusion: search_api.Fusion = blk: {
+            const text = request.fusion orelse break :blk .rrf;
+            if (std.mem.eql(u8, text, "rrf")) break :blk .rrf;
+            if (std.mem.eql(u8, text, "dbsf")) break :blk .dbsf;
+            return writeErrorResponse(out, "bad_request", "unknown fusion");
+        };
+        const plan = search_api.plan(self.gpa, .{
+            .fts_table = request.fts_table,
+            .vec_table = request.vec_table,
+            .text = request.text,
+            .embedding = embedding_buffer,
+            .k = request.k orelse 10,
+            .candidate_count = request.candidate_count,
+            .fusion = fusion,
+            .text_weight = request.text_weight orelse 1.0,
+            .vector_weight = request.vector_weight orelse 1.0,
+        }) catch |err| {
+            return writeErrorResponse(out, "bad_request", switch (err) {
+                error.NoRetriever => "search needs text with fts_table, " ++
+                    "embedding with vec_table, or both",
+                error.MissingText => "fts_table requires text",
+                error.MissingEmbedding => "vec_table requires embedding",
+                error.InvalidIdentifier => "table names must be plain " ++
+                    "identifiers outside reserved namespaces",
+                error.InvalidK => "k must be between 1 and 4096",
+                error.InvalidCandidateCount => "candidate_count must be " ++
+                    "between 1 and 4096",
+                error.InvalidEmbedding => "embedding must be float32 with " ++
+                    "a dimension divisible by eight",
+                error.InvalidWeight => "weights must be finite and nonnegative",
+                error.OutOfMemory => return err,
+            });
+        };
+        defer plan.deinit(self.gpa);
+        return self.runReadQuery(request, plan.sql, plan.values(), out);
+    }
+
+    fn runReadQuery(
+        self: *Server,
+        request: Request,
+        sql: []const u8,
+        values: []const prepared.Value,
+        out: *Io.Writer,
+    ) !void {
         const Level = enum { any, leader, linearizable };
         const level: Level = blk: {
             const text = request.level orelse break :blk .linearizable;
@@ -3803,7 +3904,7 @@ pub const Server = struct {
             };
         }
 
-        var result = self.node.queryWithLimits(self.gpa, sql, .{
+        var result = self.node.queryPreparedWithLimits(self.gpa, sql, values, .{
             .max_rows = self.options.max_query_rows,
             .max_bytes = self.options.max_query_bytes,
             .max_vm_steps = self.options.max_query_vm_steps,
@@ -3970,6 +4071,24 @@ pub const Server = struct {
                 self.node.currentLeader(),
                 self.node.identity.configuration_id,
             },
+        );
+    }
+
+    /// Records the search-feature version in an image that predates it,
+    /// as one replicated internal write (ZDS 0009). The operator calls
+    /// this only after every member runs a compatible binary; new
+    /// databases record the version at schema bootstrap.
+    fn opEnableSearchFeature(self: *Server, out: *Io.Writer) !void {
+        if (try self.ensureSchemaForWrite(out) == null) return;
+        const outcome = self.runWrite(struct {
+            fn run(node: *Node, context: void) !ExecOutcome {
+                _ = context;
+                return node.enableSearchFeature();
+            }
+        }.run, {}) catch |err| return self.writeWriteError(err, out);
+        try out.print(
+            "{{\"ok\":true,\"slot\":{d},\"search_feature_version\":{d}}}",
+            .{ outcome.slot, Node.supported_search_feature_version },
         );
     }
 
