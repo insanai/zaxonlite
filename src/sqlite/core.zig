@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const c = @import("c");
+const search_extension = @import("search_extension.zig");
 
 pub const Error = error{
     SqliteError,
@@ -48,16 +49,81 @@ pub const Authorizer = *const fn (
 
 pub const ProgressHandler = *const fn (context: ?*anyopaque) callconv(.c) c_int;
 
+/// Authorizer action and result codes re-exported for the guard, keeping
+/// the translated C header confined to `src/sqlite/`.
+pub const auth = struct {
+    pub const ok: c_int = c.SQLITE_OK;
+    pub const deny: c_int = c.SQLITE_DENY;
+    pub const transaction: c_int = c.SQLITE_TRANSACTION;
+    pub const savepoint: c_int = c.SQLITE_SAVEPOINT;
+    pub const attach: c_int = c.SQLITE_ATTACH;
+    pub const detach: c_int = c.SQLITE_DETACH;
+    pub const pragma: c_int = c.SQLITE_PRAGMA;
+    pub const read: c_int = c.SQLITE_READ;
+    pub const insert: c_int = c.SQLITE_INSERT;
+    pub const create_index: c_int = c.SQLITE_CREATE_INDEX;
+    pub const drop_table: c_int = c.SQLITE_DROP_TABLE;
+};
+
 /// True when the linked amalgamation was compiled with `option`
 /// (without the `SQLITE_` prefix), e.g. "OMIT_LOAD_EXTENSION".
 pub fn compileOptionUsed(option: [:0]const u8) bool {
     return c.sqlite3_compileoption_used(option.ptr) != 0;
 }
 
+/// The linked SQLite library version, e.g. 3050400 for 3.50.4.
+pub fn libversionNumber() c_int {
+    return c.sqlite3_libversion_number();
+}
+
+/// SQLite's global heap high-water mark in bytes; optionally resets the
+/// mark. Benchmarks use it to prove query heap scales with the candidate
+/// count, not the corpus size (ZDS 0009).
+pub fn memoryHighwater(reset: bool) i64 {
+    return c.sqlite3_memory_highwater(@intFromBool(reset));
+}
+
+/// The statically linked sqlite-vec version, read once from a scratch
+/// in-memory connection and copied into `buffer`.
+pub fn vecVersion(buffer: []u8) Error![]const u8 {
+    var db = try Db.open(":memory:");
+    defer db.close();
+    var stmt = try db.prepare("select vec_version()");
+    defer stmt.finalize();
+    if (!try stmt.step()) return error.SqliteError;
+    const text = stmt.columnText(0);
+    const len = @min(text.len, buffer.len);
+    @memcpy(buffer[0..len], text[0..len]);
+    return buffer[0..len];
+}
+
+/// zaxonlite rejects mapped-I/O limits above 1 GiB even where SQLite
+/// would accept more (ZDS 0009).
+pub const max_mmap_bytes: u64 = 1 << 30;
+
+pub const OpenOptions = struct {
+    /// SQLite-managed mapped-I/O limit in bytes. Zero — the default on
+    /// every target — disables mmap; a nonzero value is an explicit
+    /// operator opt-in bounded by `max_mmap_bytes` (ZDS 0009).
+    mmap_size: u64 = 0,
+};
+
 pub const Db = struct {
     handle: *c.sqlite3,
+    /// The mapped-I/O limit SQLite actually accepted, read back after
+    /// configuration. Stays zero where the VFS does not support mmap.
+    effective_mmap_size: i64 = 0,
 
     pub fn open(path: [:0]const u8) Error!Db {
+        return openWithOptions(path, .{});
+    }
+
+    /// The single registration boundary (ZDS 0009): every zaxonlite
+    /// connection — live writer, read lease, test harness, restored-image
+    /// or backup validation — passes through here, so FTS5, sqlite-vec,
+    /// and the Zig search functions exist before any statement prepares.
+    pub fn openWithOptions(path: [:0]const u8, options: OpenOptions) Error!Db {
+        if (options.mmap_size > max_mmap_bytes) return error.SqliteMisuse;
         var handle: ?*c.sqlite3 = null;
         const flags = c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE |
             c.SQLITE_OPEN_NOMUTEX | c.SQLITE_OPEN_EXRESCODE;
@@ -66,7 +132,32 @@ pub const Db = struct {
             if (handle) |opened| _ = c.sqlite3_close(opened);
             return error.SqliteError;
         }
-        return .{ .handle = handle.? };
+        var db = Db{ .handle = handle.? };
+        errdefer _ = c.sqlite3_close(db.handle);
+        // A connection must never serve a schema whose virtual-table
+        // module is missing: registration failure fails the open.
+        try search_extension.register(db.handle);
+        try db.configureMmap(options.mmap_size);
+        return db;
+    }
+
+    /// Applies the mapped-I/O limit explicitly — including the zero
+    /// default — then reads back what SQLite accepted. `PRAGMA mmap_size`
+    /// is advisory: platforms without mapped I/O silently keep zero.
+    fn configureMmap(self: *Db, limit: u64) Error!void {
+        var sql_buffer: [48]u8 = undefined;
+        const sql = std.fmt.bufPrintZ(
+            &sql_buffer,
+            "pragma mmap_size = {d}",
+            .{limit},
+        ) catch unreachable;
+        try self.exec(sql);
+        var stmt = try self.prepare("pragma mmap_size");
+        defer stmt.finalize();
+        self.effective_mmap_size = if (try stmt.step())
+            stmt.columnInt64(0)
+        else
+            0;
     }
 
     pub fn close(self: *Db) void {
@@ -103,6 +194,10 @@ pub const Db = struct {
 
     pub fn lastInsertRowId(self: *const Db) i64 {
         return c.sqlite3_last_insert_rowid(self.handle);
+    }
+
+    pub fn totalChanges64(self: *const Db) i64 {
+        return c.sqlite3_total_changes64(self.handle);
     }
 
     pub fn inTransaction(self: *const Db) bool {
@@ -282,6 +377,17 @@ pub const Stmt = struct {
         return c.sqlite3_column_int64(self.handle, @intCast(index));
     }
 
+    pub fn columnDouble(self: *const Stmt, index: u32) f64 {
+        return c.sqlite3_column_double(self.handle, @intCast(index));
+    }
+
+    pub fn columnBlob(self: *const Stmt, index: u32) []const u8 {
+        const len: usize = @intCast(c.sqlite3_column_bytes(self.handle, @intCast(index)));
+        const ptr = c.sqlite3_column_blob(self.handle, @intCast(index));
+        if (ptr == null) return "";
+        return @as([*]const u8, @ptrCast(ptr))[0..len];
+    }
+
     pub fn columnText(self: *const Stmt, index: u32) []const u8 {
         const len: usize = @intCast(c.sqlite3_column_bytes(self.handle, @intCast(index)));
         const ptr = c.sqlite3_column_text(self.handle, @intCast(index));
@@ -321,4 +427,75 @@ test "narrow bindings execute and query" {
     try testing.expectEqualStrings("two", stmt.columnText(0));
     try testing.expect(!try stmt.step());
     try testing.expect(try db.integrityCheckOk());
+}
+
+test "mmap defaults to zero and enforces the opt-in ceiling" {
+    // On an in-memory database `PRAGMA mmap_size` returns no row at all;
+    // the effective value therefore reads back as the zero default.
+    var db = try Db.open(":memory:");
+    defer db.close();
+    try testing.expectEqual(@as(i64, 0), db.effective_mmap_size);
+
+    // Limits above 1 GiB are rejected before the connection exists.
+    try testing.expectError(
+        error.SqliteMisuse,
+        Db.openWithOptions(":memory:", .{ .mmap_size = max_mmap_bytes + 1 }),
+    );
+}
+
+test "mmap opt-in reports what SQLite accepted" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_path = try tmp.dir.realPath(testing.io, &path_buffer);
+    var path_z_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(
+        &path_z_buffer,
+        "{s}/mmap.db",
+        .{path_buffer[0..dir_path]},
+    );
+    const profile: u64 = 256 * 1024 * 1024;
+    var db = try Db.openWithOptions(db_path, .{ .mmap_size = profile });
+    defer db.close();
+    // The stored value always equals what a read-back reports; a platform
+    // without mapped I/O keeps zero, one with it accepts the profile.
+    var stmt = try db.prepare("pragma mmap_size");
+    defer stmt.finalize();
+    try testing.expect(try stmt.step());
+    try testing.expectEqual(db.effective_mmap_size, stmt.columnInt64(0));
+    try testing.expect(db.effective_mmap_size == 0 or
+        db.effective_mmap_size == @as(i64, @intCast(profile)));
+}
+
+test "fts5 is compiled in and ranks with bm25" {
+    // Build invariant (ZDS 0009): the amalgamation must carry FTS5.
+    try testing.expect(compileOptionUsed("ENABLE_FTS5"));
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_path = try tmp.dir.realPath(testing.io, &path_buffer);
+    var path_z_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(
+        &path_z_buffer,
+        "{s}/fts.db",
+        .{path_buffer[0..dir_path]},
+    );
+
+    var db = try Db.open(db_path);
+    defer db.close();
+    try db.exec("create virtual table notes using fts5(body)");
+    try db.exec(
+        "insert into notes(body) values " ++
+            "('paxos replicates sqlite pages'), " ++
+            "('vectors rank media results')",
+    );
+    var stmt = try db.prepare(
+        "select rowid from notes where notes match 'sqlite' " ++
+            "order by bm25(notes), rowid",
+    );
+    defer stmt.finalize();
+    try testing.expect(try stmt.step());
+    try testing.expectEqual(@as(i64, 1), stmt.columnInt64(0));
+    try testing.expect(!try stmt.step());
 }
