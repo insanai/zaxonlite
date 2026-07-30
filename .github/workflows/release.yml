@@ -178,11 +178,6 @@ jobs:
   python-linux:
     name: Python wheel (manylinux2014 x86-64)
     runs-on: ubuntu-latest
-    container: quay.io/pypa/manylinux2014_x86_64:latest
-    defaults:
-      run:
-        shell: bash
-        working-directory: zaxonlite/languages/python
     steps:
       - name: Checkout paxos-zig (path dependency parent)
         uses: actions/checkout@v4
@@ -197,48 +192,46 @@ jobs:
         with:
           path: zaxonlite
 
-      - name: Install Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: ${{ env.ZIG_VERSION }}
-
-      - name: Prepare Zig package cache
-        run: mkdir -p "${ZIG_GLOBAL_CACHE_DIR:-$HOME/.cache/zig}/tmp"
-
-      - name: Build static OpenSSL 3
-        working-directory: .
+      # Run only the compiler toolchain in the old-glibc container. GitHub
+      # JavaScript actions use Node 24 and therefore execute on the host.
+      - name: Build, repair, and test wheel in manylinux2014
         run: |
-          set -eux
-          curl -fsSLO "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
-          tar xf "openssl-${OPENSSL_VERSION}.tar.gz"
-          cd "openssl-${OPENSSL_VERSION}"
-          ./Configure linux-x86_64 \
-            no-shared no-apps no-tests no-docs no-legacy \
-            --prefix="${GITHUB_WORKSPACE}/openssl-python" \
-            --libdir=lib
-          make -j"$(nproc)" build_libs
-          make install_dev
+          docker run --rm \
+            --volume "${GITHUB_WORKSPACE}:/workspace" \
+            --workdir /workspace/zaxonlite/languages/python \
+            --env OPENSSL_VERSION \
+            --env ZIG_VERSION \
+            quay.io/pypa/manylinux2014_x86_64:latest \
+            bash -euxo pipefail -c '
+              cd /tmp
+              curl -fsSLO "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+              tar xf "zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+              export PATH="/tmp/zig-x86_64-linux-${ZIG_VERSION}:$PATH"
+              export ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache
+              mkdir -p "$ZIG_GLOBAL_CACHE_DIR/tmp"
 
-      - name: Build and repair wheel
-        env:
-          ZXLITE_OPENSSL_PREFIX: ${{ github.workspace }}/openssl-python
-        run: |
-          set -eux
-          python=/opt/python/cp312-cp312/bin/python
-          "$python" -m pip install "setuptools>=77" build auditwheel
-          "$python" -m build --wheel --no-isolation --outdir dist
-          auditwheel repair --plat manylinux2014_x86_64 \
-            --wheel-dir wheelhouse dist/*.whl
-          test "$(find wheelhouse -maxdepth 1 -name '*cp312-abi3-manylinux2014_x86_64.whl' | wc -l)" -eq 1
+              curl -fsSLO "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
+              tar xf "openssl-${OPENSSL_VERSION}.tar.gz"
+              cd "openssl-${OPENSSL_VERSION}"
+              ./Configure linux-x86_64 \
+                no-shared no-apps no-tests no-docs no-legacy \
+                --prefix=/tmp/openssl-python --libdir=lib
+              make -j"$(nproc)" build_libs
+              make install_dev
 
-      - name: Test installed wheel
-        run: |
-          set -eux
-          python=/opt/python/cp312-cp312/bin/python
-          "$python" -m venv /tmp/zxlite-wheel-test
-          /tmp/zxlite-wheel-test/bin/pip install wheelhouse/*.whl
-          /tmp/zxlite-wheel-test/bin/python -c \
-            'import zxlite; assert zxlite.__version__ == "0.2.0"'
+              cd /workspace/zaxonlite/languages/python
+              export ZXLITE_OPENSSL_PREFIX=/tmp/openssl-python
+              python=/opt/python/cp312-cp312/bin/python
+              "$python" -m pip install "setuptools>=77" build auditwheel
+              "$python" -m build --wheel --no-isolation --outdir dist
+              auditwheel repair --plat manylinux2014_x86_64 \
+                --wheel-dir wheelhouse dist/*.whl
+              test "$(find wheelhouse -maxdepth 1 -name "*cp312-abi3-manylinux2014_x86_64.whl" | wc -l)" -eq 1
+              "$python" -m venv /tmp/zxlite-wheel-test
+              /tmp/zxlite-wheel-test/bin/pip install wheelhouse/*.whl
+              /tmp/zxlite-wheel-test/bin/python -c \
+                "import zxlite; assert zxlite.__version__ == \"0.2.0\""
+            '
 
       - name: Upload Linux wheel
         uses: actions/upload-artifact@v4
