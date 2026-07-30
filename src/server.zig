@@ -705,9 +705,10 @@ pub fn serve(
             Server.handleConnectionTracked,
             .{ &server, stream },
         ) catch {
-            server.noteHandlerFinished(stream);
+            server.noteHandlerClosing(stream);
             var s = stream;
             s.close(io);
+            server.noteHandlerFinished();
             continue;
         };
         handler.detach();
@@ -1430,16 +1431,21 @@ pub const Server = struct {
         }
     }
 
-    fn noteHandlerFinished(self: *Server, stream: std.Io.net.Stream) void {
+    fn noteHandlerClosing(self: *Server, stream: std.Io.net.Stream) void {
         self.mutex.lockUncancelable(self.io);
-        std.debug.assert(self.handler_count > 0);
-        self.handler_count -= 1;
+        defer self.mutex.unlock(self.io);
         for (self.active_connections.items, 0..) |connection, index| {
             if (connection.stream.socket.handle == stream.socket.handle) {
                 _ = self.active_connections.swapRemove(index);
-                break;
+                return;
             }
         }
+    }
+
+    fn noteHandlerFinished(self: *Server) void {
+        self.mutex.lockUncancelable(self.io);
+        std.debug.assert(self.handler_count > 0);
+        self.handler_count -= 1;
         self.handler_cond.signal(self.io);
         self.mutex.unlock(self.io);
     }
@@ -1892,7 +1898,6 @@ pub const Server = struct {
 
     fn handleConnection(self: *Server, stream_const: std.Io.net.Stream) void {
         var stream = stream_const;
-        defer stream.close(self.io);
         var read_buffer: [64 * 1024]u8 = undefined;
         var write_buffer: [64 * 1024]u8 = undefined;
 
@@ -2125,7 +2130,12 @@ pub const Server = struct {
     }
 
     fn handleConnectionTracked(self: *Server, stream: std.Io.net.Stream) void {
-        defer self.noteHandlerFinished(stream);
+        // Remove the descriptor from the shutdown set before closing it,
+        // but keep the handler counted until close completes.
+        defer self.noteHandlerFinished();
+        var owned_stream = stream;
+        defer owned_stream.close(self.io);
+        defer self.noteHandlerClosing(stream);
         self.handleConnection(stream);
     }
 
