@@ -50,6 +50,12 @@ def zig_target_args() -> list[str]:
     raise RuntimeError(f"unsupported macOS wheel architecture: {machine}")
 
 
+def zig_openssl_args() -> list[str]:
+    """Point the Zig build at the same OpenSSL SDK used by the extension."""
+    prefix = os.environ.get("ZXLITE_OPENSSL_PREFIX")
+    return [f"-Dopenssl-prefix={prefix}"] if prefix else []
+
+
 def find_zaxonlite_root() -> Path:
     """Locate the zaxonlite source tree from the package directory.
 
@@ -134,6 +140,7 @@ class ZigBuildExt(build_ext):
                 "build",
                 "-Doptimize=ReleaseSafe",
                 *zig_target_args(),
+                *zig_openssl_args(),
             ],
             cwd=root,
             check=True,

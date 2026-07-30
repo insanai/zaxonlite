@@ -36,7 +36,7 @@ int main(int argc, char **argv) {
     snprintf(dir, sizeof dir, "%s-%d-%ld", argv[1], (int)getpid(),
              (long)time(NULL));
 
-    CHECK("version string", strcmp(zaxonlite_version(), "0.1.2") == 0);
+    CHECK("version string", strcmp(zaxonlite_version(), "0.2.0") == 0);
 
     zaxonlite *db = NULL;
     CHECK("open", zaxonlite_open(dir, &db) == 0 && db != NULL);

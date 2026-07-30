@@ -1,13 +1,12 @@
 # Release workflow for zaxonlite (insanai/zaxonlite).
 #
-# One Ubuntu container cross-compiles the self-contained `zaxon` CLI for
-# Linux, Windows, and macOS with Zig. The binary links OpenSSL 3 for the
-# mTLS transport, so the job first builds a static OpenSSL per target,
-# using `zig cc` as the cross C compiler, and caches the result. No
-# target-native machines are involved.
+# One Ubuntu job cross-compiles the self-contained `zaxon` CLI for Linux,
+# Windows, and macOS with Zig. Native Linux and macOS jobs build the
+# `cp312-abi3` Python wheels, repair their platform metadata, and test the
+# installed artifacts before a separate job can publish them.
 #
 # Cut a release by pushing the version declared in build.zig.zon:
-#   git tag v0.1.2 && git push origin v0.1.2
+#   git tag v0.2.0 && git push origin v0.2.0
 # Before tagging, bump `.version` in build.zig.zon and the library version
 # string so `zaxon version` reports the tag.
 #
@@ -32,8 +31,8 @@ env:
   OPENSSL_VERSION: 3.5.0
 
 jobs:
-  build:
-    name: Cross-compile and publish
+  cli:
+    name: Cross-compile CLI
     runs-on: ubuntu-latest
     steps:
       # The `.path = ".."` paxos dependency resolves when paxos-zig sits at
@@ -169,13 +168,198 @@ jobs:
           package aarch64-macos      zaxon
           package x86_64-windows-gnu zaxon.exe
 
-      - name: Checksums
+      - name: Upload CLI archives
+        uses: actions/upload-artifact@v4
+        with:
+          name: zaxon-cli
+          path: release/*
+          if-no-files-found: error
+
+  python-linux:
+    name: Python wheel (manylinux2014 x86-64)
+    runs-on: ubuntu-latest
+    container: quay.io/pypa/manylinux2014_x86_64:latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: zaxonlite/languages/python
+    steps:
+      - name: Checkout paxos-zig (path dependency parent)
+        uses: actions/checkout@v4
+        with:
+          repository: insanai/paxos-zig
+          token: ${{ secrets.CROSS_REPO_TOKEN || github.token }}
+          ref: ${{ github.ref_name }}
+          path: .
+
+      - name: Checkout zaxonlite
+        uses: actions/checkout@v4
+        with:
+          path: zaxonlite
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Prepare Zig package cache
+        run: mkdir -p "${ZIG_GLOBAL_CACHE_DIR:-$HOME/.cache/zig}/tmp"
+
+      - name: Build static OpenSSL 3
+        working-directory: .
+        run: |
+          set -eux
+          curl -fsSLO "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
+          tar xf "openssl-${OPENSSL_VERSION}.tar.gz"
+          cd "openssl-${OPENSSL_VERSION}"
+          ./Configure linux-x86_64 \
+            no-shared no-apps no-tests no-docs no-legacy \
+            --prefix="${GITHUB_WORKSPACE}/openssl-python" \
+            --libdir=lib
+          make -j"$(nproc)" build_libs
+          make install_dev
+
+      - name: Build and repair wheel
+        env:
+          ZXLITE_OPENSSL_PREFIX: ${{ github.workspace }}/openssl-python
+        run: |
+          set -eux
+          python=/opt/python/cp312-cp312/bin/python
+          "$python" -m pip install "setuptools>=77" build auditwheel
+          "$python" -m build --wheel --no-isolation --outdir dist
+          auditwheel repair --plat manylinux2014_x86_64 \
+            --wheel-dir wheelhouse dist/*.whl
+          test "$(find wheelhouse -maxdepth 1 -name '*cp312-abi3-manylinux2014_x86_64.whl' | wc -l)" -eq 1
+
+      - name: Test installed wheel
+        run: |
+          set -eux
+          python=/opt/python/cp312-cp312/bin/python
+          "$python" -m venv /tmp/zxlite-wheel-test
+          /tmp/zxlite-wheel-test/bin/pip install wheelhouse/*.whl
+          /tmp/zxlite-wheel-test/bin/python -c \
+            'import zxlite; assert zxlite.__version__ == "0.2.0"'
+
+      - name: Upload Linux wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: zxlite-wheel-linux-x86_64
+          path: zaxonlite/languages/python/wheelhouse/*.whl
+          if-no-files-found: error
+
+  python-macos:
+    name: Python wheel (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            os: macos-13
+          - arch: arm64
+            os: macos-14
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: zaxonlite/languages/python
+    steps:
+      - name: Checkout paxos-zig (path dependency parent)
+        uses: actions/checkout@v4
+        with:
+          repository: insanai/paxos-zig
+          token: ${{ secrets.CROSS_REPO_TOKEN || github.token }}
+          ref: ${{ github.ref_name }}
+          path: .
+
+      - name: Checkout zaxonlite
+        uses: actions/checkout@v4
+        with:
+          path: zaxonlite
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Install CPython
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Prepare native build environment
+        run: |
+          mkdir -p "${ZIG_GLOBAL_CACHE_DIR:-$HOME/.cache/zig}/tmp"
+          echo "ZXLITE_OPENSSL_PREFIX=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+          python -m pip install "setuptools>=77" build delocate
+
+      - name: Build and repair wheel
+        run: |
+          set -eux
+          python -m build --wheel --no-isolation --outdir dist
+          python -m delocate.cmd.delocate_wheel \
+            --wheel-dir wheelhouse dist/*.whl
+          test "$(find wheelhouse -maxdepth 1 -name "*cp312-abi3-macosx*_${{ matrix.arch }}.whl" | wc -l)" -eq 1
+
+      - name: Test installed wheel
+        run: |
+          set -eux
+          python -m venv /tmp/zxlite-wheel-test
+          /tmp/zxlite-wheel-test/bin/pip install wheelhouse/*.whl
+          /tmp/zxlite-wheel-test/bin/python -c \
+            'import zxlite; assert zxlite.__version__ == "0.2.0"'
+
+      - name: Upload macOS wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: zxlite-wheel-macos-${{ matrix.arch }}
+          path: zaxonlite/languages/python/wheelhouse/*.whl
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [cli, python-linux, python-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: Create checksums
         working-directory: release
         run: sha256sum * > SHA256SUMS
 
       - name: Create GitHub release
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: release/*
+          body: |
+            zaxonlite 0.2.0 adds the native `zxlite` Python DB-API and
+            SQLAlchemy SDK, redundant cluster connections, concurrent
+            consistency-aware reads, and typed replicated hybrid search.
+
+            This release includes self-contained `zaxon` CLI archives and
+            CPython 3.12+ Stable ABI wheels for Linux x86-64 and macOS.
           generate_release_notes: true
+
+  pypi:
+    name: Publish zxlite to PyPI
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [release]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+    steps:
+      - name: Download Python wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: zxlite-wheel-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}

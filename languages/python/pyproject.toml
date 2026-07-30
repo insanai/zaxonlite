@@ -1,6 +1,6 @@
 [project]
 name = "zxlite"
-version = "0.1.0"
+version = "0.2.0"
 description = "Native DB-API 2.0 and SQLAlchemy driver for replicated zaxonlite"
 readme = "README.md"
 license = "MIT"
@@ -18,6 +18,9 @@ classifiers = [
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Database :: Database Engines/Servers",
 ]
 
