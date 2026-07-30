@@ -69,7 +69,7 @@ jobs:
           python-version: ${{ matrix.python }}
 
       - name: Prepare Zig fetch cache directory
-        run: mkdir -p "$HOME/.cache/zig/tmp"
+        run: mkdir -p "${ZIG_GLOBAL_CACHE_DIR:-$HOME/.cache/zig}/tmp"
 
       - name: Lint gate
         run: |
