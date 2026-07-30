@@ -228,7 +228,7 @@ jobs:
               "$python" -m build --wheel --no-isolation --outdir dist
               auditwheel repair --plat manylinux2014_x86_64 \
                 --wheel-dir wheelhouse dist/*.whl
-              test "$(find wheelhouse -maxdepth 1 -name "*cp312-abi3-manylinux2014_x86_64.whl" | wc -l)" -eq 1
+              test "$(find wheelhouse -maxdepth 1 -name "*cp312-abi3-manylinux2014_x86_64*.whl" | wc -l)" -eq 1
               "$python" -m venv /tmp/zxlite-wheel-test
               /tmp/zxlite-wheel-test/bin/pip install wheelhouse/*.whl
               /tmp/zxlite-wheel-test/bin/python -c \
