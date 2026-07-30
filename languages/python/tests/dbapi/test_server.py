@@ -179,6 +179,7 @@ def test_remote_executescript_not_supported(tmp_path: Path) -> None:
             conn.close()
 
 
+@posix_only
 def test_server_finalizer_warns(tmp_path: Path, sock_dir: Path) -> None:
     server = zxlite.start_server(
         directory=tmp_path / "node",
@@ -218,6 +219,7 @@ def test_dev_psk_requires_numeric_loopback(tmp_path: Path) -> None:
         )
 
 
+@posix_only
 def test_unix_multi_member_rejected(tmp_path: Path) -> None:
     with pytest.raises(zxlite.ProgrammingError, match="single-member"):
         zxlite.start_server(
@@ -230,6 +232,7 @@ def test_unix_multi_member_rejected(tmp_path: Path) -> None:
         )
 
 
+@posix_only
 def test_unix_gateway_rejected(tmp_path: Path) -> None:
     with pytest.raises(zxlite.ProgrammingError, match="gateway"):
         zxlite.start_server(
@@ -239,6 +242,7 @@ def test_unix_gateway_rejected(tmp_path: Path) -> None:
         )
 
 
+@posix_only
 def test_unix_relative_path_rejected(tmp_path: Path) -> None:
     with pytest.raises(zxlite.ProgrammingError, match="absolute"):
         zxlite.start_server(
