@@ -29,7 +29,7 @@ source tree (the build walks up from this directory to find it, also
 accepts a sibling checkout named zaxonlite, or an explicit
 ZAXONLITE_ROOT). Windows source builds set `ZXLITE_OPENSSL_PREFIX` to
 an x64 MSVC-compatible static OpenSSL SDK, such as vcpkg's
-`x64-windows-static-md` installation.
+`x64-windows-static` installation.
 
     cd languages/python
     uv sync

@@ -360,7 +360,7 @@ jobs:
             Join-Path $env:LOCALAPPDATA "zig"
           }
           New-Item -ItemType Directory -Force (Join-Path $cache "tmp")
-          $triplet = "x64-windows-static-md"
+          $triplet = "x64-windows-static"
           & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install "openssl:$triplet"
           $prefix = Join-Path $env:VCPKG_INSTALLATION_ROOT "installed\$triplet"
           "ZXLITE_OPENSSL_PREFIX=$prefix" >> $env:GITHUB_ENV

@@ -189,6 +189,7 @@ class ZigBuildExt(build_ext):
             [
                 "zig",
                 "build",
+                "install-cabi",
                 "-Doptimize=ReleaseSafe",
                 *zig_target_args(),
                 *zig_openssl_args(),

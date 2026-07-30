@@ -131,9 +131,10 @@ fn linkOpenSsl(
     }
     // MSVC import libraries are named libssl.lib/libcrypto.lib; the
     // windows-gnu (mingw-style) static build produces libssl.a, which the
-    // posix names resolve.
+    // posix names resolve. A native Windows target can leave the ABI as
+    // `.none`; that uses the MSVC toolchain unless GNU was explicit.
     const msvc = target.result.os.tag == .windows and
-        target.result.abi == .msvc;
+        target.result.abi != .gnu;
     module.linkSystemLibrary(if (msvc) "libssl" else "ssl", .{
         .use_pkg_config = .no,
     });
@@ -664,7 +665,8 @@ pub fn build(b: *std.Build) void {
     // Installing SQLite avoids forcing external hosts (notably the
     // Python wheel build) to guess which target-specific cache archive
     // belongs to this product graph.
-    b.installArtifact(graph.sqlite_lib);
+    const install_sqlite = b.addInstallArtifact(graph.sqlite_lib, .{});
+    b.getInstallStep().dependOn(&install_sqlite.step);
     const capi_lib = b.addLibrary(.{
         .name = "zaxonlite",
         .linkage = .static,
@@ -676,7 +678,14 @@ pub fn build(b: *std.Build) void {
         }),
     });
     capi_lib.installHeader(b.path("include/zaxonlite.h"), "zaxonlite.h");
-    b.installArtifact(capi_lib);
+    const install_capi = b.addInstallArtifact(capi_lib, .{});
+    b.getInstallStep().dependOn(&install_capi.step);
+    const install_cabi_step = b.step(
+        "install-cabi",
+        "Install only the C ABI libraries and header",
+    );
+    install_cabi_step.dependOn(&install_sqlite.step);
+    install_cabi_step.dependOn(&install_capi.step);
 
     const capi_smoke = b.addExecutable(.{
         .name = "zaxon-capi-smoke",

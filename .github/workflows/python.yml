@@ -87,7 +87,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $triplet = "x64-windows-static-md"
+          $triplet = "x64-windows-static"
           & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install "openssl:$triplet"
           $prefix = Join-Path $env:VCPKG_INSTALLATION_ROOT "installed\$triplet"
           "ZXLITE_OPENSSL_PREFIX=$prefix" >> $env:GITHUB_ENV
@@ -101,7 +101,9 @@ jobs:
       - name: Run C ABI contract (Windows)
         if: runner.os == 'Windows' && matrix.python == '3.12'
         working-directory: zaxonlite
-        run: zig build test-cabi -Dopenssl-prefix="$env:ZXLITE_OPENSSL_PREFIX"
+        run: |
+          zig build test-cabi -Dtarget=x86_64-windows-msvc `
+            -Dopenssl-prefix="$env:ZXLITE_OPENSSL_PREFIX"
 
       - name: Build native extension and run tests
         run: |
