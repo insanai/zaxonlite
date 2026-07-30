@@ -486,6 +486,17 @@ int zaxonlite_remote_query(zaxonlite_remote *remote, const char *sql,
                            zaxonlite_result **out_result);
 
 /*
+ * Runs the typed ZDS 0009 search operation through the remote pool.
+ * Identifier, candidate, weight, and embedding validation stays in the
+ * server's native planner. Consistency, freshness, scheduling, and result
+ * ownership match zaxonlite_remote_query.
+ */
+int zaxonlite_remote_search(zaxonlite_remote *remote,
+                            const zaxonlite_search_options *options,
+                            int level, uint64_t freshness_ms,
+                            zaxonlite_result **out_result);
+
+/*
  * Retries the retained pending write with its original session and
  * sequence until the server reports a definitive outcome: success, an
  * idempotent replay, or a definitive rejection (which proves the

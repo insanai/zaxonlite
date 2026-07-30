@@ -144,6 +144,10 @@ fn mapRemoteError(handle: *RemoteHandle, err: anyerror) c_int {
             handle.setError(@errorName(err), category_misuse);
             return misuse_code;
         },
+        error.InvalidWeight => {
+            handle.setError("search weights must be finite", category_validation);
+            return misuse_code;
+        },
         else => {
             handle.setError(@errorName(err), category_availability);
             return unavailable_code;
@@ -171,6 +175,19 @@ fn mapServerRejection(handle: *RemoteHandle) c_int {
     }
     handle.setError(message, category_availability);
     return unavailable_code;
+}
+
+fn mapRemoteSearchError(handle: *RemoteHandle, err: anyerror) c_int {
+    if (err == error.ServerRejected and
+        std.mem.eql(u8, handle.remote.lastServerCode(), "bad_request"))
+    {
+        handle.setError(
+            handle.remote.lastServerMessage(),
+            category_validation,
+        );
+        return misuse_code;
+    }
+    return mapRemoteError(handle, err);
 }
 
 fn valuesFromC(raw_values: ?[*]const CValue, count: usize) ![]Value {
@@ -231,9 +248,7 @@ export fn zaxonlite_remote_open(
     }
     const any_tls = options.tls_ca_path != null or
         options.tls_cert_path != null or options.tls_key_path != null;
-    if (any_tls and (options.tls_ca_path == null or
-        options.tls_cert_path == null or options.tls_key_path == null))
-    {
+    if (!validTlsOptions(options, any_tls)) {
         return misuse_code;
     }
 
@@ -244,8 +259,33 @@ export fn zaxonlite_remote_open(
     };
     handle.error_buffer[0] = 0;
 
-    handle.remote = Remote.open(gpa, handle.threaded.io(), .{
-        .seeds = seed_storage[0..options.seed_count],
+    handle.remote = openRemote(
+        handle,
+        options,
+        seed_storage[0..options.seed_count],
+        any_tls,
+    ) catch |err| {
+        handle.threaded.deinit();
+        gpa.destroy(handle);
+        return remoteOpenErrorCode(err);
+    };
+    out.* = handle;
+    return ok_code;
+}
+
+fn validTlsOptions(options: *const CRemoteOptions, any_tls: bool) bool {
+    return !any_tls or (options.tls_ca_path != null and
+        options.tls_cert_path != null and options.tls_key_path != null);
+}
+
+fn openRemote(
+    handle: *RemoteHandle,
+    options: *const CRemoteOptions,
+    seeds: []const []const u8,
+    any_tls: bool,
+) !*Remote {
+    return Remote.open(gpa, handle.threaded.io(), .{
+        .seeds = seeds,
         .tls = if (any_tls) .{
             .cert_path = std.mem.span(options.tls_cert_path.?),
             .key_path = std.mem.span(options.tls_key_path.?),
@@ -264,32 +304,30 @@ export fn zaxonlite_remote_open(
             std.mem.readInt(u128, &options.expected_database_id, .big)
         else
             null,
-    }) catch |err| {
-        handle.threaded.deinit();
-        gpa.destroy(handle);
-        return switch (err) {
-            // Configuration faults are misuse; everything else is the
-            // open-time probe failing to reach, authenticate against,
-            // or identity-match any seed.
-            error.NoSeeds,
-            error.TooManySeeds,
-            error.DuplicateSeed,
-            error.UnixSeedNotAlone,
-            error.InvalidEndpoint,
-            error.DevPskWithUnixSocket,
-            error.DevPskNeedsSecret,
-            error.DevPskWithTls,
-            error.DevPskNeedsLoopback,
-            error.TlsWithUnixSocket,
-            error.TcpNeedsTls,
-            error.SecretTooShort,
-            => misuse_code,
-            error.DatabaseMismatch => integrity_code,
-            else => unavailable_code,
-        };
+    });
+}
+
+fn remoteOpenErrorCode(err: anyerror) c_int {
+    // Configuration faults are misuse; everything else is the
+    // open-time probe failing to reach, authenticate against, or
+    // identity-match any seed.
+    return switch (err) {
+        error.NoSeeds,
+        error.TooManySeeds,
+        error.DuplicateSeed,
+        error.UnixSeedNotAlone,
+        error.InvalidEndpoint,
+        error.DevPskWithUnixSocket,
+        error.DevPskNeedsSecret,
+        error.DevPskWithTls,
+        error.DevPskNeedsLoopback,
+        error.TlsWithUnixSocket,
+        error.TcpNeedsTls,
+        error.SecretTooShort,
+        => misuse_code,
+        error.DatabaseMismatch => integrity_code,
+        else => unavailable_code,
     };
-    out.* = handle;
-    return ok_code;
 }
 
 /// Closes the pool and releases the handle. Calls racing the close fail
@@ -423,6 +461,128 @@ export fn zaxonlite_remote_query(
     ) catch |err| return mapRemoteError(handle, err);
     out.* = capi.typedResultHandle(typed) catch return unavailable_code;
     return ok_code;
+}
+
+/// Runs typed search through the server's validated planner at the
+/// requested consistency level. The returned cells use typed-v1.
+export fn zaxonlite_remote_search(
+    pointer: ?*anyopaque,
+    raw_options: ?*const capi.CSearchOptions,
+    level: c_int,
+    freshness_ms: u64,
+    out_result: ?*?*anyopaque,
+) c_int {
+    const handle = remoteHandleOf(pointer) orelse return misuse_code;
+    const options = raw_options orelse return misuse_code;
+    const out = out_result orelse return misuse_code;
+    out.* = null;
+    const read_level = parseReadLevel(handle, level) orelse
+        return misuse_code;
+    var metadata_buffer: [64][]const u8 = undefined;
+    const request = remoteSearchRequest(
+        handle,
+        options,
+        &metadata_buffer,
+    ) orelse return misuse_code;
+    const typed = handle.remote.search(
+        gpa,
+        request,
+        read_level,
+        if (freshness_ms == 0) null else freshness_ms,
+    ) catch |err| return mapRemoteSearchError(handle, err);
+    out.* = capi.typedResultHandle(typed) catch return unavailable_code;
+    return ok_code;
+}
+
+fn parseReadLevel(handle: *RemoteHandle, level: c_int) ?remote_mod.Level {
+    return switch (level) {
+        0 => .any,
+        1 => .leader,
+        2 => .linearizable,
+        else => {
+            handle.setError("invalid read level", category_misuse);
+            return null;
+        },
+    };
+}
+
+fn remoteSearchRequest(
+    handle: *RemoteHandle,
+    options: *const capi.CSearchOptions,
+    metadata_buffer: *[64][]const u8,
+) ?zaxonlite.SearchRequest {
+    if (!validOptionalBytes(options.text, options.text_length) or
+        !validOptionalBytes(options.embedding, options.embedding_length))
+    {
+        handle.setError("invalid search byte buffer", category_validation);
+        return null;
+    }
+    if (options.metadata_column_count > metadata_buffer.len) {
+        handle.setError("too many metadata columns", category_validation);
+        return null;
+    }
+    const columns = metadata_buffer[0..options.metadata_column_count];
+    if (!copyMetadataColumns(handle, options, columns)) return null;
+    return .{
+        .fts_table = optionalString(options.fts_table),
+        .vec_table = optionalString(options.vec_table),
+        .text = optionalBytes(options.text, options.text_length),
+        .embedding = optionalBytes(
+            options.embedding,
+            options.embedding_length,
+        ),
+        .k = options.k,
+        .candidate_count = if (options.has_candidate_count)
+            options.candidate_count
+        else
+            null,
+        .fusion = switch (options.fusion) {
+            0 => .rrf,
+            1 => .dbsf,
+            else => {
+                handle.setError("invalid fusion", category_validation);
+                return null;
+            },
+        },
+        .text_weight = options.text_weight,
+        .vector_weight = options.vector_weight,
+        .metadata_table = optionalString(options.metadata_table),
+        .metadata_id_column = optionalString(options.metadata_id_column),
+        .metadata_columns = columns,
+    };
+}
+
+fn validOptionalBytes(pointer: ?*const anyopaque, length: usize) bool {
+    if (length > zaxonlite.prepared.maximum_input_bytes) return false;
+    return pointer != null or length == 0;
+}
+
+fn copyMetadataColumns(
+    handle: *RemoteHandle,
+    options: *const capi.CSearchOptions,
+    columns: [][]const u8,
+) bool {
+    if (columns.len == 0) return true;
+    const raw_columns = options.metadata_columns orelse {
+        handle.setError("metadata columns are missing", category_validation);
+        return false;
+    };
+    for (raw_columns[0..columns.len], columns) |raw_column, *column| {
+        column.* = optionalString(raw_column) orelse {
+            handle.setError("metadata column is null", category_validation);
+            return false;
+        };
+    }
+    return true;
+}
+
+fn optionalString(pointer: ?[*:0]const u8) ?[]const u8 {
+    return if (pointer) |text| std.mem.span(text) else null;
+}
+
+fn optionalBytes(pointer: ?*const anyopaque, length: usize) ?[]const u8 {
+    const bytes = pointer orelse return null;
+    return @as([*]const u8, @ptrCast(bytes))[0..length];
 }
 
 /// Retries the retained pending write with its original session and

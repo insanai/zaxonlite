@@ -123,7 +123,7 @@ const CExecResult = extern struct {
     replayed: bool,
 };
 
-const CSearchOptions = extern struct {
+pub const CSearchOptions = extern struct {
     fts_table: ?[*:0]const u8,
     vec_table: ?[*:0]const u8,
     text: ?*const anyopaque,
@@ -336,7 +336,7 @@ export fn zaxonlite_cluster_open_v2(
 fn clusterOpen(options: CClusterOptionsV2, out_handle: ?*?*anyopaque) c_int {
     const out = out_handle orelse return misuse_code;
     out.* = null;
-    const directory = options.directory orelse return misuse_code;
+    _ = options.directory orelse return misuse_code;
     // Every declared count is reduced to the product limit before any
     // slice is formed or allocation sized from it.
     if (options.member_count == 0 or
@@ -364,16 +364,39 @@ fn clusterOpen(options: CClusterOptionsV2, out_handle: ?*?*anyopaque) c_int {
         .embedded = undefined,
     };
     handle.error_buffer[0] = 0;
-    const timeout = if (options.startup_timeout_ms == 0) 10_000 else options.startup_timeout_ms;
-    const any_tls = options.tls_cert_path != null or
-        options.tls_key_path != null or options.tls_ca_path != null;
-    if (any_tls and (options.tls_cert_path == null or
-        options.tls_key_path == null or options.tls_ca_path == null))
-    {
+    if (!validTlsOptions(&options)) {
         handle.threaded.deinit();
         gpa.destroy(handle);
         return misuse_code;
     }
+
+    handle.embedded = openEmbeddedCluster(
+        handle,
+        &options,
+        members,
+        raw_secret,
+    ) catch |err| {
+        handle.threaded.deinit();
+        gpa.destroy(handle);
+        return clusterOpenErrorCode(err);
+    };
+    out.* = handle;
+    return ok_code;
+}
+
+fn validTlsOptions(options: *const CClusterOptionsV2) bool {
+    const any_tls = options.tls_cert_path != null or
+        options.tls_key_path != null or options.tls_ca_path != null;
+    return !any_tls or (options.tls_cert_path != null and
+        options.tls_key_path != null and options.tls_ca_path != null);
+}
+
+fn openEmbeddedCluster(
+    handle: *ClusterHandle,
+    options: *const CClusterOptionsV2,
+    members: []const zaxonlite.EmbeddedMember,
+    raw_secret: ?[]const u8,
+) !*Embedded {
     // Provider secrets are loaded through the native validation path
     // (regular file, no symlink, owner-only mode, bounded size) and zeroed
     // after `Embedded.open` copies the bytes it needs.
@@ -385,15 +408,12 @@ fn clusterOpen(options: CClusterOptionsV2, out_handle: ?*?*anyopaque) c_int {
             gpa,
             handle.threaded.io(),
             std.mem.span(path),
-        ) catch {
-            handle.threaded.deinit();
-            gpa.destroy(handle);
-            return misuse_code;
-        };
+        ) catch return error.InvalidSecretProvider;
         secret_bytes = provider_secret.?.bytes;
     }
-    handle.embedded = Embedded.open(gpa, handle.threaded.io(), .{
-        .directory = std.mem.span(directory),
+    const any_tls = options.tls_cert_path != null;
+    return Embedded.open(gpa, handle.threaded.io(), .{
+        .directory = std.mem.span(options.directory.?),
         .node_id = options.node_id,
         .members = members,
         .cluster_id = if (options.cluster_id) |text| std.mem.span(text) else null,
@@ -403,34 +423,36 @@ fn clusterOpen(options: CClusterOptionsV2, out_handle: ?*?*anyopaque) c_int {
             .key_path = std.mem.span(options.tls_key_path.?),
             .ca_path = std.mem.span(options.tls_ca_path.?),
         } else null,
-        .startup_timeout_ms = timeout,
+        .startup_timeout_ms = if (options.startup_timeout_ms == 0)
+            10_000
+        else
+            options.startup_timeout_ms,
         .allow_insecure_test_tcp = options.allow_insecure_test_tcp,
         .allow_psk_only_loopback = options.allow_psk_only_loopback,
-    }) catch |err| {
-        handle.threaded.deinit();
-        gpa.destroy(handle);
-        return switch (err) {
-            error.DevPskNeedsSecret,
-            error.DevPskWithTls,
-            error.DevPskWithInsecureTcp,
-            error.DevPskNeedsLoopback,
-            error.DevPskWithUnixSocket,
-            error.UnixSocketNeedsSingleMember,
-            error.UnixSocketGateway,
-            error.InvalidEndpoint,
-            error.InvalidMemberCount,
-            error.InvalidNodeId,
-            error.DuplicateNodeId,
-            error.DuplicateEndpoint,
-            error.InvalidVoterCount,
-            error.CampaignerRequired,
-            error.NotMember,
-            => misuse_code,
-            else => unavailable_code,
-        };
+    });
+}
+
+fn clusterOpenErrorCode(err: anyerror) c_int {
+    return switch (err) {
+        error.InvalidSecretProvider,
+        error.DevPskNeedsSecret,
+        error.DevPskWithTls,
+        error.DevPskWithInsecureTcp,
+        error.DevPskNeedsLoopback,
+        error.DevPskWithUnixSocket,
+        error.UnixSocketNeedsSingleMember,
+        error.UnixSocketGateway,
+        error.InvalidEndpoint,
+        error.InvalidMemberCount,
+        error.InvalidNodeId,
+        error.DuplicateNodeId,
+        error.DuplicateEndpoint,
+        error.InvalidVoterCount,
+        error.CampaignerRequired,
+        error.NotMember,
+        => misuse_code,
+        else => unavailable_code,
     };
-    out.* = handle;
-    return ok_code;
 }
 
 fn parseAuthSecret(options: *const CClusterOptionsV2) !?[]const u8 {
@@ -983,17 +1005,39 @@ export fn zaxonlite_search(
     const out = out_result orelse return misuse_code;
     out.* = null;
 
+    var metadata_buffer: [64][]const u8 = undefined;
+    const request = searchRequest(
+        handle,
+        options,
+        &metadata_buffer,
+    ) orelse return misuse_code;
+    const typed = handle.node.searchTyped(gpa, request, .{}) catch |err|
+        return mapError(handle, err);
+    out.* = typedResultHandle(typed) catch return unavailable_code;
+    return ok_code;
+}
+
+fn searchRequest(
+    handle: *Handle,
+    options: *const CSearchOptions,
+    metadata_buffer: *[64][]const u8,
+) ?zaxonlite.SearchRequest {
+    if (!validSearchBytes(options.text, options.text_length) or
+        !validSearchBytes(options.embedding, options.embedding_length))
+    {
+        handle.setCategorizedError("InvalidSearchBytes", category_validation);
+        return null;
+    }
     if (options.metadata_column_count > 64) {
         handle.setCategorizedError("InvalidMetadata", category_validation);
-        return misuse_code;
+        return null;
     }
-    var metadata_buffer: [64][]const u8 = undefined;
     const metadata_columns =
         metadata_buffer[0..options.metadata_column_count];
     if (options.metadata_column_count > 0) {
         const raw_columns = options.metadata_columns orelse {
             handle.setCategorizedError("InvalidMetadata", category_validation);
-            return misuse_code;
+            return null;
         };
         for (
             raw_columns[0..options.metadata_column_count],
@@ -1004,13 +1048,12 @@ export fn zaxonlite_search(
                     "InvalidMetadata",
                     category_validation,
                 );
-                return misuse_code;
+                return null;
             };
             column.* = std.mem.span(text);
         }
     }
-
-    const request = zaxonlite.SearchRequest{
+    return .{
         .fts_table = if (options.fts_table) |text| std.mem.span(text) else null,
         .vec_table = if (options.vec_table) |text| std.mem.span(text) else null,
         .text = searchBytes(options.text, options.text_length),
@@ -1028,7 +1071,7 @@ export fn zaxonlite_search(
                     "invalid fusion",
                     category_validation,
                 );
-                return misuse_code;
+                return null;
             },
         },
         .text_weight = options.text_weight,
@@ -1043,10 +1086,11 @@ export fn zaxonlite_search(
             null,
         .metadata_columns = metadata_columns,
     };
-    const typed = handle.node.searchTyped(gpa, request, .{}) catch |err|
-        return mapError(handle, err);
-    out.* = typedResultHandle(typed) catch return unavailable_code;
-    return ok_code;
+}
+
+fn validSearchBytes(pointer: ?*const anyopaque, length: usize) bool {
+    if (length > zaxonlite.prepared.maximum_input_bytes) return false;
+    return pointer != null or length == 0;
 }
 
 fn searchBytes(pointer: ?*const anyopaque, length: usize) ?[]const u8 {

@@ -714,6 +714,37 @@ int main(int argc, char **argv) {
                     zaxonlite_result_close(after_dup);
                 }
 
+                CHECK("remote search table",
+                      zaxonlite_remote_exec(
+                          remote,
+                          "create virtual table docs using fts5(body)",
+                          NULL, 0, &remote_write) == 0);
+                zaxonlite_value search_text[] = {
+                    {.type = ZAXONLITE_TEXT,
+                     .bytes = "paxos replicates sqlite",
+                     .length = 23}};
+                CHECK("remote search corpus",
+                      zaxonlite_remote_exec(
+                          remote, "insert into docs(body) values (?1)",
+                          search_text, 1, &remote_write) == 0);
+                zaxonlite_search_options remote_search_options = {
+                    .fts_table = "docs",
+                    .text = "paxos",
+                    .text_length = 5,
+                    .k = 5,
+                    .fusion = ZAXONLITE_SEARCH_RRF,
+                    .text_weight = 1.0,
+                    .vector_weight = 1.0,
+                };
+                zaxonlite_result *search_result = NULL;
+                CHECK("remote typed search",
+                      zaxonlite_remote_search(
+                          remote, &remote_search_options, 2, 0,
+                          &search_result) == 0 &&
+                          search_result != NULL &&
+                          zaxonlite_result_row_count(search_result) == 1);
+                zaxonlite_result_close(search_result);
+
                 char *remote_status = NULL;
                 CHECK("remote status json",
                       zaxonlite_remote_status_json(remote, &remote_status) ==
