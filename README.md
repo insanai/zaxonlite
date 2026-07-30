@@ -228,9 +228,10 @@ the storage layer relies on POSIX rename semantics and on the NTFS
 metadata log to persist directory entries, and a node refuses to start
 where a probe shows they are missing rather than quietly weakening the
 guarantee. Unix socket listeners are POSIX-only; use loopback TCP on
-Windows. Nothing on Windows is covered by a running test suite yet, only
-by a cross-compile gate. The 10,000-crash stress gates and the 1 GiB
-recovery target are deferred; the checked recovery fixture is 1 MiB.
+Windows. Native Windows CI runs the C ABI contract and the zxlite DB-API,
+server/client, search, threading, and SQLAlchemy suites. The 10,000-crash
+stress gates and the 1 GiB recovery target are deferred; the checked
+recovery fixture is 1 MiB.
 
 ## Build and test
 

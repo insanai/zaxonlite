@@ -10,7 +10,28 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+
+#ifdef _WIN32
+#include <io.h>
+#include <process.h>
+#define close _close
+#define getpid _getpid
+#define open _open
+#define unlink _unlink
+#define write _write
+#else
 #include <unistd.h>
+#endif
+
+static int restrict_file_permissions(int fd, const char *path) {
+#ifdef _WIN32
+    (void)fd;
+    return _chmod(path, _S_IREAD | _S_IWRITE);
+#else
+    (void)path;
+    return fchmod(fd, S_IRUSR | S_IWUSR);
+#endif
+}
 
 static int failures = 0;
 
@@ -545,17 +566,16 @@ int main(int argc, char **argv) {
     /* External-client remote pool (ZDS 0010 Gate B): a dev-PSK loopback
      * server and zaxonlite_remote_* sharing one auth provider file. */
     char psk_path[1024];
-    snprintf(psk_path, sizeof psk_path, "/tmp/zx-smoke-psk-%d-%ld",
-             (int)getpid(), (long)time(NULL));
+    snprintf(psk_path, sizeof psk_path, "%s.psk", dir);
     int psk_fd = open(psk_path, O_CREAT | O_TRUNC | O_WRONLY, 0600);
     CHECK("remote psk file created", psk_fd >= 0);
     if (psk_fd >= 0) {
         const char psk_bytes[] =
             "remote-smoke-secret-0123456789abcdef0123456789abcdef";
         CHECK("remote psk file written",
-              fchmod(psk_fd, S_IRUSR | S_IWUSR) == 0 &&
+              restrict_file_permissions(psk_fd, psk_path) == 0 &&
                   write(psk_fd, psk_bytes, sizeof psk_bytes - 1) ==
-                      (ssize_t)(sizeof psk_bytes - 1));
+                      (int)(sizeof psk_bytes - 1));
         close(psk_fd);
 
         char remote_dir[1024];

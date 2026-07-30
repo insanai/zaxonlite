@@ -1,9 +1,9 @@
 # Release workflow for zaxonlite (insanai/zaxonlite).
 #
 # One Ubuntu job cross-compiles the self-contained `zaxon` CLI for Linux,
-# Windows, and macOS with Zig. Native Linux and macOS jobs build the
-# `cp312-abi3` Python wheels, repair their platform metadata, and test the
-# installed artifacts before a separate job can publish them.
+# Windows, and macOS with Zig. Native Linux, macOS, and Windows jobs build
+# the `cp312-abi3` Python wheels, repair platform metadata where needed,
+# and test the installed artifacts before a separate job can publish them.
 #
 # Cut a release by pushing the version declared in build.zig.zon:
 #   git tag v0.2.0 && git push origin v0.2.0
@@ -321,10 +321,80 @@ jobs:
           path: zaxonlite/languages/python/wheelhouse/*.whl
           if-no-files-found: error
 
+  python-windows:
+    name: Python wheel (Windows x86-64)
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: zaxonlite/languages/python
+    steps:
+      - name: Checkout paxos-zig (path dependency parent)
+        uses: actions/checkout@v4
+        with:
+          repository: insanai/paxos-zig
+          token: ${{ secrets.CROSS_REPO_TOKEN || github.token }}
+          ref: ${{ github.ref_name }}
+          path: .
+
+      - name: Checkout zaxonlite
+        uses: actions/checkout@v4
+        with:
+          path: zaxonlite
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Install CPython
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Prepare native build environment
+        shell: pwsh
+        run: |
+          $cache = if ($env:ZIG_GLOBAL_CACHE_DIR) {
+            $env:ZIG_GLOBAL_CACHE_DIR
+          } else {
+            Join-Path $env:LOCALAPPDATA "zig"
+          }
+          New-Item -ItemType Directory -Force (Join-Path $cache "tmp")
+          $triplet = "x64-windows-static-md"
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install "openssl:$triplet"
+          $prefix = Join-Path $env:VCPKG_INSTALLATION_ROOT "installed\$triplet"
+          "ZXLITE_OPENSSL_PREFIX=$prefix" >> $env:GITHUB_ENV
+          python -m pip install "setuptools>=77" build wheel
+
+      - name: Build wheel
+        shell: pwsh
+        run: |
+          python -m build --wheel --no-isolation --outdir wheelhouse
+          $wheels = @(Get-ChildItem wheelhouse\*cp312-abi3-win_amd64.whl)
+          if ($wheels.Count -ne 1) {
+            throw "expected one cp312-abi3 win_amd64 wheel; found $($wheels.Count)"
+          }
+
+      - name: Test installed wheel
+        shell: pwsh
+        run: |
+          python -m venv "$env:RUNNER_TEMP\zxlite-wheel-test"
+          $wheel = (Get-ChildItem wheelhouse\*.whl).FullName
+          & "$env:RUNNER_TEMP\zxlite-wheel-test\Scripts\pip.exe" install $wheel
+          & "$env:RUNNER_TEMP\zxlite-wheel-test\Scripts\python.exe" -c `
+            'import zxlite; assert zxlite.__version__ == "0.2.0"'
+
+      - name: Upload Windows wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: zxlite-wheel-windows-x86_64
+          path: zaxonlite/languages/python/wheelhouse/*.whl
+          if-no-files-found: error
+
   release:
     name: Publish GitHub release
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [cli, python-linux, python-macos]
+    needs: [cli, python-linux, python-macos, python-windows]
     runs-on: ubuntu-latest
     steps:
       - name: Download release artifacts
@@ -347,7 +417,8 @@ jobs:
             consistency-aware reads, and typed replicated hybrid search.
 
             This release includes self-contained `zaxon` CLI archives and
-            CPython 3.12+ Stable ABI wheels for Linux x86-64 and macOS.
+            CPython 3.12+ Stable ABI wheels for Linux x86-64, macOS, and
+            Windows x86-64.
           generate_release_notes: true
 
   pypi:

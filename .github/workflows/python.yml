@@ -38,7 +38,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
         python: ["3.12", "3.13", "3.14"]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
@@ -68,14 +68,40 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
-      - name: Prepare Zig fetch cache directory
+      - name: Prepare Zig fetch cache directory (POSIX)
+        if: runner.os != 'Windows'
         run: mkdir -p "${ZIG_GLOBAL_CACHE_DIR:-$HOME/.cache/zig}/tmp"
+
+      - name: Prepare Zig fetch cache directory (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $cache = if ($env:ZIG_GLOBAL_CACHE_DIR) {
+            $env:ZIG_GLOBAL_CACHE_DIR
+          } else {
+            Join-Path $env:LOCALAPPDATA "zig"
+          }
+          New-Item -ItemType Directory -Force (Join-Path $cache "tmp")
+
+      - name: Install static OpenSSL (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $triplet = "x64-windows-static-md"
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install "openssl:$triplet"
+          $prefix = Join-Path $env:VCPKG_INSTALLATION_ROOT "installed\$triplet"
+          "ZXLITE_OPENSSL_PREFIX=$prefix" >> $env:GITHUB_ENV
 
       - name: Lint gate
         run: |
           uv sync --group dev --no-install-project
           uv run --no-sync ruff format --check .
           uv run --no-sync ruff check .
+
+      - name: Run C ABI contract (Windows)
+        if: runner.os == 'Windows' && matrix.python == '3.12'
+        working-directory: zaxonlite
+        run: zig build test-cabi -Dopenssl-prefix="$env:ZXLITE_OPENSSL_PREFIX"
 
       - name: Build native extension and run tests
         run: |

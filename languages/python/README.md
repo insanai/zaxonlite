@@ -19,10 +19,17 @@ plain about what each one is:
 
 ## Install
 
-The package builds its native extension against the zaxonlite static
-library. You need Zig 0.16 on PATH and the zaxonlite source tree (the
-build walks up from this directory to find it, also accepts a sibling
-checkout named zaxonlite, or an explicit ZAXONLITE_ROOT).
+Release wheels support CPython 3.12 and newer on Linux x86-64, macOS
+x86-64 and arm64, and Windows x86-64. Unix socket endpoints are
+POSIX-only; Windows applications use local or clustered TCP endpoints.
+
+Source builds compile the native extension against the zaxonlite
+static library. You need Zig 0.16 on PATH, OpenSSL 3, and the zaxonlite
+source tree (the build walks up from this directory to find it, also
+accepts a sibling checkout named zaxonlite, or an explicit
+ZAXONLITE_ROOT). Windows source builds set `ZXLITE_OPENSSL_PREFIX` to
+an x64 MSVC-compatible static OpenSSL SDK, such as vcpkg's
+`x64-windows-static-md` installation.
 
     cd languages/python
     uv sync

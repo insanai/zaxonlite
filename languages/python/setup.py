@@ -12,15 +12,17 @@ because the zaxonlite compilation unit references zig compiler-rt
 f128 helpers that the system toolchain does not provide.  The archive
 carries undefined sqlite3_* and OpenSSL references that the reference
 C consumer resolves through the zig build graph; here they resolve
-from the matching installed libsqlite3.a and the host OpenSSL 3 (the
+from the matching installed SQLite archive and the host OpenSSL 3 (the
 default `zig build` keeps TLS enabled).  Wheel builders must provision
-OpenSSL 3; macOS prefers Homebrew's static archives.
+OpenSSL 3; macOS prefers Homebrew's static archives and Windows uses a
+static vcpkg SDK.
 """
 
 import os
 import platform
 import subprocess
 import sys
+import sysconfig
 from pathlib import Path
 
 from setuptools import Extension, setup
@@ -43,6 +45,13 @@ def zig_target_args() -> list[str]:
     override = os.environ.get("ZXLITE_ZIG_TARGET")
     if override:
         return [f"-Dtarget={override}"]
+    if sys.platform == "win32":
+        machine = platform.machine().lower()
+        if machine not in {"amd64", "x86_64"}:
+            raise RuntimeError(
+                f"unsupported Windows wheel architecture: {platform.machine()}"
+            )
+        return ["-Dtarget=x86_64-windows-msvc"]
     if sys.platform != "darwin":
         return []
     machine = platform.machine().lower()
@@ -93,10 +102,30 @@ def find_zaxonlite_root() -> Path:
 def openssl_link_args() -> list[str]:
     """Return linker arguments that resolve OpenSSL 3 symbols.
 
-    Prefer the static Homebrew archives on macOS so the extension has
-    no runtime dylib dependency; otherwise fall back to -lssl/-lcrypto.
+    Prefer static archives on macOS and Windows so the extension has no
+    runtime OpenSSL dependency; otherwise fall back to -lssl/-lcrypto.
     """
     prefix = os.environ.get("ZXLITE_OPENSSL_PREFIX")
+    if sys.platform == "win32":
+        if prefix is None:
+            raise RuntimeError(
+                "ZXLITE_OPENSSL_PREFIX must point to a static OpenSSL 3 "
+                "SDK when building a Windows wheel"
+            )
+        lib_dir = Path(prefix) / "lib"
+        static = [lib_dir / "libssl.lib", lib_dir / "libcrypto.lib"]
+        missing = [str(archive) for archive in static if not archive.is_file()]
+        if missing:
+            raise RuntimeError(
+                "Windows OpenSSL SDK is missing static libraries: " + ", ".join(missing)
+            )
+        return [
+            *(str(archive) for archive in static),
+            "-lws2_32",
+            "-lcrypt32",
+            "-ladvapi32",
+            "-luser32",
+        ]
     if prefix is None and sys.platform == "darwin":
         prefix = "/opt/homebrew/opt/openssl@3"
     if prefix:
@@ -107,6 +136,25 @@ def openssl_link_args() -> list[str]:
         if lib_dir.is_dir():
             return [f"-L{lib_dir}", "-lssl", "-lcrypto"]
     return ["-lssl", "-lcrypto"]
+
+
+def static_library(root: Path, name: str) -> Path:
+    """Return one Zig-installed static library for the host platform."""
+    filename = f"{name}.lib" if sys.platform == "win32" else f"lib{name}.a"
+    return root / "zig-out" / "lib" / filename
+
+
+def windows_python_library() -> Path:
+    """Locate CPython's Stable ABI import library."""
+    roots = {Path(sys.base_prefix), Path(sys.prefix), Path(sys.exec_prefix)}
+    candidates = [root / "libs" / "python3.lib" for root in roots]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise RuntimeError(
+        "CPython Stable ABI import library python3.lib was not found under "
+        + ", ".join(str(root) for root in sorted(roots))
+    )
 
 
 def zig_linker_command(
@@ -149,21 +197,62 @@ class ZigBuildExt(build_ext):
             check=True,
             stdout=sys.stderr,
         )
-        library = root / "zig-out" / "lib" / "libzaxonlite.a"
+        library = static_library(root, "zaxonlite")
         if not library.is_file():
             raise RuntimeError(f"zig build did not produce {library}")
-        sqlite = root / "zig-out" / "lib" / "libsqlite3.a"
+        sqlite = static_library(root, "sqlite3")
         if not sqlite.is_file():
             raise RuntimeError(f"zig build did not produce {sqlite}")
         ext.include_dirs.append(str(root / "zig-out" / "include"))
         ext.extra_objects.append(str(library))
         ext.extra_objects.append(str(sqlite))
         ext.extra_link_args.extend(openssl_link_args())
+        if sys.platform == "win32":
+            self._build_windows_extension(ext)
+            return
         self._link_with_zig_cc()
         # Native target and static dependency changes are outside
         # distutils' source timestamp graph; always relink the wheel.
         self.force = True
         super().build_extension(ext)
+
+    def _build_windows_extension(self, ext: Extension) -> None:
+        """Compile and link one Stable ABI `.pyd` with Zig's MSVC target.
+
+        Official Windows CPython uses the MSVC ABI. Keeping compilation
+        and linking in one Zig driver invocation avoids mixing MSVC LTCG
+        objects with LLD and supplies Zig compiler-rt symbols referenced
+        by the zaxonlite archive.
+        """
+        if len(ext.sources) != 1:
+            raise RuntimeError("the Windows zxlite build expects one C source")
+        target = zig_target_args()[0].removeprefix("-Dtarget=")
+        output = Path(self.get_ext_fullpath(ext.name)).resolve()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        include_dirs = {
+            *(Path(path) for path in ext.include_dirs),
+            Path(sysconfig.get_path("include")),
+            Path(sysconfig.get_path("platinclude")),
+        }
+        command = [
+            "zig",
+            "cc",
+            "-target",
+            target,
+            "-shared",
+            "-O2",
+            "-std=c11",
+            "-D_CRT_SECURE_NO_WARNINGS",
+            *(f"-D{name}={value}" for name, value in ext.define_macros),
+            *(f"-I{path}" for path in sorted(include_dirs)),
+            str(PACKAGE_DIR / ext.sources[0]),
+            *ext.extra_objects,
+            str(windows_python_library()),
+            *ext.extra_link_args,
+            "-o",
+            str(output),
+        ]
+        subprocess.run(command, check=True, stdout=sys.stderr)
 
     def _link_with_zig_cc(self) -> None:
         """Route the shared-object link through `zig cc`.
