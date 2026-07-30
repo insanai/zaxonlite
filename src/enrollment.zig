@@ -220,7 +220,11 @@ pub fn issueTokenAt(
     // reject the `O_PATH` handles Linux gets from non-iterating opens.
     var directory = try root.openDir(io, store_directory, .{ .iterate = true });
     defer directory.close(io);
-    try directory.setPermissions(io, @enumFromInt(0o700));
+    // Windows protects the store through its inherited ACL; Zig 0.16 does
+    // not implement setting POSIX directory permissions there.
+    if (builtin.os.tag != .windows) {
+        try directory.setPermissions(io, @enumFromInt(0o700));
+    }
 
     var secret: [token_bytes]u8 = undefined;
     io.random(&secret);

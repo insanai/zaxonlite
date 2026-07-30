@@ -29,6 +29,7 @@
 //! client replies still remain behind the local barrier.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const paxos = @import("paxos");
 
@@ -335,7 +336,11 @@ pub const Node = struct {
             .open_options = .{ .iterate = true },
         });
         errdefer dir.close(io);
-        try dir.setPermissions(io, @enumFromInt(0o700));
+        // Windows has no POSIX mode bits and Zig 0.16 does not implement
+        // `dirSetPermissionsWindows`; the directory keeps its inherited ACL.
+        if (builtin.os.tag != .windows) {
+            try dir.setPermissions(io, @enumFromInt(0o700));
+        }
 
         // One process per data directory.
         const lock_file = try dir.createFile(io, lock_file_name, .{

@@ -9,6 +9,7 @@
 //! operators paste secrets into SQL.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const max_entries = 1000;
 const max_file_bytes = 4 * 1024 * 1024;
@@ -164,7 +165,11 @@ pub const History = struct {
         defer file.close(io);
         // Creation permissions do not tighten an existing file, so enforce
         // the security invariant on the opened handle before writing data.
-        try file.setPermissions(io, @enumFromInt(0o600));
+        // Windows uses the file's inherited ACL and Zig 0.16 does not
+        // implement its POSIX-shaped file permission setter.
+        if (builtin.os.tag != .windows) {
+            try file.setPermissions(io, @enumFromInt(0o600));
+        }
         try file.setLength(io, 0);
         try file.writeStreamingAll(io, data.written());
     }

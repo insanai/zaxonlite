@@ -31,6 +31,11 @@ ZAXONLITE_ROOT). Windows source builds set `ZXLITE_OPENSSL_PREFIX` to
 an x64 MSVC-compatible static OpenSSL SDK, such as vcpkg's
 `x64-windows-static` installation.
 
+On Windows, protect data directories, TLS keys, and PSK provider files with
+an owner-only NTFS ACL. The native library validates regular files and
+rejects symlinks there, but Windows has no POSIX mode bits for its usual
+owner/group/world permission check.
+
     cd languages/python
     uv sync
 

@@ -5,6 +5,7 @@
 //! receives already validated bytes and never performs filesystem I/O.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 
 pub const minimum_secret_bytes = 32;
@@ -99,15 +100,17 @@ pub fn loadSecret(
 }
 
 /// Private transport material must be a regular file reached without
-/// following a symlink and must grant no group/world permissions. The data
-/// directory has the same owner-only boundary, so checking mode here is the
-/// practical portable policy; deployments should run under a dedicated UID.
+/// following a symlink. POSIX hosts also require owner-only mode bits.
+/// Windows has no equivalent mode-bit boundary; its ACL remains an operator
+/// responsibility and is inherited when zaxonlite creates local files.
 pub fn validatePrivateFile(io: Io, path: []const u8) !void {
     const stat = try Io.Dir.cwd().statFile(io, path, .{
         .follow_symlinks = false,
     });
     if (stat.kind != .file) return error.UnsafePrivateFile;
-    if (@intFromEnum(stat.permissions) & 0o077 != 0) {
+    if (builtin.os.tag != .windows and
+        @intFromEnum(stat.permissions) & 0o077 != 0)
+    {
         return error.UnsafePrivateFile;
     }
 }

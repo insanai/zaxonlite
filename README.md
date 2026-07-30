@@ -231,7 +231,9 @@ guarantee. Unix socket listeners are POSIX-only; use loopback TCP on
 Windows. Native Windows CI runs the C ABI contract and the zxlite DB-API,
 server/client, search, threading, and SQLAlchemy suites. The 10,000-crash
 stress gates and the 1 GiB recovery target are deferred; the checked
-recovery fixture is 1 MiB.
+recovery fixture is 1 MiB. POSIX hosts enforce owner-only modes on data and
+provider files; Windows deployments must apply equivalent NTFS ACLs because
+Windows has no POSIX mode-bit boundary.
 
 ## Build and test
 
