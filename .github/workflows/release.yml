@@ -250,9 +250,11 @@ jobs:
           - arch: x86_64
             os: macos-13
             deployment_target: "10.15"
+            wheel_platform: macosx_10_15_x86_64
           - arch: arm64
             os: macos-14
             deployment_target: "11.0"
+            wheel_platform: macosx_11_0_arm64
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -285,7 +287,7 @@ jobs:
         run: |
           mkdir -p "${ZIG_GLOBAL_CACHE_DIR:-$HOME/.cache/zig}/tmp"
           echo "ZXLITE_OPENSSL_PREFIX=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
-          python -m pip install "setuptools>=77" build delocate
+          python -m pip install "setuptools>=77" build delocate wheel
 
       - name: Build and repair wheel
         env:
@@ -294,6 +296,11 @@ jobs:
         run: |
           set -eux
           python -m build --wheel --no-isolation --outdir dist
+          # GitHub's framework Python reports universal2 even when
+          # ARCHFLAGS produced the single-architecture binary above.
+          python -m wheel tags \
+            --platform-tag "${{ matrix.wheel_platform }}" \
+            --remove dist/*.whl
           python -m delocate.cmd.delocate_wheel \
             --wheel-dir wheelhouse dist/*.whl
           test "$(find wheelhouse -maxdepth 1 -name "*cp312-abi3-macosx*_${{ matrix.arch }}.whl" | wc -l)" -eq 1
