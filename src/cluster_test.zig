@@ -296,14 +296,19 @@ fn configurationAtLeast(parsed: *const Parsed, target: i64) bool {
 }
 
 fn leaderEndpoint(cluster: *Cluster) Endpoint {
-    for (cluster.endpoints) |endpoint| {
-        if (rpcTry(cluster, endpoint, "{\"op\":\"status\"}")) |body| {
-            defer cluster.gpa.free(body);
-            const parsed = parse(cluster, body);
-            defer parsed.deinit();
-            const role = fieldString(cluster, &parsed, "role");
-            if (std.mem.eql(u8, role, "leader")) return endpoint;
+    var elapsed: u64 = 0;
+    while (elapsed <= 10_000) {
+        for (cluster.endpoints) |endpoint| {
+            if (rpcTry(cluster, endpoint, "{\"op\":\"status\"}")) |body| {
+                defer cluster.gpa.free(body);
+                const parsed = parse(cluster, body);
+                defer parsed.deinit();
+                const role = fieldString(cluster, &parsed, "role");
+                if (std.mem.eql(u8, role, "leader")) return endpoint;
+            }
         }
+        elapsed += 250;
+        cluster.io.sleep(.fromMilliseconds(250), .awake) catch {};
     }
     fail(cluster, "no leader found", .{});
 }

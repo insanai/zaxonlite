@@ -700,6 +700,11 @@ pub fn build(b: *std.Build) void {
         .flags = &.{"-std=c11"},
     });
     capi_smoke.root_module.addIncludePath(b.path("include"));
+    if (openssl_prefix.len > 0) {
+        capi_smoke.root_module.addLibraryPath(.{
+            .cwd_relative = b.fmt("{s}/lib", .{openssl_prefix}),
+        });
+    }
     capi_smoke.root_module.linkLibrary(capi_lib);
     const run_capi_smoke = b.addRunArtifact(capi_smoke);
     run_capi_smoke.addArg(b.fmt(
