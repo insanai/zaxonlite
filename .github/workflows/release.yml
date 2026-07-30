@@ -249,7 +249,7 @@ jobs:
       matrix:
         include:
           - arch: x86_64
-            os: macos-13
+            os: macos-15-intel
             deployment_target: "10.15"
             wheel_platform: macosx_10_15_x86_64
           - arch: arm64
