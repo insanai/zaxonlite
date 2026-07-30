@@ -73,11 +73,11 @@ jobs:
 
       - name: Lint gate
         run: |
-          uv sync --group dev
-          uv run ruff format --check .
-          uv run ruff check .
+          uv sync --group dev --no-install-project
+          uv run --no-sync ruff format --check .
+          uv run --no-sync ruff check .
 
       - name: Build native extension and run tests
         run: |
-          uv run python setup.py build_ext --inplace
-          uv run pytest -x -q
+          uv sync --group dev
+          uv run --no-sync pytest -x -q

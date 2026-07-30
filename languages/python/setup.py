@@ -30,6 +30,13 @@ PACKAGE_DIR = Path(__file__).resolve().parent
 
 PY_LIMITED_API = "0x030C0000"  # CPython 3.12
 
+UNSUPPORTED_ZIG_LINKER_FLAGS = frozenset(
+    {
+        "-Wl,--exclude-libs,ALL",
+        "-Wl,-Bsymbolic-functions",
+    }
+)
+
 
 def zig_target_args() -> list[str]:
     """Return a Zig target pinned to the wheel's macOS deployment floor."""
@@ -93,6 +100,29 @@ def openssl_link_args() -> list[str]:
     return ["-lssl", "-lcrypto"]
 
 
+def zig_linker_command(
+    original: list[str],
+    platform_name: str,
+    macos_target: str | None = None,
+) -> list[str]:
+    """Adapt one setuptools shared-link command for Zig 0.16."""
+    rewritten = ["zig", "cc"]
+    if platform_name == "darwin":
+        if macos_target is None:
+            raise RuntimeError("macOS Zig linking requires an explicit target")
+        rewritten.extend(["-target", macos_target])
+    for flag in original[1:]:
+        # Linux CPython builds inject GNU ld symbol-binding flags that
+        # Zig 0.16 rejects instead of forwarding. They are optional
+        # extension-linking policy, not ABI requirements.
+        if platform_name.startswith("linux") and (flag in UNSUPPORTED_ZIG_LINKER_FLAGS):
+            continue
+        rewritten.append("-shared" if flag == "-bundle" else flag)
+    if "-shared" not in rewritten:
+        rewritten.append("-shared")
+    return rewritten
+
+
 class ZigBuildExt(build_ext):
     """build_ext that builds and links the zaxonlite static library."""
 
@@ -134,15 +164,12 @@ class ZigBuildExt(build_ext):
         dlopens exactly like a bundle.
         """
         original = list(self.compiler.linker_so)
-        rewritten = ["zig", "cc"]
-        if sys.platform == "darwin":
-            rewritten.extend(
-                ["-target", zig_target_args()[0].removeprefix("-Dtarget=")]
-            )
-        for flag in original[1:]:
-            rewritten.append("-shared" if flag == "-bundle" else flag)
-        if "-shared" not in rewritten:
-            rewritten.append("-shared")
+        target = (
+            zig_target_args()[0].removeprefix("-Dtarget=")
+            if sys.platform == "darwin"
+            else None
+        )
+        rewritten = zig_linker_command(original, sys.platform, target)
         self.compiler.set_executable("linker_so", rewritten)
 
 
