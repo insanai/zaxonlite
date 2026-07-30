@@ -222,6 +222,7 @@ jobs:
 
               cd /workspace/zaxonlite/languages/python
               export ZXLITE_OPENSSL_PREFIX=/tmp/openssl-python
+              export ZXLITE_ZIG_TARGET=x86_64-linux-gnu.2.17
               python=/opt/python/cp312-cp312/bin/python
               "$python" -m pip install "setuptools>=77" build auditwheel
               "$python" -m build --wheel --no-isolation --outdir dist

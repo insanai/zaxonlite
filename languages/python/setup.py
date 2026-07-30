@@ -39,7 +39,10 @@ UNSUPPORTED_ZIG_LINKER_FLAGS = frozenset(
 
 
 def zig_target_args() -> list[str]:
-    """Return a Zig target pinned to the wheel's macOS deployment floor."""
+    """Return a Zig target pinned to the release platform's ABI floor."""
+    override = os.environ.get("ZXLITE_ZIG_TARGET")
+    if override:
+        return [f"-Dtarget={override}"]
     if sys.platform != "darwin":
         return []
     machine = platform.machine().lower()
