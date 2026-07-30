@@ -43,6 +43,7 @@ static int failures = 0;
             printf("FAIL %s\n", name);                                        \
             failures++;                                                       \
         }                                                                     \
+        fflush(stdout);                                                       \
     } while (0)
 
 int main(int argc, char **argv) {

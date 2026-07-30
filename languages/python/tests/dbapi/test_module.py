@@ -1,5 +1,6 @@
 """Module globals, exception hierarchy, and connect() gatekeeping."""
 
+import os
 from collections.abc import Callable
 from pathlib import Path
 
@@ -43,6 +44,7 @@ def test_remote_dsn_with_path_is_rejected() -> None:
         zxlite.connect("zxlite://host:4321/cluster")
 
 
+@pytest.mark.skipif(os.name == "nt", reason="unix sockets are POSIX-only")
 def test_unix_target_without_server_fails_at_connect(
     tmp_path: Path,
 ) -> None:
