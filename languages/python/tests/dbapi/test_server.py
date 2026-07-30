@@ -76,6 +76,16 @@ def test_unix_server_end_to_end(tmp_path: Path, sock_dir: Path) -> None:
                 "select body from docs where docs match ?", ("paxos",)
             ).fetchall()
             assert found == [("paxos replicates sqlite",)]
+            ranked = conn.search(
+                fts_table="docs",
+                text="paxos",
+                read_level="any",
+            ).fetchall()
+            assert len(ranked) == 1
+            assert ranked[0][0] == 1
+            with pytest.raises(zxlite.ProgrammingError) as invalid:
+                conn.search(fts_table="docs; drop table docs", text="paxos")
+            assert invalid.value.category == "validation"
             assert "data-voter" in conn.status_json()
         finally:
             conn.close()
@@ -165,8 +175,6 @@ def test_remote_executescript_not_supported(tmp_path: Path) -> None:
                 conn.execute("insert into a values (1); insert into a values (2)")
             with pytest.raises(zxlite.NotSupportedError, match="RETURNING"):
                 conn.execute("insert into a(v) values (?) returning v", (1,))
-            with pytest.raises(zxlite.NotSupportedError):
-                conn.search(fts_table="docs", text="x")
         finally:
             conn.close()
 

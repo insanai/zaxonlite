@@ -127,6 +127,8 @@ def test_remote_admission_timeout_maps_to_write_queue_timeout() -> None:
     mapped = _map_remote_error(error)
     assert isinstance(mapped, zxlite.OperationalError)
     assert mapped.category == "write_queue_timeout"
+    assert str(mapped).startswith("-- WRITE QUEUE TIMEOUT --")
+    assert "\n\nHint: A plain retry is safe" in str(mapped)
     assert "database is locked" not in str(mapped)
 
 
@@ -142,9 +144,14 @@ def test_remote_integrity_maps_to_interface_error() -> None:
     error.message = "database identity mismatch"
     mapped = _map_remote_error(error)
     assert isinstance(mapped, zxlite.InterfaceError)
+    assert str(mapped).startswith("-- DATABASE IDENTITY MISMATCH --")
+    assert "\n\nHint:" in str(mapped)
 
     # An ordinary pending-write unavailability stays OperationalError.
     error.code = 4
     error.category = 7
     error.message = "write pending: call zaxonlite_remote_resolve_pending"
-    assert isinstance(_map_remote_error(error), zxlite.OperationalError)
+    unavailable = _map_remote_error(error)
+    assert isinstance(unavailable, zxlite.OperationalError)
+    assert str(unavailable).startswith("-- DATABASE UNAVAILABLE --")
+    assert "\n\nHint:" in str(unavailable)

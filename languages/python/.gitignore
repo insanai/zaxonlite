@@ -1,8 +1,53 @@
+# Virtual environments
 .venv/
+venv/
+
+# Python packaging
 build/
 dist/
-__pycache__/
+wheelhouse/
 *.egg-info/
+*.egg
+*.whl
+*.tar.gz
+
+# Native build artifacts
 *.so
+*.so.*
+*.dylib
+*.dll
+*.pyd
+*.bundle
+*.a
+*.lib
+*.o
+*.obj
+*.exe
+*.dSYM/
+*.gcda
+*.gcno
+*.profraw
+*.profdata
+
+# Python bytecode and caches
+__pycache__/
+*.pyc
+*.pyo
+*$py.class
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
+.pyright/
+.tox/
+.nox/
+.hypothesis/
+
+# Coverage output
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Nested Zig builds
+.zig-cache/
+zig-out/

@@ -144,21 +144,6 @@ connection_capsule_destructor(PyObject *capsule)
     PyMem_Free(box);
 }
 
-static ClusterBox *
-cluster_from_capsule(PyObject *capsule)
-{
-    ClusterBox *box = PyCapsule_GetPointer(capsule, cluster_capsule_name);
-    if (box == NULL) {
-        return NULL;
-    }
-    if (box->handle == NULL) {
-        raise_zx_error(ZX_CODE_MISUSE, ZX_CATEGORY_MISUSE,
-                       "cluster handle is closed");
-        return NULL;
-    }
-    return box;
-}
-
 static RemoteBox *
 remote_from_capsule(PyObject *capsule)
 {
@@ -959,7 +944,8 @@ zx_expire_sessions(PyObject *self, PyObject *args)
 }
 
 static PyObject *
-zx_search(PyObject *self, PyObject *args, PyObject *kwargs)
+zx_search_impl(PyObject *self, PyObject *args, PyObject *kwargs,
+               int remote)
 {
     (void)self;
     static char *keywords[] = {
@@ -967,7 +953,8 @@ zx_search(PyObject *self, PyObject *args, PyObject *kwargs)
         "text",           "embedding",       "k",
         "candidate_count", "fusion",         "text_weight",
         "vector_weight",  "metadata_table",  "metadata_id_column",
-        "metadata_columns", NULL,
+        "metadata_columns", "level",          "freshness_ms",
+        NULL,
     };
     PyObject *capsule;
     const char *fts_table = NULL;
@@ -983,16 +970,29 @@ zx_search(PyObject *self, PyObject *args, PyObject *kwargs)
     const char *metadata_table = NULL;
     const char *metadata_id_column = NULL;
     PyObject *metadata_columns_obj = Py_None;
+    int level = 2;
+    unsigned long long freshness_ms = 0;
     if (!PyArg_ParseTupleAndKeywords(
-            args, kwargs, "O|zzz#OIOiddzzO:search", keywords, &capsule,
+            args, kwargs, "O|zzz#OIOiddzzOiK:search", keywords, &capsule,
             &fts_table, &vec_table, &text, &text_length, &embedding_obj,
             &k, &candidate_obj, &fusion, &text_weight, &vector_weight,
-            &metadata_table, &metadata_id_column, &metadata_columns_obj)) {
+            &metadata_table, &metadata_id_column, &metadata_columns_obj,
+            &level, &freshness_ms)) {
         return NULL;
     }
-    ConnectionBox *box = connection_from_capsule(capsule);
-    if (box == NULL) {
-        return NULL;
+    ConnectionBox *connection = NULL;
+    RemoteBox *remote_box = NULL;
+    if (remote) {
+        remote_box = remote_from_capsule(capsule);
+        if (remote_box == NULL) {
+            return NULL;
+        }
+    }
+    else {
+        connection = connection_from_capsule(capsule);
+        if (connection == NULL) {
+            return NULL;
+        }
     }
 
     zaxonlite_search_options options;
@@ -1069,7 +1069,13 @@ zx_search(PyObject *self, PyObject *args, PyObject *kwargs)
     zaxonlite_result *result = NULL;
     int rc;
     Py_BEGIN_ALLOW_THREADS
-    rc = zaxonlite_search(box->handle, &options, &result);
+    if (remote) {
+        rc = zaxonlite_remote_search(remote_box->handle, &options, level,
+                                     freshness_ms, &result);
+    }
+    else {
+        rc = zaxonlite_search(connection->handle, &options, &result);
+    }
     Py_END_ALLOW_THREADS
     if (have_embedding_view) {
         PyBuffer_Release(&embedding_view);
@@ -1080,10 +1086,16 @@ zx_search(PyObject *self, PyObject *args, PyObject *kwargs)
     Py_XDECREF(columns_seq);
     columns_seq = NULL;
     if (rc != 0) {
-        raise_native_error(box->handle, rc);
+        if (remote) {
+            raise_remote_error(remote_box->handle, rc);
+        }
+        else {
+            raise_native_error(connection->handle, rc);
+        }
         return NULL;
     }
-    PyObject *pair = convert_result(box->handle, result);
+    PyObject *pair =
+        convert_result(remote ? NULL : connection->handle, result);
     zaxonlite_result_close(result);
     return pair;
 
@@ -1094,6 +1106,18 @@ fail:
     PyMem_Free(metadata_columns);
     Py_XDECREF(columns_seq);
     return NULL;
+}
+
+static PyObject *
+zx_search(PyObject *self, PyObject *args, PyObject *kwargs)
+{
+    return zx_search_impl(self, args, kwargs, 0);
+}
+
+static PyObject *
+zx_remote_search(PyObject *self, PyObject *args, PyObject *kwargs)
+{
+    return zx_search_impl(self, args, kwargs, 1);
 }
 
 /* --- hosted server (cluster facade) ---------------------------------- */
@@ -1898,6 +1922,9 @@ static PyMethodDef zx_methods[] = {
     {"remote_query", zx_remote_query, METH_VARARGS,
      "remote_query(capsule, sql, params, level, freshness_ms) ->"
      " (columns, rows)"},
+    {"remote_search", (PyCFunction)(void (*)(void))zx_remote_search,
+     METH_VARARGS | METH_KEYWORDS,
+     "remote_search(capsule, **options) -> (columns, rows)"},
     {"remote_resolve_pending", zx_remote_resolve_pending, METH_VARARGS,
      "remote_resolve_pending(capsule) -> (changes, replayed)"},
     {"remote_status_json", zx_remote_status_json, METH_VARARGS,

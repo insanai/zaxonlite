@@ -113,8 +113,9 @@ Remote semantics, stated honestly:
 - Reads run on a bounded pool of independent connections at your
   chosen consistency level; connection.query(sql, params,
   read_level=..., freshness_ms=...) overrides per call.
-- RETURNING, executescript(), typed search(), and named parameters are
-  not supported remotely. Raw FTS5 search SQL works through execute().
+- RETURNING, executescript(), and named parameters are not supported
+  remotely. Typed search and raw FTS5 search SQL both use the remote
+  read pool at the requested consistency level.
 - executemany() travels as one typed batch, one replicated
   transaction, and one session sequence: every row applies or none
   does, exactly like a local batch.
@@ -179,7 +180,8 @@ backup(path), integrity_check(), open_session() /
 execute_idempotent(session, sequence, sql) for exactly-once retry,
 expire_sessions(retain), and typed search(...) per ZDS 0009 (lexical
 FTS5, vector, or hybrid with rrf/dbsf fusion; embeddings are raw
-little-endian float32 bytes). Remote Connection adds
+little-endian float32 bytes). Remote Connection exposes the same typed
+search with read_level and freshness_ms overrides, and adds
 resolve_pending() and status_json().
 
 ## Semantics worth knowing
@@ -196,6 +198,9 @@ resolve_pending() and status_json().
   raises OperationalError.
 - Mapped exceptions carry a stable .category string such as
   "constraint", "validation", or "write_queue_timeout".
+- Operating failures use the repository's Elm-style boundary,
+  explanation, and Hint format. SQL and programming errors retain
+  sqlite-shaped wording; branch on .category rather than message text.
 
 ## Not supported
 

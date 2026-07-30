@@ -12,15 +12,13 @@ because the zaxonlite compilation unit references zig compiler-rt
 f128 helpers that the system toolchain does not provide.  The archive
 carries undefined sqlite3_* and OpenSSL references that the reference
 C consumer resolves through the zig build graph; here they resolve
-from the freshly built libsqlite3.a in the zig cache and the host
-OpenSSL 3 (the default `zig build` keeps TLS enabled).
-
-TODO(release wheels): cibuildwheel images must provision OpenSSL 3 for
-static linking (or build with -Dtls=false once the C ABI gates the
-cluster facade); local Gate A development links the host OpenSSL.
+from the matching installed libsqlite3.a and the host OpenSSL 3 (the
+default `zig build` keeps TLS enabled).  Wheel builders must provision
+OpenSSL 3; macOS prefers Homebrew's static archives.
 """
 
 import os
+import platform
 import subprocess
 import sys
 from pathlib import Path
@@ -31,6 +29,18 @@ from setuptools.command.build_ext import build_ext
 PACKAGE_DIR = Path(__file__).resolve().parent
 
 PY_LIMITED_API = "0x030C0000"  # CPython 3.12
+
+
+def zig_target_args() -> list[str]:
+    """Return a Zig target pinned to the wheel's macOS deployment floor."""
+    if sys.platform != "darwin":
+        return []
+    machine = platform.machine().lower()
+    if machine in {"arm64", "aarch64"}:
+        return ["-Dtarget=aarch64-macos.11.0"]
+    if machine == "x86_64":
+        return ["-Dtarget=x86_64-macos.10.15"]
+    raise RuntimeError(f"unsupported macOS wheel architecture: {machine}")
 
 
 def find_zaxonlite_root() -> Path:
@@ -64,26 +74,6 @@ def find_zaxonlite_root() -> Path:
     )
 
 
-def find_sqlite_archive(root: Path) -> Path:
-    """Return the newest libsqlite3.a produced by the zig build.
-
-    The zig build graph links the bundled SQLite (FTS5 plus the pinned
-    sqlite-vec) as a separate static library that is not installed to
-    zig-out, so the freshest cache entry after `zig build` is the one
-    that matches the just-built libzaxonlite.a.
-    """
-    candidates = sorted(
-        (root / ".zig-cache" / "o").glob("*/libsqlite3.a"),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )
-    if not candidates:
-        raise RuntimeError(
-            f"no libsqlite3.a found under {root}/.zig-cache after zig build"
-        )
-    return candidates[0]
-
-
 def openssl_link_args() -> list[str]:
     """Return linker arguments that resolve OpenSSL 3 symbols.
 
@@ -109,7 +99,12 @@ class ZigBuildExt(build_ext):
     def build_extension(self, ext: Extension) -> None:
         root = find_zaxonlite_root()
         subprocess.run(
-            ["zig", "build", "-Doptimize=ReleaseSafe"],
+            [
+                "zig",
+                "build",
+                "-Doptimize=ReleaseSafe",
+                *zig_target_args(),
+            ],
             cwd=root,
             check=True,
             stdout=sys.stderr,
@@ -117,11 +112,17 @@ class ZigBuildExt(build_ext):
         library = root / "zig-out" / "lib" / "libzaxonlite.a"
         if not library.is_file():
             raise RuntimeError(f"zig build did not produce {library}")
+        sqlite = root / "zig-out" / "lib" / "libsqlite3.a"
+        if not sqlite.is_file():
+            raise RuntimeError(f"zig build did not produce {sqlite}")
         ext.include_dirs.append(str(root / "zig-out" / "include"))
         ext.extra_objects.append(str(library))
-        ext.extra_objects.append(str(find_sqlite_archive(root)))
+        ext.extra_objects.append(str(sqlite))
         ext.extra_link_args.extend(openssl_link_args())
         self._link_with_zig_cc()
+        # Native target and static dependency changes are outside
+        # distutils' source timestamp graph; always relink the wheel.
+        self.force = True
         super().build_extension(ext)
 
     def _link_with_zig_cc(self) -> None:
@@ -134,6 +135,10 @@ class ZigBuildExt(build_ext):
         """
         original = list(self.compiler.linker_so)
         rewritten = ["zig", "cc"]
+        if sys.platform == "darwin":
+            rewritten.extend(
+                ["-target", zig_target_args()[0].removeprefix("-Dtarget=")]
+            )
         for flag in original[1:]:
             rewritten.append("-shared" if flag == "-bundle" else flag)
         if "-shared" not in rewritten:

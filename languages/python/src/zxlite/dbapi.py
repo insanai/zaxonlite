@@ -135,6 +135,11 @@ class NotSupportedError(DatabaseError):
     """Errors for requested features the driver does not support."""
 
 
+def _diagnostic(title: str, message: str, hint: str) -> str:
+    """Format one operating error using the repository's Elm-style shape."""
+    return f"-- {title.upper()} --\n\n{message}\n\nHint: {hint}"
+
+
 def _map_native_error(error: BaseException) -> Error:
     """Translate a native `_ZxError` into the DB-API hierarchy."""
     code = getattr(error, "code", None)
@@ -156,6 +161,12 @@ def _map_native_error(error: BaseException) -> Error:
         }.get(category, OperationalError)
     else:
         exception_type = OperationalError
+    if exception_type is OperationalError and category in (5, 7):
+        message = _diagnostic(
+            "database unavailable",
+            message,
+            "Check the node status, storage, transport, and quorum, then retry.",
+        )
     mapped = exception_type(message)
     mapped.category = _CATEGORY_NAMES.get(category, "none")
     return mapped
@@ -176,7 +187,13 @@ def _map_remote_error(error: BaseException) -> Error:
     category = getattr(error, "category", 0)
     if code == 3 or category == 6:
         message = getattr(error, "message", None) or str(error)
-        mismatched = InterfaceError(message)
+        mismatched = InterfaceError(
+            _diagnostic(
+                "database identity mismatch",
+                message,
+                "Verify the seed list, credentials, and expected_database_id.",
+            )
+        )
         mismatched.category = _CATEGORY_NAMES.get(category, "integrity")
         return mismatched
     mapped = _map_native_error(error)
@@ -186,6 +203,14 @@ def _map_remote_error(error: BaseException) -> Error:
         and "admission timed out" in str(mapped)
     ):
         mapped.category = "write_queue_timeout"
+        mapped.args = (
+            _diagnostic(
+                "write queue timeout",
+                "The write was not admitted before the configured timeout.",
+                "A plain retry is safe; increase timeout or reduce "
+                "concurrent writers if contention persists.",
+            ),
+        )
     return mapped
 
 
@@ -333,15 +358,24 @@ class _WriteLane:
                     self._condition.notify_all()
                     if write:
                         timed_out = OperationalError(
-                            f"write did not enter the connection write "
-                            f"lane within {bound:.3f} seconds; the "
-                            f"statement did not execute and a plain "
-                            f"retry is safe"
+                            _diagnostic(
+                                "write queue timeout",
+                                "The write did not enter the connection "
+                                f"lane within {bound:.3f} seconds. The "
+                                "statement did not execute.",
+                                "A plain retry is safe; increase timeout or "
+                                "reduce concurrent writers if contention "
+                                "persists.",
+                            )
                         )
                         timed_out.category = "write_queue_timeout"
                         raise timed_out
                     stalled = OperationalError(
-                        "internal read wait cap exceeded on the connection lane"
+                        _diagnostic(
+                            "connection lane stalled",
+                            "A read waited beyond the internal connection cap.",
+                            "Close the connection and inspect blocked native calls.",
+                        )
                     )
                     stalled.category = "busy"
                     raise stalled
@@ -617,6 +651,72 @@ def _is_numeric_loopback(endpoint: str) -> bool:
     else:
         host = endpoint.rpartition(":")[0]
     return host in ("127.0.0.1", "::1")
+
+
+def _search_arguments(
+    *,
+    fts_table: str | None,
+    vec_table: str | None,
+    text: str | None,
+    embedding: bytes | bytearray | memoryview | None,
+    k: int,
+    candidate_count: int | None,
+    fusion: str,
+    text_weight: float,
+    vector_weight: float,
+    metadata_table: str | None,
+    metadata_id_column: str | None,
+    metadata_columns: Sequence[str],
+) -> dict[str, Any]:
+    """Validate Python search types and build native keyword arguments."""
+    fusion_codes = {"rrf": 0, "dbsf": 1}
+    if fusion not in fusion_codes:
+        raise ProgrammingError(f"fusion must be 'rrf' or 'dbsf', not {fusion!r}")
+    if text is not None and not isinstance(text, str):
+        raise ProgrammingError("text must be a str")
+    if embedding is not None and not isinstance(
+        embedding, (bytes, bytearray, memoryview)
+    ):
+        raise ProgrammingError(
+            "embedding must be bytes, bytearray, or a contiguous "
+            "memoryview of little-endian float32 values"
+        )
+    for name, value in (
+        ("fts_table", fts_table),
+        ("vec_table", vec_table),
+        ("metadata_table", metadata_table),
+        ("metadata_id_column", metadata_id_column),
+    ):
+        if value is not None and not isinstance(value, str):
+            raise ProgrammingError(f"{name} must be a str")
+    columns = tuple(metadata_columns)
+    if any(not isinstance(column, str) for column in columns):
+        raise ProgrammingError("metadata_columns must contain only str values")
+    if not isinstance(k, int) or isinstance(k, bool):
+        raise ProgrammingError("k must be an int")
+    if candidate_count is not None and (
+        not isinstance(candidate_count, int) or isinstance(candidate_count, bool)
+    ):
+        raise ProgrammingError("candidate_count must be an int")
+    try:
+        text_weight_value = float(text_weight)
+        vector_weight_value = float(vector_weight)
+    except (TypeError, ValueError):
+        raise ProgrammingError("search weights must be real numbers") from None
+    return {
+        "fts_table": fts_table,
+        "vec_table": vec_table,
+        "text": text,
+        "embedding": embedding,
+        "k": k,
+        "candidate_count": candidate_count,
+        "fusion": fusion_codes[fusion],
+        "text_weight": text_weight_value,
+        "vector_weight": vector_weight_value,
+        "metadata_table": metadata_table,
+        "metadata_id_column": metadata_id_column,
+        "metadata_columns": columns,
+    }
 
 
 def connect(
@@ -1266,53 +1366,23 @@ class Connection(_BaseConnection):
                 "read_level and freshness_ms apply to remote "
                 "connections; a local connection rejects them"
             )
-        fusion_codes = {"rrf": 0, "dbsf": 1}
-        if fusion not in fusion_codes:
-            raise ProgrammingError(f"fusion must be 'rrf' or 'dbsf', not {fusion!r}")
-        if text is not None and not isinstance(text, str):
-            raise ProgrammingError("text must be a str")
-        if embedding is not None and not isinstance(
-            embedding, (bytes, bytearray, memoryview)
-        ):
-            raise ProgrammingError(
-                "embedding must be bytes, bytearray, or a contiguous "
-                "memoryview of little-endian float32 values"
-            )
-        for name, value in (
-            ("fts_table", fts_table),
-            ("vec_table", vec_table),
-            ("metadata_table", metadata_table),
-            ("metadata_id_column", metadata_id_column),
-        ):
-            if value is not None and not isinstance(value, str):
-                raise ProgrammingError(f"{name} must be a str")
-        columns = tuple(metadata_columns)
-        for column in columns:
-            if not isinstance(column, str):
-                raise ProgrammingError("metadata_columns must contain only str values")
-        if not isinstance(k, int) or isinstance(k, bool):
-            raise ProgrammingError("k must be an int")
-        if candidate_count is not None and (
-            not isinstance(candidate_count, int) or isinstance(candidate_count, bool)
-        ):
-            raise ProgrammingError("candidate_count must be an int")
+        arguments = _search_arguments(
+            fts_table=fts_table,
+            vec_table=vec_table,
+            text=text,
+            embedding=embedding,
+            k=k,
+            candidate_count=candidate_count,
+            fusion=fusion,
+            text_weight=text_weight,
+            vector_weight=vector_weight,
+            metadata_table=metadata_table,
+            metadata_id_column=metadata_id_column,
+            metadata_columns=metadata_columns,
+        )
         with self._lane.enter(write=False, timeout=self._timeout):
             column_names, rows = self._call(
-                lambda: _zxlite.search(
-                    self._capsule,
-                    fts_table=fts_table,
-                    vec_table=vec_table,
-                    text=text,
-                    embedding=embedding,
-                    k=k,
-                    candidate_count=candidate_count,
-                    fusion=fusion_codes[fusion],
-                    text_weight=float(text_weight),
-                    vector_weight=float(vector_weight),
-                    metadata_table=metadata_table,
-                    metadata_id_column=metadata_id_column,
-                    metadata_columns=columns,
-                )
+                lambda: _zxlite.search(self._capsule, **arguments)
             )
         cursor = self.cursor()
         cursor._load_read_result(column_names, rows)
@@ -1453,16 +1523,65 @@ class RemoteConnection(_BaseConnection):
         cursor._load_read_result(column_names, rows)
         return cursor
 
-    def search(self, **options: Any) -> Cursor:
-        """Reject typed search; remote typed search needs a server RPC.
-
-        Raw search SQL (FTS5 MATCH and the registered fusion
-        functions) still works through ordinary `execute()`.
-        """
-        raise NotSupportedError(
-            "typed search is not available on remote connections yet; "
-            "run raw search SQL through execute() instead"
+    def search(
+        self,
+        *,
+        fts_table: str | None = None,
+        vec_table: str | None = None,
+        text: str | None = None,
+        embedding: bytes | bytearray | memoryview | None = None,
+        k: int = 10,
+        candidate_count: int | None = None,
+        fusion: str = "rrf",
+        text_weight: float = 1.0,
+        vector_weight: float = 1.0,
+        metadata_table: str | None = None,
+        metadata_id_column: str | None = None,
+        metadata_columns: Sequence[str] = (),
+        read_level: str | None = None,
+        freshness_ms: int | None = None,
+    ) -> Cursor:
+        """Run typed search through the remote native planner."""
+        self._check()
+        level = self._default_level
+        if read_level is not None:
+            if read_level not in _REMOTE_READ_LEVELS:
+                raise ProgrammingError(
+                    f"read_level must be one of {sorted(_REMOTE_READ_LEVELS)}"
+                )
+            level = _REMOTE_READ_LEVELS[read_level]
+        freshness = (
+            self._default_freshness if freshness_ms is None else int(freshness_ms)
         )
+        if freshness and level != 0:
+            raise ProgrammingError(
+                "freshness_ms is only meaningful with read_level=any"
+            )
+        arguments = _search_arguments(
+            fts_table=fts_table,
+            vec_table=vec_table,
+            text=text,
+            embedding=embedding,
+            k=k,
+            candidate_count=candidate_count,
+            fusion=fusion,
+            text_weight=text_weight,
+            vector_weight=vector_weight,
+            metadata_table=metadata_table,
+            metadata_id_column=metadata_id_column,
+            metadata_columns=metadata_columns,
+        )
+        column_names, rows = self._call(
+            lambda: _zxlite.remote_search(
+                self._capsule,
+                **arguments,
+                level=level,
+                freshness_ms=freshness,
+            )
+        )
+        cursor = self.cursor()
+        cursor._load_read_result(column_names, rows)
+        return cursor
 
     def status_json(self) -> str:
         """Return raw status JSON from a healthy member (diagnostics)."""
