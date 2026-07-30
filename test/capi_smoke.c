@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 200809L
+
 /* C ABI smoke test: exercises every exported function against a scratch
  * directory passed as argv[1]. Exits non-zero on the first failure. */
 
