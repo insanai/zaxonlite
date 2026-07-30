@@ -761,6 +761,10 @@ pub fn main(init: std.process.Init) !u8 {
             "0 row(s) changed",
             null,
         );
+        // Leader announcements are intentionally debounced for three
+        // 25 ms protocol ticks. Fast hosts can complete the exec and stop
+        // commands before that operator-facing readiness log is emitted.
+        io.sleep(.fromMilliseconds(100), .awake) catch {};
         try expect(
             gpa,
             io,
