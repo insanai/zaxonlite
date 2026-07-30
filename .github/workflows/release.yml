@@ -210,6 +210,7 @@ jobs:
               export ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache
               mkdir -p "$ZIG_GLOBAL_CACHE_DIR/tmp"
 
+              yum install -y perl-IPC-Cmd
               curl -fsSLO "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
               tar xf "openssl-${OPENSSL_VERSION}.tar.gz"
               cd "openssl-${OPENSSL_VERSION}"
@@ -248,8 +249,10 @@ jobs:
         include:
           - arch: x86_64
             os: macos-13
+            deployment_target: "10.15"
           - arch: arm64
             os: macos-14
+            deployment_target: "11.0"
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -285,6 +288,9 @@ jobs:
           python -m pip install "setuptools>=77" build delocate
 
       - name: Build and repair wheel
+        env:
+          ARCHFLAGS: -arch ${{ matrix.arch }}
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
         run: |
           set -eux
           python -m build --wheel --no-isolation --outdir dist

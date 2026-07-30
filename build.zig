@@ -64,6 +64,13 @@ fn addProductGraph(
             "-DSQLITE_CORE",
             "-DSQLITE_VEC_STATIC",
             "-DSQLITE_VEC_OMIT_FS",
+            // sqlite-vec 0.1.9 aliases the fixed-width names through BSD
+            // u_int* typedefs on every non-Windows target. musl does not
+            // expose those legacy names, so map only this compilation unit
+            // back to the equivalent <stdint.h> types.
+            "-Du_int8_t=uint8_t",
+            "-Du_int16_t=uint16_t",
+            "-Du_int64_t=uint64_t",
         },
     });
     const sqlite_lib = b.addLibrary(.{
