@@ -26,6 +26,7 @@ const client = @import("client.zig");
 const configuration = @import("configuration.zig");
 const node_mod = @import("node.zig");
 const prepared = @import("prepared.zig");
+const search_api = @import("search_api.zig");
 const server = @import("server.zig");
 const tls = @import("tls.zig");
 
@@ -268,27 +269,29 @@ pub const Remote = struct {
         );
         @memset(self.slots, .{});
 
+        try self.probeFirstSlot();
+        return self;
+    }
+
+    fn probeFirstSlot(self: *Remote) !void {
         // Open-time probe (ZDS 0010): opening succeeds only when at
         // least one seed authenticates, reports the expected database
         // identity, and answers a client RPC. The first slot is dialed
         // and probed eagerly (bounded by `connect_timeout_ms`); every
         // other slot stays lazy.
-        {
-            const first = &self.slots[0];
-            first.connection = client.ClusterConnection.init(
-                gpa,
-                io,
-                self.endpoints,
-                self.transport,
-            );
-            first.initialized = true;
-            errdefer {
-                first.connection.deinit();
-                first.initialized = false;
-            }
-            try self.probeSlot(first);
+        const first = &self.slots[0];
+        first.connection = client.ClusterConnection.init(
+            self.gpa,
+            self.io,
+            self.endpoints,
+            self.transport,
+        );
+        first.initialized = true;
+        errdefer {
+            first.connection.deinit();
+            first.initialized = false;
         }
-        return self;
+        try self.probeSlot(first);
     }
 
     /// Releases every slot and transport credential. New acquisitions
@@ -486,6 +489,34 @@ pub const Remote = struct {
         try self.probeSlot(slot);
 
         const body = try self.callSlot(slot, request, level != .any);
+        defer self.gpa.free(body);
+        return self.parseTypedQuery(result_gpa, body);
+    }
+
+    /// Runs one typed search through the server's validated ZDS 0009
+    /// planner. Scheduling and consistency are identical to `query`.
+    pub fn search(
+        self: *Remote,
+        result_gpa: std.mem.Allocator,
+        request: search_api.Request,
+        level: Level,
+        freshness_ms: ?u64,
+    ) !node_mod.TypedResult {
+        const body_request = try buildSearchRequest(
+            self.gpa,
+            request,
+            level,
+            freshness_ms,
+        );
+        defer self.gpa.free(body_request);
+
+        const slot = try self.acquire(
+            if (level == .any) .read_any else .read_leader,
+        );
+        defer self.release(slot);
+        try self.probeSlot(slot);
+
+        const body = try self.callSlot(slot, body_request, level != .any);
         defer self.gpa.free(body);
         return self.parseTypedQuery(result_gpa, body);
     }
@@ -1076,6 +1107,91 @@ fn buildQueryRequest(
     }
     try out.writeAll("}");
     return buffer.toOwnedSlice();
+}
+
+fn buildSearchRequest(
+    gpa: std.mem.Allocator,
+    request: search_api.Request,
+    level: Level,
+    freshness_ms: ?u64,
+) ![]u8 {
+    if (!std.math.isFinite(request.text_weight) or
+        !std.math.isFinite(request.vector_weight))
+    {
+        return error.InvalidWeight;
+    }
+    var buffer: std.Io.Writer.Allocating = .init(gpa);
+    defer buffer.deinit();
+    const out = &buffer.writer;
+    try out.writeAll("{\"op\":\"search\",\"format\":\"typed-v1\"");
+    try writeOptionalString(out, "fts_table", request.fts_table);
+    try writeOptionalString(out, "vec_table", request.vec_table);
+    try writeOptionalString(out, "text", request.text);
+    try writeOptionalEmbedding(gpa, out, request.embedding);
+    try out.print(
+        ",\"k\":{d},\"fusion\":\"{s}\",\"text_weight\":{d}," ++
+            "\"vector_weight\":{d}",
+        .{
+            request.k,
+            @tagName(request.fusion),
+            request.text_weight,
+            request.vector_weight,
+        },
+    );
+    if (request.candidate_count) |count| {
+        try out.print(",\"candidate_count\":{d}", .{count});
+    }
+    try writeOptionalString(out, "metadata_table", request.metadata_table);
+    try writeOptionalString(
+        out,
+        "metadata_id_column",
+        request.metadata_id_column,
+    );
+    try writeMetadataColumns(out, request.metadata_columns);
+    try out.print(",\"level\":\"{s}\"", .{@tagName(level)});
+    if (freshness_ms) |maximum| {
+        try out.print(",\"freshness_ms\":{d}", .{maximum});
+    }
+    try out.writeAll("}");
+    return buffer.toOwnedSlice();
+}
+
+fn writeOptionalString(
+    out: *Io.Writer,
+    name: []const u8,
+    value: ?[]const u8,
+) !void {
+    const text = value orelse return;
+    try out.print(",\"{s}\":", .{name});
+    try server.writeJsonString(out, text);
+}
+
+fn writeOptionalEmbedding(
+    gpa: std.mem.Allocator,
+    out: *Io.Writer,
+    value: ?[]const u8,
+) !void {
+    const bytes = value orelse return;
+    const encoder = std.base64.standard.Encoder;
+    const encoded = try gpa.alloc(u8, encoder.calcSize(bytes.len));
+    defer gpa.free(encoded);
+    _ = encoder.encode(encoded, bytes);
+    try out.writeAll(",\"embedding\":\"");
+    try out.writeAll(encoded);
+    try out.writeAll("\"");
+}
+
+fn writeMetadataColumns(
+    out: *Io.Writer,
+    columns: []const []const u8,
+) !void {
+    if (columns.len == 0) return;
+    try out.writeAll(",\"metadata_columns\":[");
+    for (columns, 0..) |column, index| {
+        if (index > 0) try out.writeAll(",");
+        try server.writeJsonString(out, column);
+    }
+    try out.writeAll("]");
 }
 
 /// Writes the optional tagged typed-v1 `params` member (omitted when

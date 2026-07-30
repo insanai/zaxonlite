@@ -179,6 +179,66 @@ pub const Embedded = struct {
         const peers = parsed_members.peers;
         const endpoints = parsed_members.endpoints;
 
+        try validateTransportOptions(options, endpoints);
+        const backends = parsed_members.backends;
+        const backend_count = parsed_members.backend_count;
+        const secret = if (options.auth_secret) |bytes|
+            try allocator.dupe(u8, bytes)
+        else
+            null;
+        const cluster_id = if (options.cluster_id) |text|
+            try allocator.dupe(u8, text)
+        else
+            null;
+        const tls_config: ?tls.Config = if (options.tls) |config| .{
+            .cert_path = try allocator.dupe(u8, config.cert_path),
+            .key_path = try allocator.dupe(u8, config.key_path),
+            .ca_path = try allocator.dupe(u8, config.ca_path),
+        } else null;
+        const enrollment_ca_key = if (options.enrollment_ca_key) |path|
+            try allocator.dupe(u8, path)
+        else
+            null;
+
+        self.serve_options = .{
+            .directory = directory,
+            .node_id = options.node_id,
+            .listen_host = own.host,
+            .listen_port = own.port,
+            .listen_unix = own.unix_path,
+            .members = peers,
+            .database_id = server.deriveDatabaseId(peers, cluster_id),
+            .auth_secret = secret,
+            .tls = tls_config,
+            .enrollment_ca_key = enrollment_ca_key,
+            .enable_failpoints = options.enable_test_faults or
+                options.allow_insecure_test_tcp,
+            .allow_insecure_test_tcp = options.allow_insecure_test_tcp,
+            .allow_psk_only_loopback = options.allow_psk_only_loopback,
+            .test_faults = options.test_faults,
+        };
+        self.gateway_shutdown = .init(false);
+        self.gateway_options = .{
+            .listen_host = own.host,
+            .listen_port = own.port,
+            .backends = backends[0..backend_count],
+            .shutdown_flag = &self.gateway_shutdown,
+        };
+        self.gateway_mode = own_role == .gateway;
+        self.endpoints = endpoints;
+        self.self_endpoint = own;
+        self.auth_secret = secret;
+        self.tls_client = null;
+        if (tls_config) |config| {
+            self.tls_client = try tls.Context.initClient(config);
+        }
+        errdefer if (self.tls_client) |*context| context.deinit();
+    }
+
+    fn validateTransportOptions(
+        options: OpenOptions,
+        endpoints: []const client.Endpoint,
+    ) !void {
         // A unix member address names a single-node local service, never a
         // way to connect Paxos members. This replaces the earlier silent
         // degradation that left the socket path in `host` with port zero.
@@ -207,52 +267,6 @@ pub const Embedded = struct {
                 }
             }
         }
-        const backends = parsed_members.backends;
-        const backend_count = parsed_members.backend_count;
-        const secret = if (options.auth_secret) |bytes| try allocator.dupe(u8, bytes) else null;
-        const cluster_id = if (options.cluster_id) |text| try allocator.dupe(u8, text) else null;
-        const tls_config: ?tls.Config = if (options.tls) |config| .{
-            .cert_path = try allocator.dupe(u8, config.cert_path),
-            .key_path = try allocator.dupe(u8, config.key_path),
-            .ca_path = try allocator.dupe(u8, config.ca_path),
-        } else null;
-        const enrollment_ca_key = if (options.enrollment_ca_key) |path|
-            try allocator.dupe(u8, path)
-        else
-            null;
-
-        self.serve_options = .{
-            .directory = directory,
-            .node_id = options.node_id,
-            .listen_host = own.host,
-            .listen_port = own.port,
-            .listen_unix = own.unix_path,
-            .members = peers,
-            .database_id = server.deriveDatabaseId(peers, cluster_id),
-            .auth_secret = secret,
-            .tls = tls_config,
-            .enrollment_ca_key = enrollment_ca_key,
-            .enable_failpoints = options.enable_test_faults or options.allow_insecure_test_tcp,
-            .allow_insecure_test_tcp = options.allow_insecure_test_tcp,
-            .allow_psk_only_loopback = options.allow_psk_only_loopback,
-            .test_faults = options.test_faults,
-        };
-        self.gateway_shutdown = .init(false);
-        self.gateway_options = .{
-            .listen_host = own.host,
-            .listen_port = own.port,
-            .backends = backends[0..backend_count],
-            .shutdown_flag = &self.gateway_shutdown,
-        };
-        self.gateway_mode = own_role == .gateway;
-        self.endpoints = endpoints;
-        self.self_endpoint = own;
-        self.auth_secret = secret;
-        self.tls_client = null;
-        if (tls_config) |config| {
-            self.tls_client = try tls.Context.initClient(config);
-        }
-        errdefer if (self.tls_client) |*context| context.deinit();
     }
 
     /// Matches the server's development-PSK constraint exactly: only the

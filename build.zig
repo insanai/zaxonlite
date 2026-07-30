@@ -653,7 +653,11 @@ pub fn build(b: *std.Build) void {
     );
     cluster_bench_step.dependOn(&run_cluster_bench.step);
 
-    // C ABI: libzaxonlite static library plus installed header.
+    // C ABI: libzaxonlite, its exact SQLite dependency, and the header.
+    // Installing SQLite avoids forcing external hosts (notably the
+    // Python wheel build) to guess which target-specific cache archive
+    // belongs to this product graph.
+    b.installArtifact(graph.sqlite_lib);
     const capi_lib = b.addLibrary(.{
         .name = "zaxonlite",
         .linkage = .static,
