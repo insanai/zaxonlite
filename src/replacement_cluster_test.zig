@@ -123,6 +123,7 @@ const Cluster = struct {
         if (node.child) |*child| {
             child.kill(self.io);
             node.child = null;
+            self.io.sleep(.fromMilliseconds(250), .awake) catch {};
         }
     }
 
@@ -131,6 +132,7 @@ const Cluster = struct {
         if (node.child) |*child| {
             _ = child.wait(self.io) catch {};
             node.child = null;
+            self.io.sleep(.fromMilliseconds(250), .awake) catch {};
         }
     }
 
