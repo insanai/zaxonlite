@@ -9,7 +9,7 @@
 const std = @import("std");
 
 /// Human-readable library version.
-pub const version = "0.2.1";
+pub const version = "0.2.2";
 
 /// Fixed-size replicated command descriptor and its canonical wire codec.
 pub const command = @import("command.zig");
@@ -130,6 +130,6 @@ test {
 }
 
 test "sqlite is linked and recent" {
-    try std.testing.expectEqualStrings("0.2.1", version);
+    try std.testing.expectEqualStrings("0.2.2", version);
     try std.testing.expect(sqlite.libversionNumber() >= 3050000);
 }
