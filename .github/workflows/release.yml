@@ -201,6 +201,7 @@ jobs:
             --workdir /workspace/zaxonlite/languages/python \
             --env OPENSSL_VERSION \
             --env ZIG_VERSION \
+            --env GITHUB_REF_NAME \
             quay.io/pypa/manylinux2014_x86_64:latest \
             bash -euxo pipefail -c '
               cd /tmp
@@ -208,7 +209,7 @@ jobs:
               tar xf "zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
               export PATH="/tmp/zig-x86_64-linux-${ZIG_VERSION}:$PATH"
               export ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache
-              mkdir -p "$ZIG_GLOBAL_CACHE_DIR/tmp"
+              mkdir -p /tmp/zig-cache/tmp
 
               yum install -y perl-IPC-Cmd
               curl -fsSLO "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
@@ -229,9 +230,11 @@ jobs:
               auditwheel repair --plat manylinux2014_x86_64 \
                 --wheel-dir wheelhouse dist/*.whl
               test "$(find wheelhouse -maxdepth 1 -name "*cp312-abi3-manylinux2014_x86_64*.whl" | wc -l)" -eq 1
+              "$python" -m venv /tmp/zxlite-wheel-test
+              /tmp/zxlite-wheel-test/bin/pip install wheelhouse/*.whl
               version="${GITHUB_REF_NAME#v}"
               /tmp/zxlite-wheel-test/bin/python -c \
-                "import zxlite; assert zxlite.__version__ == \"${version:-0.2.1}\""
+                "import zxlite; assert zxlite.__version__ == \"${version}\""
             '
 
       - name: Upload Linux wheel
