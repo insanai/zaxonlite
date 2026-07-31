@@ -1,5 +1,7 @@
 """Strict remote DSN validation (no network activity on rejection)."""
 
+import os
+
 import pytest
 
 import zxlite
@@ -30,6 +32,7 @@ def test_query_seed_form_parses() -> None:
     assert parsed["freshness_ms"] == 250
 
 
+@pytest.mark.skipif(os.name == "nt", reason="unix sockets are POSIX-only")
 def test_query_form_accepts_one_unix_seed() -> None:
     parsed = _parse_remote_dsn("zxlite:///?seed=unix%3A%2Frun%2Fzx.sock")
     assert parsed["seeds"] == ("unix:/run/zx.sock",)
