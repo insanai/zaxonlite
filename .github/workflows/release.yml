@@ -45,7 +45,7 @@ jobs:
         with:
           repository: insanai/paxos-zig
           token: ${{ secrets.CROSS_REPO_TOKEN || github.token }}
-          ref: ${{ github.ref_name }}
+          ref: main
           path: .
 
       - name: Checkout zaxonlite
@@ -184,7 +184,7 @@ jobs:
         with:
           repository: insanai/paxos-zig
           token: ${{ secrets.CROSS_REPO_TOKEN || github.token }}
-          ref: ${{ github.ref_name }}
+          ref: main
           path: .
 
       - name: Checkout zaxonlite
@@ -265,7 +265,7 @@ jobs:
         with:
           repository: insanai/paxos-zig
           token: ${{ secrets.CROSS_REPO_TOKEN || github.token }}
-          ref: ${{ github.ref_name }}
+          ref: main
           path: .
 
       - name: Checkout zaxonlite
@@ -333,7 +333,7 @@ jobs:
         with:
           repository: insanai/paxos-zig
           token: ${{ secrets.CROSS_REPO_TOKEN || github.token }}
-          ref: ${{ github.ref_name }}
+          ref: main
           path: .
 
       - name: Checkout zaxonlite
