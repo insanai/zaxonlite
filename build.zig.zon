@@ -4,7 +4,7 @@
     .fingerprint = 0xdf9f861eecc5d6a3, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
-        .paxos = .{ .path = ".." },
+        .paxos = .{ .url = "https://github.com/insanai/paxos-zig/archive/refs/tags/v0.2.2.tar.gz", .hash = "paxos-0.2.2-_zKMfWbvAgDe98pKuHrMQz163uJOLGBzwWhag8grXjVJ" },
         .sqlite = .{
             .url = "https://sqlite.org/2025/sqlite-amalgamation-3500400.zip",
             .hash = "N-V-__8AAHCbqABM_X5RTjbDBDBWErxZE8tJzmtEnLOLRHGx",
