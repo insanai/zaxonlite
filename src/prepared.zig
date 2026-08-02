@@ -25,6 +25,64 @@ pub const Statement = struct {
     values: []const Value,
 };
 
+/// Longest text or blob value a `scalar_equals` expectation may carry.
+/// The cap bounds comparison work inside the write path; an observed cell
+/// longer than the cap can never equal a valid expected value.
+pub const scalar_bytes_max: usize = 4096;
+
+/// Per-statement verification for a checked transaction. A failed
+/// expectation rolls the whole transaction back before any WAL frame is
+/// captured or appended to the replicated log.
+pub const Expectation = union(enum) {
+    /// No verification; the statement only has to execute successfully.
+    any,
+    /// The statement's own change count (rows inserted, updated, or
+    /// deleted, by SQLite's total-changes delta) must equal this value.
+    changes_exactly: u64,
+    /// The statement must produce exactly this many result rows.
+    rows_exactly: u64,
+    /// The statement must produce exactly one row with one column whose
+    /// typed value equals this one. Text and blob expectations are
+    /// bounded by `scalar_bytes_max`.
+    scalar_equals: Value,
+};
+
+/// One statement of a checked transaction: SQL, bound values, and the
+/// expectation the write path verifies before the transaction commits.
+pub const CheckedStatement = struct {
+    sql: []const u8,
+    values: []const Value,
+    expectation: Expectation = .any,
+};
+
+/// Validates checked-transaction bounds before any SQL executes: the
+/// statement-count and input-byte limits shared with the transaction
+/// builder, plus the scalar expectation byte cap.
+pub fn validateCheckedBounds(statements: []const CheckedStatement) !void {
+    if (statements.len == 0) return error.EmptyTransaction;
+    if (statements.len > maximum_statements) return error.TooManyStatements;
+    var input_bytes: usize = 0;
+    for (statements) |statement| {
+        var added_bytes = statement.sql.len;
+        for (statement.values) |value| {
+            added_bytes = std.math.add(usize, added_bytes, valueBytes(value)) catch
+                return error.TransactionInputTooLarge;
+        }
+        input_bytes = std.math.add(usize, input_bytes, added_bytes) catch
+            return error.TransactionInputTooLarge;
+        if (input_bytes > maximum_input_bytes) return error.TransactionInputTooLarge;
+        switch (statement.expectation) {
+            .scalar_equals => |expected| switch (expected) {
+                .text, .blob => if (valueBytes(expected) > scalar_bytes_max) {
+                    return error.ScalarExpectationTooLarge;
+                },
+                else => {},
+            },
+            else => {},
+        }
+    }
+}
+
 pub const Transaction = struct {
     arena: std.heap.ArenaAllocator,
     statements: std.ArrayList(Statement) = .empty,
