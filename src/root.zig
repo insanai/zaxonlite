@@ -9,7 +9,7 @@
 const std = @import("std");
 
 /// Human-readable library version.
-pub const version = "0.2.2";
+pub const version = "0.3.0";
 
 /// Fixed-size replicated command descriptor and its canonical wire codec.
 pub const command = @import("command.zig");
@@ -85,6 +85,24 @@ pub const TypedResult = node.TypedResult;
 pub const WriteCapture = node.WriteCapture;
 
 pub const StatementInfo = node.StatementInfo;
+/// One tagged read statement of a `queryBatch` call.
+pub const BatchQuery = node.BatchQuery;
+/// Arena-owned tagged result sets, all from one WAL snapshot.
+pub const BatchResult = node.BatchResult;
+/// Hard cap on statements in one `queryBatch` call.
+pub const batch_queries_max = node.batch_queries_max;
+/// Which checked statement failed its expectation, and what was observed.
+pub const CheckedFailure = node.CheckedFailure;
+/// Per-statement verification for `execCheckedTransaction`.
+pub const Expectation = prepared.Expectation;
+/// One statement of a checked transaction: SQL, values, expectation.
+pub const CheckedStatement = prepared.CheckedStatement;
+/// Thread-safe facade: pooled read-only connections, a serialized write
+/// executor, and a maintenance gate over one privately owned node.
+pub const shared_node = @import("shared_node.zig");
+pub const SharedNode = shared_node.SharedNode;
+/// Facade tuning for `SharedNode.open`/`adopt`.
+pub const SharedNodeOptions = shared_node.Options;
 /// The `zaxon serve` transport host: one node behind a TCP endpoint.
 pub const server = @import("server.zig");
 /// JSON RPC client with leader-redirect following; used by the CLI and tests.
@@ -121,6 +139,7 @@ test {
     _ = @import("registry.zig");
     _ = @import("durability.zig");
     _ = @import("node.zig");
+    _ = @import("shared_node.zig");
     _ = @import("roles.zig");
     _ = @import("server.zig");
     _ = @import("client.zig");
@@ -130,6 +149,6 @@ test {
 }
 
 test "sqlite is linked and recent" {
-    try std.testing.expectEqualStrings("0.2.2", version);
+    try std.testing.expectEqualStrings("0.3.0", version);
     try std.testing.expect(sqlite.libversionNumber() >= 3050000);
 }
