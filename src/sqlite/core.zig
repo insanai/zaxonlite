@@ -122,6 +122,10 @@ pub const OpenOptions = struct {
     /// every target — disables mmap; a nonzero value is an explicit
     /// operator opt-in bounded by `max_mmap_bytes` (ZDS 0009).
     mmap_size: u64 = 0,
+    /// Opens the connection read-only (no CREATE): the connection can
+    /// never write the database file. Pooled reader connections use this
+    /// so a facade bug cannot mutate the materialized image.
+    read_only: bool = false,
 };
 
 pub const Db = struct {
@@ -141,8 +145,11 @@ pub const Db = struct {
     pub fn openWithOptions(path: [:0]const u8, options: OpenOptions) Error!Db {
         if (options.mmap_size > max_mmap_bytes) return error.SqliteMisuse;
         var handle: ?*c.sqlite3 = null;
-        const flags = c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE |
-            c.SQLITE_OPEN_NOMUTEX | c.SQLITE_OPEN_EXRESCODE;
+        const flags: c_int = if (options.read_only)
+            c.SQLITE_OPEN_READONLY | c.SQLITE_OPEN_NOMUTEX | c.SQLITE_OPEN_EXRESCODE
+        else
+            c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE |
+                c.SQLITE_OPEN_NOMUTEX | c.SQLITE_OPEN_EXRESCODE;
         const rc = c.sqlite3_open_v2(path.ptr, &handle, flags, null);
         if (rc != c.SQLITE_OK) {
             if (handle) |opened| _ = c.sqlite3_close(opened);
