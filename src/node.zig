@@ -210,7 +210,10 @@ pub const QueryLimits = struct {
     max_vm_steps: u64 = 0,
 };
 
-const QueryProgress = struct {
+/// Countdown state for one installed VM-step budget. Must outlive the
+/// connection's progress handler; callers keep it on their stack for the
+/// duration of the read.
+pub const QueryProgress = struct {
     callbacks_remaining: u64,
 };
 
@@ -220,6 +223,213 @@ fn queryProgress(context: ?*anyopaque) callconv(.c) c_int {
     progress.callbacks_remaining -= 1;
     return 0;
 }
+
+/// SQLite VM instructions between progress callbacks; the budget below is
+/// rounded up to this granularity.
+pub const query_progress_granularity: u64 = 1_000;
+
+/// Installs a VM-instruction budget on `db`. A budget is deterministic
+/// and SQLite-native; zero means unlimited and installs nothing, which
+/// remains the default for trusted embedded callers.
+pub fn installVmBudget(
+    db: *sqlite.Db,
+    max_vm_steps: u64,
+    progress: *QueryProgress,
+) void {
+    if (max_vm_steps == 0) {
+        progress.* = .{ .callbacks_remaining = 0 };
+        return;
+    }
+    progress.* = .{ .callbacks_remaining = @max(
+        @as(u64, 1),
+        (max_vm_steps +| query_progress_granularity - 1) / query_progress_granularity,
+    ) };
+    db.setProgressHandler(
+        @intCast(query_progress_granularity),
+        queryProgress,
+        progress,
+    );
+}
+
+/// Clears a budget installed by `installVmBudget`; a zero budget was
+/// never installed, so there is nothing to clear.
+pub fn clearVmBudget(db: *sqlite.Db, max_vm_steps: u64) void {
+    if (max_vm_steps == 0) return;
+    db.setProgressHandler(0, null, null);
+}
+
+/// Result budget consumed across every statement of one read call. Rows
+/// and bytes count down against `limits` as sets materialize; zero limits
+/// stay unlimited. Column names count into the byte budget, as the text
+/// read path always did.
+pub const ReadBudget = struct {
+    limits: QueryLimits,
+    rows_used: usize = 0,
+    bytes_used: usize = 0,
+
+    fn addRow(self: *ReadBudget) error{QueryRowLimit}!void {
+        if (self.limits.max_rows != 0 and self.rows_used >= self.limits.max_rows) {
+            return error.QueryRowLimit;
+        }
+        self.rows_used += 1;
+    }
+
+    fn addBytes(self: *ReadBudget, count: usize) error{QueryResultTooLarge}!void {
+        self.bytes_used = std.math.add(usize, self.bytes_used, count) catch
+            return error.QueryResultTooLarge;
+        if (self.limits.max_bytes != 0 and self.bytes_used > self.limits.max_bytes) {
+            return error.QueryResultTooLarge;
+        }
+    }
+};
+
+/// One materialized result set: arena-owned column names and typed rows.
+pub const MaterializedSet = struct {
+    columns: []const []const u8,
+    rows: []const []const prepared.Value,
+};
+
+/// Prepares and steps one read-only statement on `db`, copying every cell
+/// into `alloc` (an arena) and charging `budget`. The caller owns guard
+/// scope, the surrounding transaction, and any VM budget on `db`.
+pub fn materializeReadStatement(
+    db: *sqlite.Db,
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    values: []const prepared.Value,
+    budget: *ReadBudget,
+) !MaterializedSet {
+    var stmt = try db.prepare(sql);
+    defer stmt.finalize();
+    if (!stmt.isReadOnly()) return error.WriteInReadQuery;
+    try prepared.bind(&stmt, values);
+
+    const column_count = stmt.columnCount();
+    const columns = try alloc.alloc([]const u8, column_count);
+    for (columns, 0..) |*column, index| {
+        const name = stmt.columnName(@intCast(index));
+        try budget.addBytes(name.len);
+        column.* = try alloc.dupe(u8, name);
+    }
+
+    var rows: std.ArrayList([]const prepared.Value) = .empty;
+    while (try stmt.step()) {
+        try budget.addRow();
+        const row = try alloc.alloc(prepared.Value, column_count);
+        for (row, 0..) |*cell, index| {
+            const column: u32 = @intCast(index);
+            // Integers and reals count as their storage width; text and
+            // blob count their byte length, as the text path always did.
+            const cell_bytes: usize = switch (stmt.columnValueType(column)) {
+                .null => 0,
+                .integer, .real => 8,
+                .text => stmt.columnText(column).len,
+                .blob => stmt.columnBlob(column).len,
+            };
+            try budget.addBytes(cell_bytes);
+            cell.* = switch (stmt.columnValueType(column)) {
+                .null => .null_value,
+                .integer => .{ .integer = stmt.columnInt64(column) },
+                .real => .{ .real = stmt.columnDouble(column) },
+                .text => .{
+                    .text = try alloc.dupe(u8, stmt.columnText(column)),
+                },
+                .blob => .{
+                    .blob = try alloc.dupe(u8, stmt.columnBlob(column)),
+                },
+            };
+        }
+        try rows.append(alloc, row);
+    }
+    return .{ .columns = columns, .rows = try rows.toOwnedSlice(alloc) };
+}
+
+/// True for errors that carry a SQLite error message on the connection
+/// worth saving for `lastSqliteMessage`.
+fn isSqliteFailure(err: anyerror) bool {
+    return switch (err) {
+        error.SqliteError,
+        error.SqliteBusy,
+        error.SqliteMisuse,
+        error.SqliteInterrupted,
+        => true,
+        else => false,
+    };
+}
+
+/// Converts a typed result into the legacy text presentation, rendering
+/// integer and real cells exactly as SQLite's own text conversion does.
+/// Consumes `typed`: the returned result adopts its arena.
+pub fn textFromTyped(typed: *TypedResult) !QueryResult {
+    const alloc = typed.arena.allocator();
+    const rows = try alloc.alloc([]const ?[]const u8, typed.rows.len);
+    for (typed.rows, rows) |typed_row, *text_row| {
+        const cells = try alloc.alloc(?[]const u8, typed_row.len);
+        for (typed_row, cells) |value, *cell| {
+            cell.* = switch (value) {
+                .null_value => null,
+                .integer => |number| try std.fmt.allocPrint(
+                    alloc,
+                    "{d}",
+                    .{number},
+                ),
+                .real => |number| blk: {
+                    var buffer: [32]u8 = undefined;
+                    break :blk try alloc.dupe(
+                        u8,
+                        sqlite.formatReal(&buffer, number),
+                    );
+                },
+                .text => |bytes| bytes,
+                .blob => |bytes| bytes,
+            };
+        }
+        text_row.* = cells;
+    }
+    return .{ .arena = typed.arena, .columns = typed.columns, .rows = rows };
+}
+
+/// Hard cap on statements in one `Node.queryBatch` call.
+pub const batch_queries_max: usize = 64;
+
+/// One tagged read statement of a batch; the tag rides into the matching
+/// result set so callers can correlate without positional bookkeeping.
+pub const BatchQuery = struct {
+    tag: u32,
+    sql: []const u8,
+    values: []const prepared.Value,
+};
+
+/// Arena-owned result of `Node.queryBatch`: one tagged set per query, all
+/// materialized from a single WAL snapshot.
+pub const BatchResult = struct {
+    arena: std.heap.ArenaAllocator,
+    sets: []const Set,
+
+    pub const Set = struct {
+        tag: u32,
+        columns: []const []const u8,
+        rows: []const []const prepared.Value,
+    };
+
+    pub fn deinit(self: *BatchResult) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Byte cap on scalar-expectation text/blob comparisons (see
+/// `prepared.scalar_bytes_max`, the defining declaration).
+pub const scalar_bytes_max = prepared.scalar_bytes_max;
+
+/// Which statement of a checked transaction failed its expectation, and
+/// what the write path actually observed. Valid only when
+/// `execCheckedTransaction` returned `error.ExpectationFailed`.
+pub const CheckedFailure = struct {
+    statement_index: u32,
+    observed_changes: i64,
+    observed_rows: u64,
+};
 
 /// Host callback used to release protocol-core messages explicitly
 /// classified as safe before the current journal barrier.  The callback is
@@ -763,6 +973,25 @@ pub const Node = struct {
         return self.writePreparedTransaction(.application, transaction.slice(), null);
     }
 
+    /// Commits several prepared statements as one replicated transaction,
+    /// verifying each statement's expectation as it executes. The first
+    /// failed expectation records `out_failure`, rolls the whole SQLite
+    /// transaction back BEFORE any WAL frame is captured or appended, and
+    /// returns `error.ExpectationFailed` — the journal never sees it.
+    pub fn execCheckedTransaction(
+        self: *Node,
+        statements: []const prepared.CheckedStatement,
+        out_failure: *?CheckedFailure,
+    ) !ExecResult {
+        if (!self.capabilities.serves_writes) return error.RoleCannotWrite;
+        out_failure.* = null;
+        try prepared.validateCheckedBounds(statements);
+        return self.writeRequest(.application, .{ .checked = .{
+            .statements = statements,
+            .out_failure = out_failure,
+        } }, null, null);
+    }
+
     /// Opens a replicated client session for idempotent retry.
     pub fn openSession(self: *Node) !u64 {
         if (!self.capabilities.serves_writes) return error.RoleCannotWrite;
@@ -1013,32 +1242,7 @@ pub const Node = struct {
     ) !QueryResult {
         var typed = try self.queryPreparedTypedWithLimits(gpa, sql, values, limits);
         errdefer typed.deinit();
-        const alloc = typed.arena.allocator();
-        const rows = try alloc.alloc([]const ?[]const u8, typed.rows.len);
-        for (typed.rows, rows) |typed_row, *text_row| {
-            const cells = try alloc.alloc(?[]const u8, typed_row.len);
-            for (typed_row, cells) |value, *cell| {
-                cell.* = switch (value) {
-                    .null_value => null,
-                    .integer => |number| try std.fmt.allocPrint(
-                        alloc,
-                        "{d}",
-                        .{number},
-                    ),
-                    .real => |number| blk: {
-                        var buffer: [32]u8 = undefined;
-                        break :blk try alloc.dupe(
-                            u8,
-                            sqlite.formatReal(&buffer, number),
-                        );
-                    },
-                    .text => |bytes| bytes,
-                    .blob => |bytes| bytes,
-                };
-            }
-            text_row.* = cells;
-        }
-        return .{ .arena = typed.arena, .columns = typed.columns, .rows = rows };
+        return textFromTyped(&typed);
     }
 
     pub fn queryPreparedTypedWithLimits(
@@ -1060,107 +1264,112 @@ pub const Node = struct {
         // node's. The guard outlives the statement because the lease is
         // released (and any owned connection closed) before this returns.
         var lease_guard = guard_mod.Guard{};
-        const read_guard: *guard_mod.Guard = if (lease.owned) blk: {
-            lease_guard.install(&lease.db);
-            break :blk &lease_guard;
-        } else &self.guard;
+        const read_guard = self.leaseReadGuard(&lease, &lease_guard);
         read_guard.scope = .application;
         defer read_guard.scope = .internal;
 
         // A VM-instruction budget is deterministic and SQLite-native. It is
         // intentionally optional: embedded callers and approved migrations
         // can retain SQLite's normal unlimited behavior.
-        const progress_granularity: u64 = 1_000;
-        var progress = QueryProgress{
-            .callbacks_remaining = if (limits.max_vm_steps == 0)
-                0
-            else
-                @max(@as(u64, 1), (limits.max_vm_steps +| progress_granularity - 1) /
-                    progress_granularity),
+        var progress: QueryProgress = undefined;
+        installVmBudget(&lease.db, limits.max_vm_steps, &progress);
+        defer clearVmBudget(&lease.db, limits.max_vm_steps);
+
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        errdefer arena.deinit();
+        var budget = ReadBudget{ .limits = limits };
+        const set = materializeReadStatement(
+            &lease.db,
+            arena.allocator(),
+            sql,
+            values,
+            &budget,
+        ) catch |err| {
+            if (isSqliteFailure(err)) self.saveErrorFrom(&lease.db);
+            return err;
         };
-        if (limits.max_vm_steps != 0) {
-            lease.db.setProgressHandler(
-                @intCast(progress_granularity),
-                queryProgress,
-                &progress,
-            );
-        }
-        defer if (limits.max_vm_steps != 0) {
-            lease.db.setProgressHandler(0, null, null);
-        };
+        return .{ .arena = arena, .columns = set.columns, .rows = set.rows };
+    }
+
+    /// Runs several prepared read statements through ONE read lease inside
+    /// ONE deferred read transaction, so every set observes the same WAL
+    /// snapshot. `limits` is a single budget shared across the whole
+    /// batch: rows, bytes, and VM steps count down across statements.
+    pub fn queryBatch(
+        self: *Node,
+        gpa: std.mem.Allocator,
+        queries: []const BatchQuery,
+        limits: QueryLimits,
+    ) !BatchResult {
+        if (!self.capabilities.serves_reads) return error.RoleCannotRead;
+        if (self.fatal_storage_error) return error.StorageFailed;
+        if (queries.len == 0) return error.EmptyTransaction;
+        if (queries.len > batch_queries_max) return error.TooManyQueries;
+        if (self.needs_resync) try self.resyncImage();
+        var lease = try self.readLease();
+        defer lease.release();
+        // The live writer connection cannot nest a read transaction under
+        // an open Gate C transaction or an in-flight write.
+        if (!lease.owned and self.db.inTransaction()) return error.TransactionOpen;
+
+        var lease_guard = guard_mod.Guard{};
+        const read_guard = self.leaseReadGuard(&lease, &lease_guard);
+
+        var progress: QueryProgress = undefined;
+        installVmBudget(&lease.db, limits.max_vm_steps, &progress);
+        defer clearVmBudget(&lease.db, limits.max_vm_steps);
+
+        // The deferred transaction (and its commit below) is zaxonlite's
+        // own statement and runs in internal scope; only the caller's
+        // statements are screened as application SQL.
+        try lease.db.exec("begin");
+        var committed = false;
+        defer if (!committed) lease.db.exec("rollback") catch {};
 
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
         const alloc = arena.allocator();
-
-        var stmt = lease.db.prepare(sql) catch |err| {
-            self.saveErrorFrom(&lease.db);
-            return err;
-        };
-        defer stmt.finalize();
-        if (!stmt.isReadOnly()) return error.WriteInReadQuery;
-        try prepared.bind(&stmt, values);
-
-        const column_count = stmt.columnCount();
-        const columns = try alloc.alloc([]const u8, column_count);
-        var result_bytes: usize = 0;
-        for (columns, 0..) |*column, index| {
-            const name = stmt.columnName(@intCast(index));
-            result_bytes = std.math.add(usize, result_bytes, name.len) catch
-                return error.QueryResultTooLarge;
-            if (limits.max_bytes != 0 and result_bytes > limits.max_bytes) {
-                return error.QueryResultTooLarge;
-            }
-            column.* = try alloc.dupe(u8, name);
-        }
-
-        var rows: std.ArrayList([]const prepared.Value) = .empty;
-        while (stmt.step() catch |err| {
-            self.saveErrorFrom(&lease.db);
-            return err;
-        }) {
-            if (limits.max_rows != 0 and rows.items.len >= limits.max_rows) {
-                return error.QueryRowLimit;
-            }
-            const row = try alloc.alloc(prepared.Value, column_count);
-            for (row, 0..) |*cell, index| {
-                const column: u32 = @intCast(index);
-                // Integers and reals count as their storage width; text and
-                // blob count their byte length, as the text path always did.
-                const cell_bytes: usize = switch (stmt.columnValueType(column)) {
-                    .null => 0,
-                    .integer, .real => 8,
-                    .text => stmt.columnText(column).len,
-                    .blob => stmt.columnBlob(column).len,
+        const sets = try alloc.alloc(BatchResult.Set, queries.len);
+        var budget = ReadBudget{ .limits = limits };
+        {
+            read_guard.scope = .application;
+            defer read_guard.scope = .internal;
+            for (queries, sets) |batch_query, *set| {
+                const materialized = materializeReadStatement(
+                    &lease.db,
+                    alloc,
+                    batch_query.sql,
+                    batch_query.values,
+                    &budget,
+                ) catch |err| {
+                    if (isSqliteFailure(err)) self.saveErrorFrom(&lease.db);
+                    return err;
                 };
-                result_bytes = std.math.add(
-                    usize,
-                    result_bytes,
-                    cell_bytes,
-                ) catch return error.QueryResultTooLarge;
-                if (limits.max_bytes != 0 and result_bytes > limits.max_bytes) {
-                    return error.QueryResultTooLarge;
-                }
-                cell.* = switch (stmt.columnValueType(column)) {
-                    .null => .null_value,
-                    .integer => .{ .integer = stmt.columnInt64(column) },
-                    .real => .{ .real = stmt.columnDouble(column) },
-                    .text => .{
-                        .text = try alloc.dupe(u8, stmt.columnText(column)),
-                    },
-                    .blob => .{
-                        .blob = try alloc.dupe(u8, stmt.columnBlob(column)),
-                    },
+                set.* = .{
+                    .tag = batch_query.tag,
+                    .columns = materialized.columns,
+                    .rows = materialized.rows,
                 };
             }
-            try rows.append(alloc, row);
         }
+        try lease.db.exec("commit");
+        committed = true;
+        return .{ .arena = arena, .sets = sets };
+    }
 
-        return .{
-            .arena = arena,
-            .columns = columns,
-            .rows = try rows.toOwnedSlice(alloc),
-        };
+    /// The guard screening one read lease: a short-lived lease connection
+    /// gets `storage` installed as its own guard; the live connection
+    /// reuses the node's. `storage` must outlive the lease.
+    fn leaseReadGuard(
+        self: *Node,
+        lease: *ReadLease,
+        storage: *guard_mod.Guard,
+    ) *guard_mod.Guard {
+        if (lease.owned) {
+            storage.install(&lease.db);
+            return storage;
+        }
+        return &self.guard;
     }
 
     /// Copies the name of one bound parameter (1-based index) into
@@ -1830,9 +2039,15 @@ pub const Node = struct {
         sequence: u64,
     };
 
+    const CheckedRequest = struct {
+        statements: []const prepared.CheckedStatement,
+        out_failure: *?CheckedFailure,
+    };
+
     const WriteRequest = union(enum) {
         raw: [:0]const u8,
         prepared: []const prepared.Statement,
+        checked: CheckedRequest,
     };
 
     /// Opens the live writer (capture) connection. The materialized image
@@ -1960,9 +2175,15 @@ pub const Node = struct {
                     self.executePreparedCapture(statements, sink)
                 else
                     prepared.execute(&self.db, statements),
+                .checked => |checked| self.executeCheckedStatements(
+                    checked.statements,
+                    checked.out_failure,
+                ),
             };
             execution catch |err| {
-                self.saveErrorFrom(&self.db);
+                // An expectation failure already saved its own message;
+                // the connection's would read "not an error".
+                if (err != error.ExpectationFailed) self.saveErrorFrom(&self.db);
                 return err;
             };
         }
@@ -2324,6 +2545,99 @@ pub const Node = struct {
                 .rows = try rows.toOwnedSlice(alloc),
             };
         }
+    }
+
+    /// What one checked statement actually did: its total-changes delta,
+    /// the result rows it produced, and whether a scalar expectation
+    /// matched the first row.
+    const CheckedObservation = struct {
+        changes: i64,
+        rows: u64,
+        scalar_ok: bool,
+    };
+
+    /// Executes checked statements in order inside the open write
+    /// transaction, verifying each expectation before the next statement
+    /// runs. The caller's `errdefer rollback` fires before any capture or
+    /// Paxos work, so a failure replicates nothing.
+    fn executeCheckedStatements(
+        self: *Node,
+        statements: []const prepared.CheckedStatement,
+        out_failure: *?CheckedFailure,
+    ) !void {
+        for (statements, 0..) |statement, index| {
+            const observation = try self.runCheckedStatement(statement);
+            if (expectationHolds(statement.expectation, observation)) continue;
+            out_failure.* = .{
+                .statement_index = @intCast(index),
+                .observed_changes = observation.changes,
+                .observed_rows = observation.rows,
+            };
+            self.saveErrorText("checked transaction expectation failed");
+            return error.ExpectationFailed;
+        }
+    }
+
+    /// Runs one checked statement, counting rows and the change delta. A
+    /// scalar expectation is compared against the first row while its
+    /// column bytes are still live on the statement.
+    fn runCheckedStatement(
+        self: *Node,
+        statement: prepared.CheckedStatement,
+    ) !CheckedObservation {
+        const changes_before = self.totalChanges();
+        var stmt = try self.db.prepare(statement.sql);
+        defer stmt.finalize();
+        try prepared.bind(&stmt, statement.values);
+        var observation = CheckedObservation{
+            .changes = 0,
+            .rows = 0,
+            .scalar_ok = false,
+        };
+        while (try stmt.step()) {
+            if (observation.rows == 0) {
+                observation.scalar_ok = switch (statement.expectation) {
+                    .scalar_equals => |expected| stmt.columnCount() == 1 and
+                        scalarMatches(&stmt, expected),
+                    else => false,
+                };
+            }
+            observation.rows += 1;
+        }
+        observation.changes = self.totalChanges() - changes_before;
+        return observation;
+    }
+
+    /// Typed equality between the first column of the current row and an
+    /// expected scalar. Strict on storage class: integer 1 does not equal
+    /// real 1.0. Expected text/blob bytes are already bounded by
+    /// `prepared.scalar_bytes_max`, so an oversized observed cell simply
+    /// fails the length comparison.
+    fn scalarMatches(stmt: *sqlite.Stmt, expected: prepared.Value) bool {
+        return switch (expected) {
+            .null_value => stmt.columnValueType(0) == .null,
+            .integer => |number| stmt.columnValueType(0) == .integer and
+                stmt.columnInt64(0) == number,
+            .real => |number| stmt.columnValueType(0) == .real and
+                stmt.columnDouble(0) == number,
+            .text => |bytes| stmt.columnValueType(0) == .text and
+                std.mem.eql(u8, stmt.columnText(0), bytes),
+            .blob => |bytes| stmt.columnValueType(0) == .blob and
+                std.mem.eql(u8, stmt.columnBlob(0), bytes),
+        };
+    }
+
+    fn expectationHolds(
+        expectation: prepared.Expectation,
+        observation: CheckedObservation,
+    ) bool {
+        return switch (expectation) {
+            .any => true,
+            .changes_exactly => |expected| observation.changes >= 0 and
+                @as(u64, @intCast(observation.changes)) == expected,
+            .rows_exactly => |expected| observation.rows == expected,
+            .scalar_equals => observation.rows == 1 and observation.scalar_ok,
+        };
     }
 
     /// The result of the most recent append made through this node. Hosts

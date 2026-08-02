@@ -1440,3 +1440,473 @@ test "live transaction: rollback publishes nothing" {
     try testing.expectError(error.NoTransaction, node.commitLive());
     try testing.expectError(error.NoTransaction, node.rollbackLive());
 }
+
+// ----------------------------------------------------------------------
+// Checked transactions (KDS 0018 WP1)
+// ----------------------------------------------------------------------
+
+test "checked transaction commits when every expectation passes" {
+    const gpa = testing.allocator;
+    var test_dir = try TestDir.init(gpa);
+    defer test_dir.deinit(gpa);
+    const dir = try test_dir.nodeDir(gpa);
+    defer gpa.free(dir);
+
+    const node = try openNode(dir);
+    defer node.close();
+    _ = try node.exec("create table items(id integer primary key, v text)");
+    _ = try node.exec("insert into items(v) values ('tea')");
+
+    var failure: ?zaxonlite.CheckedFailure = null;
+    const result = try node.execCheckedTransaction(&.{
+        .{
+            .sql = "update items set v = 'green tea' where v = ?1",
+            .values = &.{.{ .text = "tea" }},
+            .expectation = .{ .changes_exactly = 1 },
+        },
+        .{
+            .sql = "select count(*) from items",
+            .values = &.{},
+            .expectation = .{ .scalar_equals = .{ .integer = 1 } },
+        },
+        .{
+            .sql = "insert into items(v) values (?1)",
+            .values = &.{.{ .text = "coffee" }},
+            .expectation = .{ .changes_exactly = 1 },
+        },
+        .{
+            .sql = "select v from items order by id",
+            .values = &.{},
+            .expectation = .{ .rows_exactly = 2 },
+        },
+    }, &failure);
+    try testing.expect(failure == null);
+    try testing.expectEqual(@as(i64, 2), result.changes);
+    try testing.expectEqual(@as(i64, 2), try countItems(node));
+}
+
+test "a failed changes expectation rolls back before capture and appends no journal record" {
+    const gpa = testing.allocator;
+    var test_dir = try TestDir.init(gpa);
+    defer test_dir.deinit(gpa);
+    const dir = try test_dir.nodeDir(gpa);
+    defer gpa.free(dir);
+
+    {
+        const node = try openNode(dir);
+        defer node.close();
+        _ = try node.exec("create table items(id integer primary key, v text)");
+        _ = try node.exec("insert into items(v) values ('tea')");
+
+        const decided_before = node.log.decidedThrough();
+        const journal_before = node.status().journal_records;
+        var failure: ?zaxonlite.CheckedFailure = null;
+        try testing.expectError(error.ExpectationFailed, node.execCheckedTransaction(&.{
+            .{
+                .sql = "insert into items(v) values ('speculative')",
+                .values = &.{},
+                .expectation = .{ .changes_exactly = 1 },
+            },
+            .{
+                .sql = "update items set v = 'renamed' where v = 'missing'",
+                .values = &.{},
+                .expectation = .{ .changes_exactly = 1 },
+            },
+        }, &failure));
+        // Nothing was decided or journaled: the rollback fired before any
+        // WAL frame was captured or appended.
+        try testing.expectEqual(decided_before, node.log.decidedThrough());
+        try testing.expectEqual(journal_before, node.status().journal_records);
+        try testing.expectEqual(@as(i64, 1), try countItems(node));
+        // The node keeps serving writes afterwards.
+        _ = try node.exec("insert into items(v) values ('kept')");
+    }
+    const reopened = try openNode(dir);
+    defer reopened.close();
+    try testing.expectEqual(@as(i64, 2), try countItems(reopened));
+    const report = try reopened.integrityCheck();
+    try testing.expect(report.ok());
+}
+
+test "checked failure reports the failing statement index and observed count" {
+    const gpa = testing.allocator;
+    var test_dir = try TestDir.init(gpa);
+    defer test_dir.deinit(gpa);
+    const dir = try test_dir.nodeDir(gpa);
+    defer gpa.free(dir);
+
+    const node = try openNode(dir);
+    defer node.close();
+    _ = try node.exec("create table items(id integer primary key, v text)");
+    _ = try node.exec("insert into items(v) values ('tea'), ('coffee'), ('water')");
+
+    var failure: ?zaxonlite.CheckedFailure = null;
+    try testing.expectError(error.ExpectationFailed, node.execCheckedTransaction(&.{
+        .{
+            .sql = "select v from items",
+            .values = &.{},
+            .expectation = .{ .rows_exactly = 3 },
+        },
+        .{
+            .sql = "delete from items where v like ?1",
+            .values = &.{.{ .text = "%e%" }},
+            .expectation = .{ .changes_exactly = 1 },
+        },
+    }, &failure));
+    const reported = failure.?;
+    try testing.expectEqual(@as(u32, 1), reported.statement_index);
+    // 'tea', 'coffee', and 'water' all match '%e%'.
+    try testing.expectEqual(@as(i64, 3), reported.observed_changes);
+    try testing.expectEqual(@as(i64, 3), try countItems(node));
+}
+
+test "scalar guard compares typed values" {
+    const gpa = testing.allocator;
+    var test_dir = try TestDir.init(gpa);
+    defer test_dir.deinit(gpa);
+    const dir = try test_dir.nodeDir(gpa);
+    defer gpa.free(dir);
+
+    const node = try openNode(dir);
+    defer node.close();
+    _ = try node.exec("create table meta(k text primary key, n integer, r real, b blob)");
+    _ = try node.exec("insert into meta values ('row', 7, 2.5, x'00ff')");
+
+    // Every storage class matches its own typed expectation.
+    var failure: ?zaxonlite.CheckedFailure = null;
+    _ = try node.execCheckedTransaction(&.{
+        .{
+            .sql = "select n from meta where k = 'row'",
+            .values = &.{},
+            .expectation = .{ .scalar_equals = .{ .integer = 7 } },
+        },
+        .{
+            .sql = "select r from meta where k = 'row'",
+            .values = &.{},
+            .expectation = .{ .scalar_equals = .{ .real = 2.5 } },
+        },
+        .{
+            .sql = "select k from meta where k = 'row'",
+            .values = &.{},
+            .expectation = .{ .scalar_equals = .{ .text = "row" } },
+        },
+        .{
+            .sql = "select b from meta where k = 'row'",
+            .values = &.{},
+            .expectation = .{ .scalar_equals = .{ .blob = &.{ 0x00, 0xff } } },
+        },
+    }, &failure);
+    try testing.expect(failure == null);
+
+    // Storage classes stay strict: integer 7 is not text '7'.
+    try testing.expectError(error.ExpectationFailed, node.execCheckedTransaction(&.{.{
+        .sql = "select n from meta where k = 'row'",
+        .values = &.{},
+        .expectation = .{ .scalar_equals = .{ .text = "7" } },
+    }}, &failure));
+    try testing.expectEqual(@as(u32, 0), failure.?.statement_index);
+    try testing.expectEqual(@as(u64, 1), failure.?.observed_rows);
+
+    // A scalar expectation needs exactly one row.
+    try testing.expectError(error.ExpectationFailed, node.execCheckedTransaction(&.{.{
+        .sql = "select k from meta where 1 = 0",
+        .values = &.{},
+        .expectation = .{ .scalar_equals = .{ .text = "row" } },
+    }}, &failure));
+    try testing.expectEqual(@as(u64, 0), failure.?.observed_rows);
+
+    // Oversized text expectations are rejected before any SQL runs.
+    const oversized = [_]u8{'x'} ** 4097;
+    try testing.expectError(
+        error.ScalarExpectationTooLarge,
+        node.execCheckedTransaction(&.{.{
+            .sql = "select k from meta",
+            .values = &.{},
+            .expectation = .{ .scalar_equals = .{ .text = &oversized } },
+        }}, &failure),
+    );
+}
+
+// ----------------------------------------------------------------------
+// Batched reads (KDS 0018 WP1)
+// ----------------------------------------------------------------------
+
+test "query batch returns tagged sets from one snapshot" {
+    const gpa = testing.allocator;
+    var test_dir = try TestDir.init(gpa);
+    defer test_dir.deinit(gpa);
+    const dir = try test_dir.nodeDir(gpa);
+    defer gpa.free(dir);
+
+    const node = try openNode(dir);
+    defer node.close();
+    _ = try node.exec("create table items(id integer primary key, v text)");
+    _ = try node.exec("insert into items(v) values ('tea'), ('coffee')");
+
+    var batch = try node.queryBatch(gpa, &.{
+        .{ .tag = 11, .sql = "select v from items order by id", .values = &.{} },
+        .{
+            .tag = 22,
+            .sql = "select count(*) from items where v = ?1",
+            .values = &.{.{ .text = "tea" }},
+        },
+    }, .{});
+    defer batch.deinit();
+
+    try testing.expectEqual(@as(usize, 2), batch.sets.len);
+    try testing.expectEqual(@as(u32, 11), batch.sets[0].tag);
+    try testing.expectEqualStrings("v", batch.sets[0].columns[0]);
+    try testing.expectEqual(@as(usize, 2), batch.sets[0].rows.len);
+    try testing.expectEqualStrings("tea", batch.sets[0].rows[0][0].text);
+    try testing.expectEqualStrings("coffee", batch.sets[0].rows[1][0].text);
+    try testing.expectEqual(@as(u32, 22), batch.sets[1].tag);
+    try testing.expectEqual(@as(i64, 1), batch.sets[1].rows[0][0].integer);
+
+    // The statement cap is enforced before any SQL runs.
+    var too_many: [zaxonlite.batch_queries_max + 1]zaxonlite.BatchQuery = undefined;
+    for (&too_many) |*entry| {
+        entry.* = .{ .tag = 0, .sql = "select 1", .values = &.{} };
+    }
+    try testing.expectError(
+        error.TooManyQueries,
+        node.queryBatch(gpa, &too_many, .{}),
+    );
+}
+
+test "query batch budgets bound rows across statements" {
+    const gpa = testing.allocator;
+    var test_dir = try TestDir.init(gpa);
+    defer test_dir.deinit(gpa);
+    const dir = try test_dir.nodeDir(gpa);
+    defer gpa.free(dir);
+
+    const node = try openNode(dir);
+    defer node.close();
+    _ = try node.exec("create table items(id integer primary key, v text)");
+    _ = try node.exec("insert into items(v) values ('a'), ('b'), ('c')");
+
+    // Three rows land in the first set; the shared budget of four admits
+    // only one more row before the second statement trips the limit.
+    try testing.expectError(error.QueryRowLimit, node.queryBatch(gpa, &.{
+        .{ .tag = 1, .sql = "select v from items", .values = &.{} },
+        .{ .tag = 2, .sql = "select v from items", .values = &.{} },
+    }, .{ .max_rows = 4 }));
+
+    // The same statements fit once the budget covers all six rows, and a
+    // shared byte budget trips across statements too.
+    var batch = try node.queryBatch(gpa, &.{
+        .{ .tag = 1, .sql = "select v from items", .values = &.{} },
+        .{ .tag = 2, .sql = "select v from items", .values = &.{} },
+    }, .{ .max_rows = 6 });
+    batch.deinit();
+    try testing.expectError(error.QueryResultTooLarge, node.queryBatch(gpa, &.{
+        .{ .tag = 1, .sql = "select printf('%20s', v) from items", .values = &.{} },
+        .{ .tag = 2, .sql = "select printf('%20s', v) from items", .values = &.{} },
+    }, .{ .max_bytes = 70 }));
+}
+
+// ----------------------------------------------------------------------
+// SharedNode facade (KDS 0018 WP1)
+// ----------------------------------------------------------------------
+
+const SharedNode = zaxonlite.SharedNode;
+
+const ReaderWorker = struct {
+    shared: *SharedNode,
+    iterations: usize,
+    failures: usize = 0,
+    rows_seen: usize = 0,
+
+    fn run(self: *ReaderWorker) void {
+        var index: usize = 0;
+        while (index < self.iterations) : (index += 1) {
+            var result = self.shared.queryPrepared(
+                testing.allocator,
+                "select count(*) from items",
+                &.{},
+            ) catch {
+                self.failures += 1;
+                continue;
+            };
+            defer result.deinit();
+            if (result.rows.len == 1) {
+                self.rows_seen += 1;
+            } else {
+                self.failures += 1;
+            }
+        }
+    }
+};
+
+const SlowWriter = struct {
+    shared: *SharedNode,
+    ok: bool = false,
+
+    fn run(self: *SlowWriter) void {
+        _ = self.shared.execPrepared(
+            "insert into items(v) values ('slow')",
+            &.{},
+        ) catch return;
+        self.ok = true;
+    }
+};
+
+test "shared node adopt, open, and close lifecycle" {
+    const gpa = testing.allocator;
+    var test_dir = try TestDir.init(gpa);
+    defer test_dir.deinit(gpa);
+    const dir = try test_dir.nodeDir(gpa);
+    defer gpa.free(dir);
+
+    // The host opens and migrates single-threaded first, then adopts.
+    const node = try openNode(dir);
+    _ = try node.exec("create table items(id integer primary key, v text)");
+    _ = try node.exec("insert into items(v) values ('tea')");
+
+    // Invalid options leave node ownership with the caller.
+    try testing.expectError(
+        error.InvalidReadConnections,
+        SharedNode.adopt(gpa, node, .{ .read_connections = 0 }),
+    );
+    try testing.expectError(
+        error.InvalidWriteQueueDepth,
+        SharedNode.adopt(gpa, node, .{ .write_queue_depth = 0 }),
+    );
+
+    const adopted = try SharedNode.adopt(gpa, node, .{});
+    _ = try adopted.execPrepared(
+        "insert into items(v) values (?1)",
+        &.{.{ .text = "coffee" }},
+    );
+    var batch = try adopted.queryBatch(gpa, &.{
+        .{ .tag = 7, .sql = "select v from items order by id", .values = &.{} },
+        .{ .tag = 8, .sql = "select count(*) from items", .values = &.{} },
+    }, .{});
+    try testing.expectEqual(@as(u32, 7), batch.sets[0].tag);
+    try testing.expectEqual(@as(usize, 2), batch.sets[0].rows.len);
+    try testing.expectEqual(@as(i64, 2), batch.sets[1].rows[0][0].integer);
+    batch.deinit();
+    const report = try adopted.integrityCheck();
+    try testing.expect(report.ok());
+    // Close owns the node: the directory lock is released below.
+    adopted.close();
+
+    // The one-call constructor serves the same data afterwards.
+    const reopened = try SharedNode.open(gpa, testing.io, .{ .directory = dir }, .{});
+    var result = try reopened.queryPrepared(
+        gpa,
+        "select count(*) from items",
+        &.{},
+    );
+    try testing.expectEqualStrings("2", result.rows[0][0].?);
+    result.deinit();
+    reopened.close();
+}
+
+test "concurrent read leases proceed while a write commits" {
+    const gpa = testing.allocator;
+    var test_dir = try TestDir.init(gpa);
+    defer test_dir.deinit(gpa);
+    const dir = try test_dir.nodeDir(gpa);
+    defer gpa.free(dir);
+
+    const shared = try SharedNode.open(gpa, testing.io, .{ .directory = dir }, .{});
+    defer shared.close();
+    _ = try shared.execPrepared(
+        "create table items(id integer primary key, v text)",
+        &.{},
+    );
+    _ = try shared.execPrepared("insert into items(v) values ('seed')", &.{});
+
+    var workers = [_]ReaderWorker{
+        .{ .shared = shared, .iterations = 40 },
+        .{ .shared = shared, .iterations = 40 },
+        .{ .shared = shared, .iterations = 40 },
+    };
+    var threads: [workers.len]std.Thread = undefined;
+    for (&workers, &threads) |*worker, *thread| {
+        thread.* = try std.Thread.spawn(.{}, ReaderWorker.run, .{worker});
+    }
+    var writes: usize = 0;
+    while (writes < 20) : (writes += 1) {
+        _ = try shared.execPrepared("insert into items(v) values ('w')", &.{});
+    }
+    for (&threads) |*thread| thread.join();
+    for (workers) |worker| {
+        try testing.expectEqual(@as(usize, 0), worker.failures);
+        try testing.expectEqual(worker.iterations, worker.rows_seen);
+    }
+    var result = try shared.queryPrepared(gpa, "select count(*) from items", &.{});
+    defer result.deinit();
+    try testing.expectEqualStrings("21", result.rows[0][0].?);
+}
+
+test "write queue at capacity returns WriteQueueFull" {
+    const gpa = testing.allocator;
+    var test_dir = try TestDir.init(gpa);
+    defer test_dir.deinit(gpa);
+    const dir = try test_dir.nodeDir(gpa);
+    defer gpa.free(dir);
+
+    // The injected storage delay keeps the first write's admission ticket
+    // held long enough for the second write to observe a full queue.
+    const shared = try SharedNode.open(gpa, testing.io, .{
+        .directory = dir,
+        .test_storage_delay_ms = 600,
+    }, .{ .write_queue_depth = 1 });
+    defer shared.close();
+    _ = try shared.execPrepared(
+        "create table items(id integer primary key, v text)",
+        &.{},
+    );
+
+    var slow = SlowWriter{ .shared = shared };
+    const thread = try std.Thread.spawn(.{}, SlowWriter.run, .{&slow});
+    try testing.io.sleep(.fromMilliseconds(200), .awake);
+    try testing.expectError(
+        error.WriteQueueFull,
+        shared.execPrepared("insert into items(v) values ('rejected')", &.{}),
+    );
+    thread.join();
+    try testing.expect(slow.ok);
+
+    // The queue drains: the next write is admitted normally.
+    _ = try shared.execPrepared("insert into items(v) values ('after')", &.{});
+    var result = try shared.queryPrepared(gpa, "select count(*) from items", &.{});
+    defer result.deinit();
+    try testing.expectEqualStrings("2", result.rows[0][0].?);
+}
+
+test "checkpoint drains pooled readers and readers resume afterward" {
+    const gpa = testing.allocator;
+    var test_dir = try TestDir.init(gpa);
+    defer test_dir.deinit(gpa);
+    const dir = try test_dir.nodeDir(gpa);
+    defer gpa.free(dir);
+
+    const shared = try SharedNode.open(gpa, testing.io, .{ .directory = dir }, .{});
+    defer shared.close();
+    _ = try shared.execPrepared(
+        "create table items(id integer primary key, v text)",
+        &.{},
+    );
+    _ = try shared.execPrepared("insert into items(v) values ('tea')", &.{});
+
+    // Populate the pool so the checkpoint has live reader connections to
+    // drain, and keep readers running across the checkpoint.
+    var warm = try shared.queryPrepared(gpa, "select v from items", &.{});
+    warm.deinit();
+    var worker = ReaderWorker{ .shared = shared, .iterations = 30 };
+    const thread = try std.Thread.spawn(.{}, ReaderWorker.run, .{&worker});
+    try shared.snapshot();
+    thread.join();
+    try testing.expectEqual(@as(usize, 0), worker.failures);
+
+    // The epoch rolled over and reads and writes still serve.
+    const after = try shared.status();
+    try testing.expect(after.snapshot != null);
+    _ = try shared.execPrepared("insert into items(v) values ('post')", &.{});
+    var result = try shared.queryPrepared(gpa, "select count(*) from items", &.{});
+    defer result.deinit();
+    try testing.expectEqualStrings("2", result.rows[0][0].?);
+}
