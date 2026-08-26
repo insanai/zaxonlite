@@ -253,8 +253,8 @@ test "journal appends, syncs, and replays" {
     try testing.expectEqual(@as(u64, 3), info.record_count);
     try testing.expectEqual(@as(u64, 0), info.truncated_bytes);
     try testing.expectEqual(@as(u64, 4), reopened.next_sequence);
-    try testing.expect(durable.accepted[0] != null);
-    try testing.expect(durable.committed[0] != null);
+    try testing.expect(durable.acceptedAt(1) != null);
+    try testing.expect(durable.committedAt(1) != null);
 }
 
 test "journal truncates a torn tail but keeps the durable prefix" {

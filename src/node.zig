@@ -837,7 +837,7 @@ pub const Node = struct {
     /// the host must checkpoint before appending another command.
     pub fn epochNearlyFull(self: *const Node) bool {
         return self.log.decidedThrough() + capacity_reserve >=
-            types.log_options.max_entries;
+            types.log_options.window_slots;
     }
 
     /// Processes one protocol message from a peer.
@@ -1481,7 +1481,7 @@ pub const Node = struct {
             .decided_slot = self.log.decidedThrough(),
             .applied_slot = self.applied_slot,
             .journal_records = self.journal.next_sequence - 1,
-            .epoch_capacity = types.log_options.max_entries,
+            .epoch_capacity = types.log_options.window_slots,
             .chain = self.last_chain,
             .page_size = self.page_size,
             .snapshot = snapshot_name,
@@ -4033,24 +4033,25 @@ pub const Node = struct {
         self: *Node,
         retained: *std.AutoHashMap([32]u8, void),
     ) !void {
-        for (self.log.core.durable.accepted) |accepted| {
-            const vote = accepted orelse continue;
-            switch (vote.value) {
-                .command => |cmd| switch (cmd) {
-                    .transaction_batch => |batch| try retained.put(batch.payload_hash, {}),
-                    else => {},
-                },
-                .stop => {},
+        for (&self.log.core.durable.cells) |*cell| {
+            if (cell.slot == 0) continue;
+            if (cell.accepted) |vote| {
+                switch (vote.value) {
+                    .command => |cmd| switch (cmd) {
+                        .transaction_batch => |batch| try retained.put(batch.payload_hash, {}),
+                        else => {},
+                    },
+                    .stop => {},
+                }
             }
-        }
-        for (self.log.core.durable.committed) |committed| {
-            const value = committed orelse continue;
-            switch (value) {
-                .command => |cmd| switch (cmd) {
-                    .transaction_batch => |batch| try retained.put(batch.payload_hash, {}),
-                    else => {},
-                },
-                .stop => {},
+            if (cell.committed) |value| {
+                switch (value) {
+                    .command => |cmd| switch (cmd) {
+                        .transaction_batch => |batch| try retained.put(batch.payload_hash, {}),
+                        else => {},
+                    },
+                    .stop => {},
+                }
             }
         }
     }

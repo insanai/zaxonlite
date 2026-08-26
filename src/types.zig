@@ -7,8 +7,10 @@ const command = @import("command.zig");
 
 pub const Command = command.Command;
 
-/// Compile-time bounds for the replicated command log. `max_entries` is the
-/// hard epoch capacity; the host must checkpoint before it is reached.
+/// Compile-time bounds for the replicated command log. `window_slots` is the
+/// consensus window; while the host never advances the core's memory floor
+/// it acts as a hard epoch capacity and the host must checkpoint before it
+/// is reached (the ZDS 0011 trim path replaces that rollover).
 pub const log_options = paxos.ReplicatedLogOptions{
     // This is a voter bound, not a total-node bound. Non-voting learners and
     // gateways live in the runtime product registry and do not consume these
@@ -20,7 +22,7 @@ pub const log_options = paxos.ReplicatedLogOptions{
     // four checkpoint/re-election pauses dominated sustained write latency
     // even though the steady-state commit path was faster. The bound remains
     // deliberately small compared with an unbounded database log.
-    .max_entries = 2048,
+    .window_slots = 2048,
     .max_batch = 16,
     // 512 holds zx2 stop metadata: checkpoint name, manifest digest,
     // next-registry digest, and the bounded replacement seed.
