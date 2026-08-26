@@ -23,6 +23,8 @@ pub const history = @import("history.zig");
 pub const applied_anchor = @import("applied_anchor.zig");
 /// Immutable journal v2 segments with sealed trailers (ZDS 0011).
 pub const segment = @import("segment.zig");
+/// The authoritative retained-segment manifest for journal v2 (ZDS 0011).
+pub const manifest = @import("manifest.zig");
 /// Framed, checksummed, append-only protocol journal: the authoritative state.
 pub const journal = @import("journal.zig");
 /// Content-addressed, immutable transaction payload store (SHA-256 named).
@@ -132,6 +134,7 @@ test {
     _ = @import("history.zig");
     _ = @import("applied_anchor.zig");
     _ = @import("segment.zig");
+    _ = @import("manifest.zig");
     _ = @import("journal.zig");
     _ = @import("payload_store.zig");
     _ = @import("checkpoint_proof.zig");
