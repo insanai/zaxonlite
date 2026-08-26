@@ -17,6 +17,8 @@ pub const command = @import("command.zig");
 pub const Command = command.Command;
 /// The one concrete ReplicatedLog instantiation and its entry/write encodings.
 pub const types = @import("types.zig");
+/// The global ordered-history anchor over every chosen entry (ZDS 0011).
+pub const history = @import("history.zig");
 /// Framed, checksummed, append-only protocol journal: the authoritative state.
 pub const journal = @import("journal.zig");
 /// Content-addressed, immutable transaction payload store (SHA-256 named).
@@ -123,6 +125,7 @@ pub const EmbeddedOpenOptions = embedded.OpenOptions;
 test {
     _ = @import("command.zig");
     _ = @import("types.zig");
+    _ = @import("history.zig");
     _ = @import("journal.zig");
     _ = @import("payload_store.zig");
     _ = @import("checkpoint_proof.zig");
