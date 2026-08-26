@@ -25,6 +25,8 @@ pub const applied_anchor = @import("applied_anchor.zig");
 pub const segment = @import("segment.zig");
 /// The authoritative retained-segment manifest for journal v2 (ZDS 0011).
 pub const manifest = @import("manifest.zig");
+/// Conservative trim policy and the durable TRIM record (ZDS 0011).
+pub const trim = @import("trim.zig");
 /// Framed, checksummed, append-only protocol journal: the authoritative state.
 pub const journal = @import("journal.zig");
 /// Content-addressed, immutable transaction payload store (SHA-256 named).
@@ -135,6 +137,7 @@ test {
     _ = @import("applied_anchor.zig");
     _ = @import("segment.zig");
     _ = @import("manifest.zig");
+    _ = @import("trim.zig");
     _ = @import("journal.zig");
     _ = @import("payload_store.zig");
     _ = @import("checkpoint_proof.zig");
