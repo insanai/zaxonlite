@@ -2889,7 +2889,10 @@ pub const Node = struct {
         for (committed) |entry| {
             switch (entry.value) {
                 .command => |cmd| switch (cmd) {
-                    .noop, .read_barrier => {
+                    // Trim and lease records occupy slots like noops here;
+                    // their retention side effects land with the ZDS 0011
+                    // trim orchestration.
+                    .noop, .read_barrier, .trim, .transfer_lease, .lease_complete => {
                         if (self.capture_batch_id != null) {
                             // Our captured write lost its slot; the live
                             // WAL contains frames the log never decided.
@@ -3071,7 +3074,9 @@ pub const Node = struct {
             const entry = self.log.read(slot) orelse return error.MissingCommitted;
             switch (entry) {
                 .command => |cmd| switch (cmd) {
-                    .noop, .read_barrier => {},
+                    // Trim and lease records change retention state, never
+                    // the materialized image; replay skips them like noops.
+                    .noop, .read_barrier, .trim, .transfer_lease, .lease_complete => {},
                     .transaction_batch => |batch| {
                         if (batch.database_id != self.identity.database_id or
                             !std.mem.eql(u8, &batch.base_chain_hash, &self.last_chain) or
