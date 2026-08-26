@@ -42,8 +42,9 @@ pub const max_entry_size = blk: {
 
 pub const ballot_size = 8 + 4 + 4;
 
-/// Maximum canonical encoded size of one `Write` payload.
-pub const max_write_size = 1 + ballot_size + 4 + max_entry_size;
+/// Maximum canonical encoded size of one `Write` payload. The slot is a
+/// 64-bit global instance number (ZDS 0011).
+pub const max_write_size = 1 + ballot_size + 8 + max_entry_size;
 
 pub const DecodeError = command.DecodeError || error{
     InvalidEntryTag,
@@ -133,12 +134,12 @@ pub fn encodeWrite(write: Write, writer: *Cursor) void {
         .accept => |accept| {
             writer.byte(1);
             encodeBallot(accept.ballot, writer);
-            writer.int(u32, accept.slot);
+            writer.int(u64, accept.slot);
             encodeEntry(accept.value, writer);
         },
         .commit => |commit| {
             writer.byte(2);
-            writer.int(u32, commit.slot);
+            writer.int(u64, commit.slot);
             encodeEntry(commit.value, writer);
         },
     }
@@ -151,11 +152,11 @@ pub fn decodeWrite(buffer: []const u8) DecodeError!Write {
         0 => .{ .promise = try decodeBallot(&reader) },
         1 => .{ .accept = .{
             .ballot = try decodeBallot(&reader),
-            .slot = try reader.int(u32),
+            .slot = try reader.int(u64),
             .value = try decodeEntry(&reader),
         } },
         2 => .{ .commit = .{
-            .slot = try reader.int(u32),
+            .slot = try reader.int(u64),
             .value = try decodeEntry(&reader),
         } },
         else => return error.InvalidWriteTag,

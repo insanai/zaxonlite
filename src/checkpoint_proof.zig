@@ -124,8 +124,8 @@ pub fn create(
     cursor.int(u128, database_id);
     cursor.int(u64, sealed_configuration_id);
     cursor.int(u64, next_configuration_id);
-    cursor.int(u32, stop_slot);
-    cursor.int(u32, applied_slot);
+    cursor.int(u64, stop_slot);
+    cursor.int(u64, applied_slot);
     cursor.bytes(&chain);
     cursor.bytes(&manifest_sha256);
     cursor.bytes(&next_registry_digest);
@@ -153,8 +153,8 @@ pub fn decode(bytes: []const u8) !Proof {
             return error.InvalidCheckpointProof,
         .next_configuration_id = reader.int(u64) catch
             return error.InvalidCheckpointProof,
-        .stop_slot = reader.int(u32) catch return error.InvalidCheckpointProof,
-        .applied_slot = reader.int(u32) catch return error.InvalidCheckpointProof,
+        .stop_slot = reader.int(u64) catch return error.InvalidCheckpointProof,
+        .applied_slot = reader.int(u64) catch return error.InvalidCheckpointProof,
         .chain = undefined,
         .manifest_sha256 = undefined,
         .next_registry_digest = undefined,

@@ -279,11 +279,11 @@ pub const LearnerHeartbeat = struct {
     configuration_id: u64,
     decided_through: paxos.Slot,
 
-    pub const encoded_size = 8 + 4;
+    pub const encoded_size = 8 + 8;
 
     pub fn encode(self: LearnerHeartbeat, buffer: *[encoded_size]u8) []const u8 {
         std.mem.writeInt(u64, buffer[0..8], self.configuration_id, .little);
-        std.mem.writeInt(u32, buffer[8..12], self.decided_through, .little);
+        std.mem.writeInt(u64, buffer[8..16], self.decided_through, .little);
         return buffer;
     }
 
@@ -293,7 +293,7 @@ pub const LearnerHeartbeat = struct {
         if (configuration_id == 0) return error.InvalidFrame;
         return .{
             .configuration_id = configuration_id,
-            .decided_through = std.mem.readInt(u32, body[8..12], .little),
+            .decided_through = std.mem.readInt(u64, body[8..16], .little),
         };
     }
 };
@@ -306,7 +306,7 @@ pub const LearnerCommit = struct {
     pub fn encode(self: LearnerCommit, buffer: *[encoded_max]u8) []const u8 {
         var cursor = types.Cursor{ .buffer = buffer };
         cursor.int(u64, self.configuration_id);
-        cursor.int(u32, self.slot);
+        cursor.int(u64, self.slot);
         types.encodeEntry(self.entry, &cursor);
         return buffer[0..cursor.offset];
     }
@@ -314,7 +314,7 @@ pub const LearnerCommit = struct {
     pub fn decode(body: []const u8) WireError!LearnerCommit {
         var reader = types.ReadCursor{ .buffer = body };
         const configuration_id = try reader.int(u64);
-        const slot = try reader.int(u32);
+        const slot = try reader.int(u64);
         const entry = try types.decodeEntry(&reader);
         if (configuration_id == 0 or slot == 0 or reader.offset != body.len) {
             return error.InvalidFrame;
@@ -326,7 +326,7 @@ pub const LearnerCommit = struct {
         };
     }
 
-    pub const encoded_max = 8 + 4 + types.max_entry_size;
+    pub const encoded_max = 8 + 8 + types.max_entry_size;
 };
 
 pub const BackupBegin = struct {
@@ -423,52 +423,52 @@ pub fn encodeEnvelope(
         .prepare => |m| {
             cursor.byte(@intFromEnum(MessageTag.prepare));
             types.encodeBallot(m.ballot, &cursor);
-            cursor.int(u32, m.decided_through);
+            cursor.int(u64, m.decided_through);
         },
         .promise => |m| {
             cursor.byte(@intFromEnum(MessageTag.promise));
             types.encodeBallot(m.ballot, &cursor);
-            cursor.int(u32, m.slot);
+            cursor.int(u64, m.slot);
             types.encodeBallot(m.accepted.ballot, &cursor);
             types.encodeEntry(m.accepted.value, &cursor);
         },
         .promise_done => |m| {
             cursor.byte(@intFromEnum(MessageTag.promise_done));
             types.encodeBallot(m.ballot, &cursor);
-            cursor.int(u32, m.accepted_count);
-            cursor.int(u32, m.decided_through);
+            cursor.int(u64, m.accepted_count);
+            cursor.int(u64, m.decided_through);
         },
         .accept => |m| {
             cursor.byte(@intFromEnum(MessageTag.accept));
             types.encodeBallot(m.ballot, &cursor);
-            cursor.int(u32, m.slot);
+            cursor.int(u64, m.slot);
             types.encodeEntry(m.value, &cursor);
         },
         .accepted => |m| {
             cursor.byte(@intFromEnum(MessageTag.accepted));
             types.encodeBallot(m.ballot, &cursor);
-            cursor.int(u32, m.slot);
-            cursor.int(u32, m.decided_through);
+            cursor.int(u64, m.slot);
+            cursor.int(u64, m.decided_through);
         },
         .commit => |m| {
             cursor.byte(@intFromEnum(MessageTag.commit));
-            cursor.int(u32, m.slot);
+            cursor.int(u64, m.slot);
             types.encodeEntry(m.value, &cursor);
         },
         .learn => |m| {
             cursor.byte(@intFromEnum(MessageTag.learn));
-            cursor.int(u32, m.from_slot);
+            cursor.int(u64, m.from_slot);
         },
         .nack => |m| {
             cursor.byte(@intFromEnum(MessageTag.nack));
             types.encodeBallot(m.rejected, &cursor);
             types.encodeBallot(m.promised, &cursor);
-            cursor.int(u32, m.decided_through);
+            cursor.int(u64, m.decided_through);
         },
         .heartbeat => |m| {
             cursor.byte(@intFromEnum(MessageTag.heartbeat));
             types.encodeBallot(m.ballot, &cursor);
-            cursor.int(u32, m.decided_through);
+            cursor.int(u64, m.decided_through);
         },
     }
     return buffer[0..cursor.offset];
@@ -484,11 +484,11 @@ pub fn decodeEnvelope(body: []const u8) WireError!types.Log.Envelope {
     const message: types.Log.Message = switch (tag) {
         .prepare => .{ .prepare = .{
             .ballot = try types.decodeBallot(&reader),
-            .decided_through = try reader.int(u32),
+            .decided_through = try reader.int(u64),
         } },
         .promise => .{ .promise = .{
             .ballot = try types.decodeBallot(&reader),
-            .slot = try reader.int(u32),
+            .slot = try reader.int(u64),
             .accepted = .{
                 .ballot = try types.decodeBallot(&reader),
                 .value = try types.decodeEntry(&reader),
@@ -496,34 +496,34 @@ pub fn decodeEnvelope(body: []const u8) WireError!types.Log.Envelope {
         } },
         .promise_done => .{ .promise_done = .{
             .ballot = try types.decodeBallot(&reader),
-            .accepted_count = try reader.int(u32),
-            .decided_through = try reader.int(u32),
+            .accepted_count = try reader.int(u64),
+            .decided_through = try reader.int(u64),
         } },
         .accept => .{ .accept = .{
             .ballot = try types.decodeBallot(&reader),
-            .slot = try reader.int(u32),
+            .slot = try reader.int(u64),
             .value = try types.decodeEntry(&reader),
         } },
         .accepted => .{ .accepted = .{
             .ballot = try types.decodeBallot(&reader),
-            .slot = try reader.int(u32),
-            .decided_through = try reader.int(u32),
+            .slot = try reader.int(u64),
+            .decided_through = try reader.int(u64),
         } },
         .commit => .{ .commit = .{
-            .slot = try reader.int(u32),
+            .slot = try reader.int(u64),
             .value = try types.decodeEntry(&reader),
         } },
         .learn => .{ .learn = .{
-            .from_slot = try reader.int(u32),
+            .from_slot = try reader.int(u64),
         } },
         .nack => .{ .nack = .{
             .rejected = try types.decodeBallot(&reader),
             .promised = try types.decodeBallot(&reader),
-            .decided_through = try reader.int(u32),
+            .decided_through = try reader.int(u64),
         } },
         .heartbeat => .{ .heartbeat = .{
             .ballot = try types.decodeBallot(&reader),
-            .decided_through = try reader.int(u32),
+            .decided_through = try reader.int(u64),
         } },
     };
     if (reader.offset != body.len) return error.InvalidFrame;
@@ -558,13 +558,13 @@ pub const FenceRequest = struct {
     fence_id: u64,
     fence_slot: paxos.Slot,
 
-    pub const encoded_size = types.ballot_size + 8 + 4;
+    pub const encoded_size = types.ballot_size + 8 + 8;
 
     pub fn encode(self: FenceRequest, buffer: *[encoded_size]u8) []const u8 {
         var cursor = types.Cursor{ .buffer = buffer };
         types.encodeBallot(self.ballot, &cursor);
         cursor.int(u64, self.fence_id);
-        cursor.int(u32, self.fence_slot);
+        cursor.int(u64, self.fence_slot);
         return buffer[0..cursor.offset];
     }
 
@@ -574,7 +574,7 @@ pub const FenceRequest = struct {
         return .{
             .ballot = try types.decodeBallot(&reader),
             .fence_id = try reader.int(u64),
-            .fence_slot = try reader.int(u32),
+            .fence_slot = try reader.int(u64),
         };
     }
 };
@@ -934,7 +934,7 @@ test "decode rejects malformed envelopes" {
         decodeEnvelope(extended[0 .. encoded.len + 1]),
     );
     // An unknown message tag is rejected.
-    var bad_tag: [16]u8 = undefined;
+    var bad_tag: [max_envelope_size]u8 = undefined;
     @memcpy(bad_tag[0..encoded.len], encoded);
     bad_tag[8] = 0xff;
     try testing.expectError(error.InvalidFrame, decodeEnvelope(bad_tag[0..encoded.len]));
