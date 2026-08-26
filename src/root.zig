@@ -19,6 +19,8 @@ pub const Command = command.Command;
 pub const types = @import("types.zig");
 /// The global ordered-history anchor over every chosen entry (ZDS 0011).
 pub const history = @import("history.zig");
+/// Alternating durable applied-state anchors for SQLite recovery (ZDS 0011).
+pub const applied_anchor = @import("applied_anchor.zig");
 /// Framed, checksummed, append-only protocol journal: the authoritative state.
 pub const journal = @import("journal.zig");
 /// Content-addressed, immutable transaction payload store (SHA-256 named).
@@ -126,6 +128,7 @@ test {
     _ = @import("command.zig");
     _ = @import("types.zig");
     _ = @import("history.zig");
+    _ = @import("applied_anchor.zig");
     _ = @import("journal.zig");
     _ = @import("payload_store.zig");
     _ = @import("checkpoint_proof.zig");
