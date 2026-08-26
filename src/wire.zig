@@ -74,6 +74,9 @@ pub const FrameKind = enum(u8) {
     registry_request = 25,
     registry_data = 26,
     installation_ready = 27,
+    state_report = 28,
+    range_request = 29,
+    range_data = 30,
 };
 
 /// A replacement sends this only after its snapshot and decided registry
@@ -715,6 +718,219 @@ pub const SnapshotChunk = struct {
 };
 
 // ----------------------------------------------------------------------
+// Progress frontiers and bounded range recovery (ZDS 0011)
+// ----------------------------------------------------------------------
+
+/// One replica's progress report. Data replicas send it after each
+/// durable state-anchor publish and on the regular tick; the sender's
+/// identity comes from the authenticated connection. `durable_state_slot`
+/// is the only field that may authorize trimming; `executed_slot` and the
+/// rest exist for lag monitoring and status.
+pub const StateReport = struct {
+    configuration_id: u64,
+    durable_state_slot: u64,
+    history_hash: [32]u8,
+    executed_slot: u64,
+    persisted_slot: u64,
+    local_delete_floor: u64,
+    retained_first_slot: u64,
+
+    pub const encoded_size = 8 * 6 + 32;
+
+    pub fn encode(self: StateReport, buffer: *[encoded_size]u8) []const u8 {
+        var cursor = types.Cursor{ .buffer = buffer };
+        cursor.int(u64, self.configuration_id);
+        cursor.int(u64, self.durable_state_slot);
+        cursor.bytes(&self.history_hash);
+        cursor.int(u64, self.executed_slot);
+        cursor.int(u64, self.persisted_slot);
+        cursor.int(u64, self.local_delete_floor);
+        cursor.int(u64, self.retained_first_slot);
+        return buffer[0..cursor.offset];
+    }
+
+    pub fn decode(body: []const u8) WireError!StateReport {
+        if (body.len != encoded_size) return error.InvalidFrame;
+        var reader = types.ReadCursor{ .buffer = body };
+        var report = StateReport{
+            .configuration_id = reader.int(u64) catch return error.InvalidFrame,
+            .durable_state_slot = reader.int(u64) catch return error.InvalidFrame,
+            .history_hash = undefined,
+            .executed_slot = undefined,
+            .persisted_slot = undefined,
+            .local_delete_floor = undefined,
+            .retained_first_slot = undefined,
+        };
+        const hash = reader.take(32) catch return error.InvalidFrame;
+        @memcpy(&report.history_hash, hash);
+        report.executed_slot = reader.int(u64) catch return error.InvalidFrame;
+        report.persisted_slot = reader.int(u64) catch return error.InvalidFrame;
+        report.local_delete_floor = reader.int(u64) catch return error.InvalidFrame;
+        report.retained_first_slot = reader.int(u64) catch return error.InvalidFrame;
+        if (report.configuration_id == 0) return error.InvalidFrame;
+        if (report.durable_state_slot > report.executed_slot) return error.InvalidFrame;
+        return report;
+    }
+};
+
+/// Upper bound on records in one range exchange; matches the bounded
+/// recovery chunk the core drives.
+pub const max_range_records: usize = 256;
+
+/// Asks a peer for chosen journal evidence beginning at `first_slot`.
+pub const RangeRequest = struct {
+    configuration_id: u64,
+    first_slot: u64,
+    count: u32,
+    /// How many further chunks the requester is ready to receive without
+    /// another request; pipelining credit, not an obligation.
+    credit: u8,
+
+    pub const encoded_size = 8 + 8 + 4 + 1;
+
+    pub fn encode(self: RangeRequest, buffer: *[encoded_size]u8) []const u8 {
+        var cursor = types.Cursor{ .buffer = buffer };
+        cursor.int(u64, self.configuration_id);
+        cursor.int(u64, self.first_slot);
+        cursor.int(u32, self.count);
+        cursor.byte(self.credit);
+        return buffer[0..cursor.offset];
+    }
+
+    pub fn decode(body: []const u8) WireError!RangeRequest {
+        if (body.len != encoded_size) return error.InvalidFrame;
+        var reader = types.ReadCursor{ .buffer = body };
+        const request = RangeRequest{
+            .configuration_id = reader.int(u64) catch return error.InvalidFrame,
+            .first_slot = reader.int(u64) catch return error.InvalidFrame,
+            .count = reader.int(u32) catch return error.InvalidFrame,
+            .credit = reader.byte() catch return error.InvalidFrame,
+        };
+        if (request.configuration_id == 0 or request.first_slot == 0) {
+            return error.InvalidFrame;
+        }
+        if (request.count == 0 or request.count > max_range_records) {
+            return error.InvalidFrame;
+        }
+        return request;
+    }
+};
+
+/// Chosen journal evidence for a bounded slot range. Records are framed
+/// inside the body as `slot u64, kind u8, len u16, bytes`; `more` tells
+/// the requester another chunk follows under its credit.
+pub const RangeData = struct {
+    configuration_id: u64,
+    first_slot: u64,
+    more: bool,
+    record_count: u16,
+    records: []const u8,
+
+    /// A chosen entry, encoded with `types.encodeEntry`.
+    pub const record_kind_chosen: u8 = 0;
+
+    const record_overhead: usize = 8 + 1 + 2;
+
+    pub const max_encoded_size = 8 + 8 + 1 + 2 +
+        max_range_records * (record_overhead + types.max_entry_size);
+
+    pub const Record = struct {
+        slot: u64,
+        kind: u8,
+        entry_bytes: []const u8,
+    };
+
+    /// Appends records into a caller-owned buffer, then finishes into the
+    /// encoded frame body.
+    pub const Encoder = struct {
+        cursor: types.Cursor,
+        count: u16,
+
+        pub fn add(self: *Encoder, slot: u64, kind: u8, entry_bytes: []const u8) void {
+            std.debug.assert(self.count < max_range_records);
+            std.debug.assert(entry_bytes.len <= types.max_entry_size);
+            std.debug.assert(slot != 0);
+            self.cursor.int(u64, slot);
+            self.cursor.byte(kind);
+            self.cursor.int(u16, @intCast(entry_bytes.len));
+            self.cursor.bytes(entry_bytes);
+            self.count += 1;
+        }
+
+        pub fn finish(self: *Encoder, more: bool) []const u8 {
+            const buffer = self.cursor.buffer;
+            std.mem.writeInt(u16, buffer[17..][0..2], self.count, .little);
+            buffer[16] = @intFromBool(more);
+            return buffer[0..self.cursor.offset];
+        }
+    };
+
+    pub fn encoder(
+        buffer: []u8,
+        configuration_id: u64,
+        first_slot: u64,
+    ) Encoder {
+        std.debug.assert(buffer.len >= max_encoded_size);
+        var cursor = types.Cursor{ .buffer = buffer };
+        cursor.int(u64, configuration_id);
+        cursor.int(u64, first_slot);
+        cursor.byte(0);
+        cursor.int(u16, 0);
+        return .{ .cursor = cursor, .count = 0 };
+    }
+
+    pub fn decode(body: []const u8) WireError!RangeData {
+        var reader = types.ReadCursor{ .buffer = body };
+        const configuration_id = reader.int(u64) catch return error.InvalidFrame;
+        const first_slot = reader.int(u64) catch return error.InvalidFrame;
+        const more_raw = reader.byte() catch return error.InvalidFrame;
+        const record_count = reader.int(u16) catch return error.InvalidFrame;
+        if (configuration_id == 0 or first_slot == 0 or more_raw > 1) {
+            return error.InvalidFrame;
+        }
+        if (record_count > max_range_records) return error.InvalidFrame;
+        const data = RangeData{
+            .configuration_id = configuration_id,
+            .first_slot = first_slot,
+            .more = more_raw == 1,
+            .record_count = record_count,
+            .records = body[reader.offset..],
+        };
+        // Every record must parse and the region must end exactly.
+        var it = data.iterator();
+        var seen: u16 = 0;
+        while (try it.next()) |_| seen += 1;
+        if (seen != record_count) return error.InvalidFrame;
+        return data;
+    }
+
+    pub fn iterator(self: *const RangeData) Iterator {
+        return .{ .reader = .{ .buffer = self.records }, .remaining = self.record_count };
+    }
+
+    pub const Iterator = struct {
+        reader: types.ReadCursor,
+        remaining: u16,
+
+        pub fn next(self: *Iterator) WireError!?Record {
+            if (self.remaining == 0) {
+                if (self.reader.offset != self.reader.buffer.len) {
+                    return error.InvalidFrame;
+                }
+                return null;
+            }
+            self.remaining -= 1;
+            const slot = self.reader.int(u64) catch return error.InvalidFrame;
+            const kind = self.reader.byte() catch return error.InvalidFrame;
+            const len = self.reader.int(u16) catch return error.InvalidFrame;
+            if (slot == 0 or len > types.max_entry_size) return error.InvalidFrame;
+            const bytes = self.reader.take(len) catch return error.InvalidFrame;
+            return .{ .slot = slot, .kind = kind, .entry_bytes = bytes };
+        }
+    };
+};
+
+// ----------------------------------------------------------------------
 // Frame reading and writing
 // ----------------------------------------------------------------------
 
@@ -938,6 +1154,71 @@ test "decode rejects malformed envelopes" {
     @memcpy(bad_tag[0..encoded.len], encoded);
     bad_tag[8] = 0xff;
     try testing.expectError(error.InvalidFrame, decodeEnvelope(bad_tag[0..encoded.len]));
+}
+
+test "state report round trips and rejects an impossible frontier" {
+    const report = StateReport{
+        .configuration_id = 3,
+        .durable_state_slot = 90,
+        .history_hash = [_]u8{7} ** 32,
+        .executed_slot = 95,
+        .persisted_slot = 99,
+        .local_delete_floor = 80,
+        .retained_first_slot = 81,
+    };
+    var buffer: [StateReport.encoded_size]u8 = undefined;
+    try testing.expectEqualDeep(report, try StateReport.decode(report.encode(&buffer)));
+
+    // A durable-state claim past the executed image is never accepted.
+    var impossible = report;
+    impossible.durable_state_slot = 96;
+    _ = impossible.encode(&buffer);
+    try testing.expectError(error.InvalidFrame, StateReport.decode(&buffer));
+}
+
+test "range frames round trip and bound their records" {
+    const request = RangeRequest{
+        .configuration_id = 3,
+        .first_slot = 500,
+        .count = 128,
+        .credit = 4,
+    };
+    var request_buffer: [RangeRequest.encoded_size]u8 = undefined;
+    try testing.expectEqualDeep(
+        request,
+        try RangeRequest.decode(request.encode(&request_buffer)),
+    );
+    var oversized = request;
+    oversized.count = max_range_records + 1;
+    _ = oversized.encode(&request_buffer);
+    try testing.expectError(error.InvalidFrame, RangeRequest.decode(&request_buffer));
+
+    var entry_bytes: [types.max_entry_size]u8 = undefined;
+    var cursor = types.Cursor{ .buffer = &entry_bytes };
+    types.encodeEntry(.{ .command = .noop }, &cursor);
+    const encoded_entry = entry_bytes[0..cursor.offset];
+
+    var body: [RangeData.max_encoded_size]u8 = undefined;
+    var encoder = RangeData.encoder(&body, 3, 500);
+    encoder.add(500, RangeData.record_kind_chosen, encoded_entry);
+    encoder.add(501, RangeData.record_kind_chosen, encoded_entry);
+    const encoded = encoder.finish(true);
+
+    const data = try RangeData.decode(encoded);
+    try testing.expectEqual(@as(u16, 2), data.record_count);
+    try testing.expect(data.more);
+    var it = data.iterator();
+    const first = (try it.next()).?;
+    try testing.expectEqual(@as(u64, 500), first.slot);
+    try testing.expectEqualSlices(u8, encoded_entry, first.entry_bytes);
+    try testing.expectEqual(@as(u64, 501), (try it.next()).?.slot);
+    try testing.expectEqual(@as(?RangeData.Record, null), try it.next());
+
+    // Truncating the record region is rejected at decode.
+    try testing.expectError(
+        error.InvalidFrame,
+        RangeData.decode(encoded[0 .. encoded.len - 1]),
+    );
 }
 
 test "fence frames round trip" {
