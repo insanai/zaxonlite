@@ -406,7 +406,7 @@ pub const Hello = struct {
 const MessageTag = enum(u8) {
     prepare = 0,
     promise = 1,
-    promise_done = 2,
+    promise_range = 2,
     accept = 3,
     accepted = 4,
     commit = 5,
@@ -426,7 +426,7 @@ pub fn encodeEnvelope(
         .prepare => |m| {
             cursor.byte(@intFromEnum(MessageTag.prepare));
             types.encodeBallot(m.ballot, &cursor);
-            cursor.int(u64, m.decided_through);
+            cursor.int(u64, m.first);
         },
         .promise => |m| {
             cursor.byte(@intFromEnum(MessageTag.promise));
@@ -435,11 +435,17 @@ pub fn encodeEnvelope(
             types.encodeBallot(m.accepted.ballot, &cursor);
             types.encodeEntry(m.accepted.value, &cursor);
         },
-        .promise_done => |m| {
-            cursor.byte(@intFromEnum(MessageTag.promise_done));
+        .promise_range => |m| {
+            cursor.byte(@intFromEnum(MessageTag.promise_range));
             types.encodeBallot(m.ballot, &cursor);
-            cursor.int(u64, m.accepted_count);
-            cursor.int(u64, m.decided_through);
+            cursor.int(u64, m.anchor.trim_id);
+            cursor.int(u64, m.anchor.chosen_trim_slot);
+            cursor.bytes(&m.anchor.history_hash);
+            cursor.int(u64, m.chosen_through);
+            cursor.int(u64, m.first);
+            cursor.int(u64, m.last);
+            cursor.int(u32, m.accepted_count);
+            cursor.byte(@intFromBool(m.more));
         },
         .accept => |m| {
             cursor.byte(@intFromEnum(MessageTag.accept));
@@ -461,6 +467,7 @@ pub fn encodeEnvelope(
         .learn => |m| {
             cursor.byte(@intFromEnum(MessageTag.learn));
             cursor.int(u64, m.from_slot);
+            cursor.int(u32, m.count);
         },
         .nack => |m| {
             cursor.byte(@intFromEnum(MessageTag.nack));
@@ -487,7 +494,7 @@ pub fn decodeEnvelope(body: []const u8) WireError!types.Log.Envelope {
     const message: types.Log.Message = switch (tag) {
         .prepare => .{ .prepare = .{
             .ballot = try types.decodeBallot(&reader),
-            .decided_through = try reader.int(u64),
+            .first = try reader.int(u64),
         } },
         .promise => .{ .promise = .{
             .ballot = try types.decodeBallot(&reader),
@@ -497,11 +504,32 @@ pub fn decodeEnvelope(body: []const u8) WireError!types.Log.Envelope {
                 .value = try types.decodeEntry(&reader),
             },
         } },
-        .promise_done => .{ .promise_done = .{
-            .ballot = try types.decodeBallot(&reader),
-            .accepted_count = try reader.int(u64),
-            .decided_through = try reader.int(u64),
-        } },
+        .promise_range => blk: {
+            var message = types.Log.Message{ .promise_range = .{
+                .ballot = try types.decodeBallot(&reader),
+                .anchor = .{
+                    .trim_id = try reader.int(u64),
+                    .chosen_trim_slot = try reader.int(u64),
+                    .history_hash = undefined,
+                },
+                .chosen_through = 0,
+                .first = 0,
+                .last = 0,
+                .accepted_count = 0,
+                .more = false,
+            } };
+            const range = &message.promise_range;
+            const hash = try reader.take(32);
+            @memcpy(&range.anchor.history_hash, hash);
+            range.chosen_through = try reader.int(u64);
+            range.first = try reader.int(u64);
+            range.last = try reader.int(u64);
+            range.accepted_count = try reader.int(u32);
+            const more_raw = try reader.byte();
+            if (more_raw > 1) return error.InvalidFrame;
+            range.more = more_raw == 1;
+            break :blk message;
+        },
         .accept => .{ .accept = .{
             .ballot = try types.decodeBallot(&reader),
             .slot = try reader.int(u64),
@@ -518,6 +546,7 @@ pub fn decodeEnvelope(body: []const u8) WireError!types.Log.Envelope {
         } },
         .learn => .{ .learn = .{
             .from_slot = try reader.int(u64),
+            .count = try reader.int(u32),
         } },
         .nack => .{ .nack = .{
             .rejected = try types.decodeBallot(&reader),
@@ -1050,21 +1079,29 @@ test "every envelope kind round trips" {
     };
     const entry = types.Entry{ .command = .{ .transaction_batch = batch } };
     const cases = [_]types.Log.Message{
-        .{ .prepare = .{ .ballot = ballot, .decided_through = 7 } },
+        .{ .prepare = .{ .ballot = ballot, .first = 8 } },
         .{ .promise = .{
             .ballot = ballot,
             .slot = 2,
             .accepted = .{ .ballot = ballot, .value = entry },
         } },
-        .{ .promise_done = .{
+        .{ .promise_range = .{
             .ballot = ballot,
+            .anchor = .{
+                .trim_id = 2,
+                .chosen_trim_slot = 6,
+                .history_hash = [_]u8{9} ** 32,
+            },
+            .chosen_through = 7,
+            .first = 8,
+            .last = 71,
             .accepted_count = 3,
-            .decided_through = 1,
+            .more = true,
         } },
         .{ .accept = .{ .ballot = ballot, .slot = 9, .value = entry } },
         .{ .accepted = .{ .ballot = ballot, .slot = 9, .decided_through = 8 } },
         .{ .commit = .{ .slot = 9, .value = entry } },
-        .{ .learn = .{ .from_slot = 3 } },
+        .{ .learn = .{ .from_slot = 3, .count = 64 } },
         .{ .nack = .{
             .rejected = ballot,
             .promised = ballot,
@@ -1138,7 +1175,7 @@ test "decode rejects malformed envelopes" {
     const envelope = types.Log.Envelope{
         .from = 1,
         .to = 2,
-        .message = .{ .learn = .{ .from_slot = 3 } },
+        .message = .{ .learn = .{ .from_slot = 3, .count = 64 } },
     };
     const encoded = encodeEnvelope(envelope, &buffer);
     // Trailing garbage is rejected.
