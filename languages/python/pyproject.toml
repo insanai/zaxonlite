@@ -1,6 +1,6 @@
 [project]
 name = "zxlite"
-version = "0.3.0"
+version = "0.4.0"
 description = "Native DB-API 2.0 and SQLAlchemy driver for replicated zaxonlite"
 readme = "README.md"
 license = "MIT"
