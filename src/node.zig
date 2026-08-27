@@ -99,6 +99,15 @@ pub const OpenOptions = struct {
     /// opens. Zero (the default) disables mmap; a nonzero value is an
     /// explicit operator opt-in bounded at 1 GiB (ZDS 0009).
     mmap_size: u64 = 0,
+    /// Retention horizon in slots: physical reclamation never deletes
+    /// the most recent `retention_slots` of applied history, even below
+    /// the chosen trim, so lagging replicas can range-recover without a
+    /// transfer. Zero keeps only what the trim requires (ZDS 0011).
+    retention_slots: u64 = 0,
+    /// Hard local storage ceiling in journal bytes: at or above it, new
+    /// writes are refused with `RecoveryRetentionExceeded` instead of
+    /// deleting unproven history. Zero disables the ceiling (ZDS 0011).
+    journal_cap_bytes: u64 = 0,
 };
 
 pub const SessionError = error{
@@ -565,6 +574,14 @@ pub const Node = struct {
     test_storage_delay_ms: u64 = 0,
     /// Operator-selected mapped-I/O limit applied to every connection.
     mmap_size: u64 = 0,
+    /// Retention horizon in slots kept below the chosen trim; zero
+    /// keeps only what the trim requires.
+    retention_slots: u64 = 0,
+    /// Hard journal-byte ceiling refusing writes; zero disables.
+    journal_cap_bytes: u64 = 0,
+    /// When the last durable state anchor published, for the 30-second
+    /// cadence trigger; zero until the first anchor of this process.
+    last_anchor_ns: i96 = 0,
     /// The limit SQLite actually accepted on the most recent connection.
     effective_mmap_size: i64 = 0,
     /// Recorded search-feature version of the served image; zero means
@@ -726,6 +743,8 @@ pub const Node = struct {
             .last_chain = command.genesisChain(identity.database_id),
             .test_storage_delay_ms = options.test_storage_delay_ms,
             .mmap_size = options.mmap_size,
+            .retention_slots = options.retention_slots,
+            .journal_cap_bytes = options.journal_cap_bytes,
         };
         @memcpy(self.members[0..members.len], members);
 
@@ -1635,6 +1654,8 @@ pub const Node = struct {
     /// Slots of execution beyond the durable anchor that trigger a new
     /// anchor (ZDS 0011 Q5).
     pub const anchor_interval_slots: paxos.Slot = 10_000;
+    pub const anchor_interval_ns: i96 = 30 * std.time.ns_per_s;
+    pub const anchor_wal_bytes: u64 = 64 * 1024 * 1024;
 
     /// Creates a durable state anchor: checkpoints the live WAL into the
     /// image, synchronizes it, and publishes the alternating APPLIED
@@ -1677,6 +1698,8 @@ pub const Node = struct {
         });
         self.durable_state_slot = self.applied_slot;
         self.history_hash_at_anchor = self.history_hash;
+        self.last_anchor_ns =
+            std.Io.Clock.Timestamp.now(self.io, .awake).raw.nanoseconds;
 
         // A one-member configuration is its own only data replica: the
         // conservative trim degenerates to the fresh anchor, chosen and
@@ -1787,10 +1810,16 @@ pub const Node = struct {
             self.durable_state_slot
         else
             self.trim_state.through_slot;
+        // The retention horizon keeps a recent suffix below the chosen
+        // trim so lagging replicas range-recover instead of transferring.
+        const retention_cutoff = if (self.retention_slots == 0)
+            std.math.maxInt(u64)
+        else
+            self.applied_slot -| self.retention_slots;
         const floor = trim.deleteFloor(
             self.trim_state.through_slot,
             durable_cap,
-            std.math.maxInt(u64),
+            retention_cutoff,
             self.trim_state.leasesSlice(),
         );
         if (floor == 0) return;
@@ -2013,18 +2042,32 @@ pub const Node = struct {
     }
 
     pub fn maybeCreateStateAnchor(self: *Node) !bool {
-        // A node with no anchor at all still recovers from genesis, so
-        // the first anchor publishes promptly; afterwards the slot
-        // cadence governs (ZDS 0011 Q5).
-        const first_anchor_due =
-            self.durable_state_slot == 0 and self.applied_slot > 0;
-        if (!first_anchor_due and
-            self.applied_slot < self.durable_state_slot + anchor_interval_slots)
-        {
-            return false;
-        }
+        if (!self.anchorDue()) return false;
         try self.createStateAnchor();
         return true;
+    }
+
+    /// The ZDS 0011 Q5 cadence: a node with no anchor at all still
+    /// recovers from genesis, so the first anchor publishes promptly;
+    /// afterwards an anchor is due every 10,000 applied slots, every 30
+    /// seconds, or when the uncheckpointed WAL reaches 64 MiB —
+    /// whichever arrives first, and only while new applied state exists
+    /// to anchor.
+    fn anchorDue(self: *Node) bool {
+        if (self.durable_state_slot == 0) return self.applied_slot > 0;
+        if (self.applied_slot <= self.durable_state_slot) return false;
+        if (self.applied_slot >= self.durable_state_slot + anchor_interval_slots) {
+            return true;
+        }
+        const now = std.Io.Clock.Timestamp.now(self.io, .awake).raw.nanoseconds;
+        if (self.last_anchor_ns != 0 and
+            now - self.last_anchor_ns >= anchor_interval_ns)
+        {
+            return true;
+        }
+        const wal_stat = self.dir.statFile(self.io, wal_file_name, .{}) catch
+            return false;
+        return wal_stat.size >= anchor_wal_bytes;
     }
 
     /// The batch identity chosen at `slot`, if it was a transaction batch
@@ -2641,6 +2684,15 @@ pub const Node = struct {
         capture: ?*WriteCapture,
     ) !ExecResult {
         if (self.fatal_storage_error) return error.StorageFailed;
+        // The storage-budget hard ceiling (ZDS 0011): past the
+        // configured journal cap, new writes are refused rather than
+        // unproven history deleted; a safe trim, a state transfer, or
+        // an operator capacity change restores service.
+        if (self.journal_cap_bytes != 0 and
+            self.journal.stats().journal_bytes >= self.journal_cap_bytes)
+        {
+            return error.RecoveryRetentionExceeded;
+        }
         if (self.needs_resync) try self.resyncImage();
         // Never execute SQL that cannot be appended: a sealed log would
         // otherwise leave a committed SQLite transaction with no slot.
