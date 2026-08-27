@@ -27,6 +27,7 @@ const paxos = @import("paxos");
 
 const command = @import("command.zig");
 const types = @import("types.zig");
+const trim = @import("trim.zig");
 const wire = @import("wire.zig");
 const transport_auth = @import("transport_auth.zig");
 const tls = @import("tls.zig");
@@ -997,6 +998,10 @@ pub const Server = struct {
     last_learner_heartbeat_tick: ?u64 = null,
     snapshot_source: ?paxos.NodeId = null,
     snapshot_requested_tick: u64 = 0,
+    /// Latest per-peer progress reports for trim coordination (ZDS 0011).
+    frontiers: [types.log_options.max_members]?trim.Frontier =
+        [_]?trim.Frontier{null} ** types.log_options.max_members,
+    last_reported_durable: paxos.Slot = 0,
     tick_count: u64 = 0,
     failed: bool = false,
     shutdown_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -1529,6 +1534,31 @@ pub const Server = struct {
             };
         }
 
+        // Broadcast a fresh progress report when the durable frontier
+        // moved; peers use only authenticated reports for trimming.
+        if (!self.retired and
+            self.node.durable_state_slot > self.last_reported_durable)
+        {
+            self.broadcastStateReport();
+        }
+
+        // The leader proposes a conservative trim when every data replica
+        // has reported and the minimum durable frontier advanced. The
+        // candidate only moves on anchor publishes, so this is naturally
+        // cadence-limited (ZDS 0011).
+        if (!self.retired and self.node.isLeader()) {
+            self.maybeProposeTrim() catch |err| {
+                std.log.warn("trim proposal failed: {t}", .{err});
+            };
+        }
+
+        // Physical reclamation below the adopted trim, off the commit path.
+        if (!self.retired) {
+            self.node.reclaim() catch |err| {
+                std.log.warn("reclamation failed: {t}", .{err});
+            };
+        }
+
         // A decided membership stop waits for the transfer-lease handover
         // (ZDS 0008 over global slots); nothing else may proceed past it.
         if (!self.retired and self.node.membership_change_pending) {
@@ -1747,6 +1777,102 @@ pub const Server = struct {
             },
             .stop => null,
         };
+    }
+
+    /// Sends this node's progress report to every peer. Caller holds the
+    /// mutex (pump context).
+    fn broadcastStateReport(self: *Server) void {
+        const local = self.node.frontier();
+        self.last_reported_durable = local.durable_state_slot;
+        self.recordFrontier(local);
+        const report = wire.StateReport{
+            .configuration_id = local.configuration_id,
+            .durable_state_slot = local.durable_state_slot,
+            .history_hash = local.history_hash,
+            .executed_slot = local.executed_slot,
+            .persisted_slot = local.persisted_slot,
+            .local_delete_floor = local.local_delete_floor,
+            .retained_first_slot = self.node.journal.retainedFirstSlot(),
+        };
+        var buffer: [wire.StateReport.encoded_size]u8 = undefined;
+        const encoded = report.encode(&buffer);
+        for (self.node.memberIds()) |member| {
+            if (member == self.node.identity.node_id) continue;
+            const sender = self.senderFor(member) orelse continue;
+            const frame = wire.frameAlloc(self.gpa, .state_report, &.{encoded}) catch
+                continue;
+            sender.enqueue(frame);
+        }
+    }
+
+    fn recordFrontier(self: *Server, frontier: trim.Frontier) void {
+        for (&self.frontiers) |*slot| {
+            if (slot.*) |held| {
+                if (held.node_id == frontier.node_id) {
+                    slot.* = frontier;
+                    return;
+                }
+            }
+        }
+        for (&self.frontiers) |*slot| {
+            if (slot.* == null) {
+                slot.* = frontier;
+                return;
+            }
+        }
+    }
+
+    fn onStateReport(self: *Server, body: []const u8, from: paxos.NodeId) void {
+        const report = wire.StateReport.decode(body) catch return;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.recordFrontier(.{
+            .node_id = from,
+            .configuration_id = report.configuration_id,
+            .durable_state_slot = report.durable_state_slot,
+            .history_hash = report.history_hash,
+            .executed_slot = report.executed_slot,
+            .persisted_slot = report.persisted_slot,
+            .local_delete_floor = report.local_delete_floor,
+        });
+    }
+
+    /// The v1 conservative trim: propose the minimum durable frontier of
+    /// every data replica once it passes the chosen trim. Frozen while a
+    /// membership change is pending or any data replica is silent.
+    fn maybeProposeTrim(self: *Server) !void {
+        if (self.node.membership_change_pending or
+            self.node.log.stop_pending) return;
+        self.recordFrontier(self.node.frontier());
+        var data_buffer: [types.log_options.max_members]paxos.NodeId = undefined;
+        const data = self.dataReplicaIds(&data_buffer);
+        if (data.len == 0) return;
+        const candidate = (try trim.candidate(
+            &self.frontiers,
+            data,
+            self.node.identity.configuration_id,
+        )) orelse return;
+        if (candidate.through_slot <= self.node.trim_state.through_slot) return;
+        try self.node.proposeTrim(candidate);
+    }
+
+    /// The current data replicas: every voter the decided registry maps
+    /// to a materializing role, or every voter on flag-based clusters.
+    fn dataReplicaIds(
+        self: *Server,
+        buffer: *[types.log_options.max_members]paxos.NodeId,
+    ) []const paxos.NodeId {
+        var count: usize = 0;
+        for (self.node.memberIds()) |member| {
+            if (self.node.decidedRegistry()) |decided| {
+                if (decided.findNode(member)) |record| {
+                    if (!record.role.capabilities().materializes) continue;
+                }
+            }
+            buffer[count] = member;
+            count += 1;
+        }
+        return buffer[0..count];
     }
 
     fn requestSnapshot(self: *Server, from: paxos.NodeId) void {
@@ -2212,6 +2338,7 @@ pub const Server = struct {
                     body,
                     hello.node_id,
                 ),
+                .state_report => self.onStateReport(body, hello.node_id),
                 .registry_request => self.onRegistryRequest(body, hello.node_id),
                 .registry_data => try self.onRegistryData(body, &install),
                 .installation_ready => try self.onInstallationReady(body, hello.node_id),
