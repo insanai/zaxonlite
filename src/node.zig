@@ -2338,12 +2338,14 @@ pub const Node = struct {
                 durable,
             );
         }
-        // The continuation may still be stateless (a joiner installing
-        // its fetched registry); the campaign hold lifts only once
-        // something is applied.
-        if (self.join_campaign_hold and self.applied_slot > 0) {
-            self.join_campaign_hold = false;
-        }
+        // A stateless continuation of a joined configuration must not
+        // lead (a joiner opens at configuration 1 and only learns its
+        // real configuration from the fetched registry, so this is
+        // where the hold is decided); it lifts once anything applies.
+        self.join_campaign_hold = self.capabilities.campaigns and
+            self.capabilities.materializes and
+            self.identity.configuration_id > 1 and
+            self.applied_slot == 0;
         self.log.core.setCampaignEnabled(
             self.capabilities.campaigns and !self.join_campaign_hold,
         );
