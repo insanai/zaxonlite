@@ -366,7 +366,7 @@ pub fn main(init: std.process.Init) !u8 {
         "UnknownSession",
     );
 
-    // --- status, snapshot, backup, integrity ---------------------------
+    // --- status, anchor, backup, integrity -----------------------------
     try expect(
         gpa,
         io,

@@ -3,8 +3,8 @@
 //!
 //! The Paxos journal plus content-addressed payload store are the
 //! authoritative durable state. The SQLite database image is a materialized
-//! state machine rebuildable from a snapshot plus the committed journal
-//! suffix.
+//! state machine rebuildable from the durable state anchor plus the
+//! retained journal suffix.
 
 const std = @import("std");
 

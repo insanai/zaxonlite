@@ -2,7 +2,7 @@
 //!
 //! These drive the real node host against real files: restart recovery,
 //! journal-authoritative rebuild, torn-tail truncation, idempotent session
-//! retry, snapshot epoch rollover, and materialized-image convergence.
+//! retry, durable state anchors, and materialized-image convergence.
 
 const std = @import("std");
 const zaxonlite = @import("zaxonlite");
@@ -445,7 +445,6 @@ test "a state anchor bounds recovery and survives image loss" {
     }
 }
 
-
 test "recovery discards a corrupt materialized image even with an empty suffix" {
     const gpa = testing.allocator;
     var test_dir = try TestDir.init(gpa);
@@ -461,8 +460,8 @@ test "recovery discards a corrupt materialized image even with an empty suffix" 
         try node.createStateAnchor();
     }
 
-    // Damage a page in the non-authoritative working image. The current
-    // epoch has no suffix entries that could happen to overwrite it.
+    // Damage a page in the non-authoritative working image. The retained
+    // journal suffix has no entries that could happen to overwrite it.
     var node_dir = try std.Io.Dir.cwd().openDir(testing.io, dir, .{});
     defer node_dir.close(testing.io);
     const file = try node_dir.openFile(
@@ -480,8 +479,6 @@ test "recovery discards a corrupt materialized image even with an empty suffix" 
     const report = try reopened.integrityCheck();
     try testing.expect(report.ok());
 }
-
-
 
 test "writes continue past the consensus window with no rollover" {
     const gpa = testing.allocator;
@@ -511,7 +508,6 @@ test "writes continue past the consensus window with no rollover" {
     const report = try node.integrityCheck();
     try testing.expect(report.ok());
 }
-
 
 test "failed SQL rolls back and replicates nothing" {
     const gpa = testing.allocator;
@@ -853,9 +849,6 @@ fn openRegistryNode(dir: []const u8) !*Node {
         .registry_nodes = &records,
     });
 }
-
-
-
 
 test "a transaction above the protocol hard limit is rejected" {
     // The 64 MiB - 73 byte protocol payload bound (ZDS 0009): a single
@@ -1638,13 +1631,13 @@ test "checkpoint drains pooled readers and readers resume afterward" {
     );
     _ = try shared.execPrepared("insert into items(v) values ('tea')", &.{});
 
-    // Populate the pool so the checkpoint has live reader connections to
-    // drain, and keep readers running across the checkpoint.
+    // Populate the pool so the anchor's checkpoint has live reader
+    // connections to drain, and keep readers running across it.
     var warm = try shared.queryPrepared(gpa, "select v from items", &.{});
     warm.deinit();
     var worker = ReaderWorker{ .shared = shared, .iterations = 30 };
     const thread = try std.Thread.spawn(.{}, ReaderWorker.run, .{&worker});
-    try shared.snapshot();
+    try shared.createStateAnchor();
     thread.join();
     try testing.expectEqual(@as(usize, 0), worker.failures);
 

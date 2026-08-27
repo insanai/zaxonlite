@@ -11,8 +11,10 @@
 //! drive-cache barrier. The host's next journal sync — which precedes
 //! every vote, recovered-value message, and client acknowledgement — is
 //! the single barrier that makes installed payloads power-loss durable
-//! (see `durability.zig`). Epoch installs likewise barrier before the
-//! CURRENT pointer moves. So every counted vote and every acknowledged
+//! (see `durability.zig`). Anchor publication likewise barriers before
+//! the alternate APPLIED record is adopted (the old CURRENT pointer name
+//! survives only as a legacy-artifact tripwire). So every counted vote
+//! and every acknowledged
 //! write still implies durable payload bytes at its consumer, at one
 //! full flush per commit point instead of three.
 

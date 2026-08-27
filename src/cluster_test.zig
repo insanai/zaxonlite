@@ -4,8 +4,8 @@
 //! data directories and drives the mandatory scenario over the client RPC
 //! protocol: election, replicated writes through every endpoint, follower
 //! stop/catch-up, logical hash comparison, a leader SIGKILL failpoint with
-//! exactly-once session retry, epoch rollover with a stopped follower
-//! (snapshot transfer), image rebuild, and total restart.
+//! exactly-once session retry, a configuration change with a stopped
+//! follower (snapshot transfer), image rebuild, and total restart.
 //!
 //! Every wait is deadline-based on observable conditions. On failure the
 //! controller prints each node's status and recent log tail, then exits 1.

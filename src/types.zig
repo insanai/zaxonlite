@@ -8,9 +8,10 @@ const command = @import("command.zig");
 pub const Command = command.Command;
 
 /// Compile-time bounds for the replicated command log. `window_slots` is the
-/// consensus window; while the host never advances the core's memory floor
-/// it acts as a hard epoch capacity and the host must checkpoint before it
-/// is reached (the ZDS 0011 trim path replaces that rollover).
+/// consensus window: a backpressure bound on how far chosen history can run
+/// ahead of the trimmed floor. The ZDS 0011 certified chosen trim path
+/// advances that floor during normal service (before ZDS 0011 the window was
+/// a hard epoch capacity the host had to checkpoint before reaching).
 pub const log_options = paxos.ReplicatedLogOptions{
     // This is a voter bound, not a total-node bound. Non-voting learners and
     // gateways live in the runtime product registry and do not consume these

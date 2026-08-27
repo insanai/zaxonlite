@@ -5,7 +5,7 @@
 //! execute + WAL frame capture + payload store fsync + journal append +
 //! journal fsync + commit accounting. Reads run over the live connection.
 //! Recovery measures a full `Node.open` (journal replay + offline page
-//! apply + validation) over the committed epoch suffix.
+//! apply + validation) over the retained journal suffix.
 //!
 //! Usage: bench [writes] [reads]
 
@@ -189,7 +189,7 @@ fn benchRecovery(
     node_ptr.* = try Node.open(gpa, io, .{ .directory = root });
     const rebuild_elapsed = nowNs(io) - rebuild_start;
     std.debug.print(
-        "{s:<18} {d:>7} ms (image restored from snapshot)\n",
+        "{s:<18} {d:>7} ms (image restored from anchor)\n",
         .{
             "rebuild",
             @as(u64, @intCast(@divTrunc(rebuild_elapsed, std.time.ns_per_ms))),

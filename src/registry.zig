@@ -14,8 +14,9 @@
 //!
 //! On disk a registry blob is the canonical encoding followed by its
 //! SHA-256 digest; the `REGISTRY` pointer file names the active blob by
-//! configuration ID, with the same shape and strict length check as the
-//! `CURRENT` snapshot pointer.
+//! configuration ID, with the same pointer-file shape and strict length
+//! check the retired `CURRENT` pointer used (that name now survives only
+//! as a legacy-artifact tripwire).
 
 const std = @import("std");
 const paxos = @import("paxos");

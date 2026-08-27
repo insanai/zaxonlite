@@ -8,7 +8,7 @@
 //!    tail damage must reopen (with the damaged suffix truncated) or be
 //!    rejected as corrupt — never crash or mis-parse;
 //! 3. end-to-end node property: random SQL against a real node with random
-//!    restarts, snapshots, torn tails, and image deletions must keep the
+//!    restarts, anchors, torn tails, and image deletions must keep the
 //!    integrity report clean and converge to identical logical content
 //!    after every rebuild.
 //!
@@ -334,7 +334,7 @@ fn fuzzNode(
             6 => {
                 _ = node.exec("insert into missing_table values (1)") catch {};
             },
-            // Snapshot: seal the epoch.
+            // Publish a durable state anchor.
             7 => try node.createStateAnchor(),
             // Restart, sometimes with injected tail garbage or a deleted
             // materialized image.

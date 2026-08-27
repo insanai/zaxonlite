@@ -1,6 +1,6 @@
 //! Soak run: sustained mixed load against one durable node.
 //!
-//! Random writes, reads, idempotent session traffic, snapshots, and full
+//! Random writes, reads, idempotent session traffic, anchors, and full
 //! restarts for a wall-clock budget, with continuous invariants: row count
 //! matches an in-memory model, session sequences apply exactly once, and
 //! the integrity report stays clean. Prints throughput statistics.
@@ -59,7 +59,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     var writes: u64 = 0;
     var reads: u64 = 0;
-    var snapshots: u64 = 0;
+    var anchors: u64 = 0;
     var restarts: u64 = 0;
     var session_writes: u64 = 0;
 
@@ -114,7 +114,7 @@ pub fn main(init: std.process.Init) !u8 {
             },
             93...95 => {
                 try node.createStateAnchor();
-                snapshots += 1;
+                anchors += 1;
             },
             else => {
                 node.close();
@@ -139,13 +139,13 @@ pub fn main(init: std.process.Init) !u8 {
     const total_ms: u64 = @intCast(total.raw.toMilliseconds());
     std.debug.print(
         "soak: PASS  {d} writes, {d} session writes, {d} reads, " ++
-            "{d} snapshots, {d} restarts in {d} ms " ++
+            "{d} anchors, {d} restarts in {d} ms " ++
             "({d} writes/s)\n",
         .{
             writes,
             session_writes,
             reads,
-            snapshots,
+            anchors,
             restarts,
             total_ms,
             if (total_ms > 0) (writes + session_writes) * 1000 / total_ms else 0,

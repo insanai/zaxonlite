@@ -5,7 +5,7 @@
 //! into `current.db`, together with the history anchor and file geometry
 //! at that slot. Recovery selects the valid record with the greatest
 //! generation and replays the journal suffix from there, so startup cost
-//! follows the anchor cadence instead of the whole epoch.
+//! follows the anchor cadence instead of the whole log.
 //!
 //! A record is never trusted on faith: magic, version, database identity,
 //! and checksum must all validate, and a corrupt or missing record only

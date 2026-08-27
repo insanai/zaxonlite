@@ -3637,21 +3637,21 @@ pub const Server = struct {
                 "\"write_gate\":\"fifo-v1\"," ++
                 "\"typed_v1\":true,",
             .{
-                status.node_id,                status.database_id,
-                status.configuration_id,       status.role,
-                status.node_type,              leader,
-                phase,                         quorum_available,
-                installation_state,            status.ballot.round,
-                status.ballot.priority,        status.ballot.node,
-                status.decided_slot,           status.applied_slot,
-                status.durable_state_slot,     status.memory_floor,
-                status.chosen_trim_slot,       status.retained_first_slot,
-                status.journal_records,        status.journal_segment_count,
-                status.journal_bytes,
-                &chain_hex,                    status.page_size,
-                status.fts5_enabled,           status.sqlite_vec_version,
-                status.search_feature_version, status.simd_backend,
-                status.mmap_size,              status.candidate_hard_limit,
+                status.node_id,              status.database_id,
+                status.configuration_id,     status.role,
+                status.node_type,            leader,
+                phase,                       quorum_available,
+                installation_state,          status.ballot.round,
+                status.ballot.priority,      status.ballot.node,
+                status.decided_slot,         status.applied_slot,
+                status.durable_state_slot,   status.memory_floor,
+                status.chosen_trim_slot,     status.retained_first_slot,
+                status.journal_records,      status.journal_segment_count,
+                status.journal_bytes,        &chain_hex,
+                status.page_size,            status.fts5_enabled,
+                status.sqlite_vec_version,   status.search_feature_version,
+                status.simd_backend,         status.mmap_size,
+                status.candidate_hard_limit,
             },
         );
         try writeMembershipOperation(out, pending, installation_error);
@@ -4182,7 +4182,11 @@ pub const Server = struct {
             error.UnknownSession, error.SequenceGap, error.ResultExpired => {
                 try writeErrorResponse(out, "session", @errorName(err));
             },
-            error.LogSealed => try writeErrorResponse(out, "retry", "epoch rolling over"),
+            error.LogSealed => try writeErrorResponse(
+                out,
+                "retry",
+                "membership change in progress",
+            ),
             error.TransactionTooLarge => try writeErrorResponse(
                 out,
                 "too_large",

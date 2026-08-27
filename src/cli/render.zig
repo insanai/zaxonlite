@@ -59,9 +59,8 @@ fn printStatusJson(status: zaxonlite.node.Status, out: *std.Io.Writer) !void {
             status.durable_state_slot,     status.memory_floor,
             status.chosen_trim_slot,       status.retained_first_slot,
             status.journal_records,        status.journal_segment_count,
-            status.journal_bytes,
-            &chain_hex,                    &history_hex,
-            status.page_size,
+            status.journal_bytes,          &chain_hex,
+            &history_hex,                  status.page_size,
             status.fts5_enabled,           status.sqlite_vec_version,
             status.search_feature_version, status.simd_backend,
             status.mmap_size,              status.candidate_hard_limit,
@@ -343,11 +342,6 @@ fn renderRemoteSuccess(
             jsonInt(object.get("applied_slot")) orelse 0,
             jsonInt(object.get("leader")),
         });
-    } else if (std.mem.eql(u8, command, "snapshot")) {
-        try out.print(
-            "snapshot installed; now at configuration {d}\n",
-            .{jsonInt(object.get("configuration_id")) orelse 0},
-        );
     } else if (std.mem.eql(u8, command, "integrity-check")) {
         try out.writeAll("integrity: pass\n");
     } else if (std.mem.eql(u8, command, "expire-sessions")) {
