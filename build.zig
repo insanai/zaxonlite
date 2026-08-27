@@ -352,6 +352,23 @@ pub fn build(b: *std.Build) void {
     );
     replacement_cluster_step.dependOn(&run_replacement_cluster_test.step);
 
+    const transfer_cluster_test = b.addExecutable(.{
+        .name = "zaxon-transfer-cluster-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/transfer_cluster_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zaxonlite", .module = zaxonlite }},
+        }),
+    });
+    const run_transfer_cluster_test = b.addRunArtifact(transfer_cluster_test);
+    run_transfer_cluster_test.addArtifactArg(zaxon);
+    const transfer_cluster_step = b.step(
+        "test-transfer-cluster",
+        "Run the beyond-retention state-transfer crash ladder under mTLS",
+    );
+    transfer_cluster_step.dependOn(&run_transfer_cluster_test.step);
+
     const role_cluster_test = b.addExecutable(.{
         .name = "zaxon-role-cluster-test",
         .root_module = b.createModule(.{
