@@ -598,7 +598,7 @@ pub const Journal = struct {
         self.next_sequence = record.sequence + 1;
         const write = types.decodeWrite(record.payload) catch
             return error.CorruptJournal;
-        durable.apply(write) catch return error.CorruptJournal;
+        durable.replayFold(write) catch return error.CorruptJournal;
         switch (write) {
             .promise => |ballot| {
                 if (self.max_promised.lessThan(ballot)) self.max_promised = ballot;
