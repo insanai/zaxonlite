@@ -31,6 +31,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
+const Sha256 = std.crypto.hash.sha2.Sha256;
 const paxos = @import("paxos");
 
 const command = @import("command.zig");
@@ -40,13 +41,13 @@ const history = @import("history.zig");
 const journal_mod = @import("journal.zig");
 const trim = @import("trim.zig");
 const payload_store_mod = @import("payload_store.zig");
-const checkpoint_proof = @import("checkpoint_proof.zig");
 const sqlite = @import("sqlite.zig");
 const search_api = @import("search_api.zig");
 const zaxon_search = @import("zaxon_search");
 const guard_mod = @import("guard.zig");
 const wal = @import("wal.zig");
 const failpoint = @import("failpoint.zig");
+const wire = @import("wire.zig");
 const durability = @import("durability.zig");
 const prepared = @import("prepared.zig");
 const registry = @import("registry.zig");
@@ -62,6 +63,10 @@ const shm_file_name = "current.db-shm";
 const identity_file_name = "identity";
 const current_file_name = "CURRENT";
 const lock_file_name = "LOCK";
+/// Sender-side pinned transfer image, private to `consensus/`.
+const transfer_pin_name = "transfer-pin.db";
+/// Receiver-side staged transfer image, replaced onto `current.db`.
+pub const transfer_install_name = ".transfer-install.db";
 const pending_operation_file_name = "PENDING-OP";
 const deleted_file_tombstone = ".ZX-DELETED";
 const join_file_name = "JOIN";
@@ -115,6 +120,11 @@ pub const RecentBatch = struct {
     batch_id: u128 = 0,
 };
 
+
+const HistoryMark = struct {
+    slot: paxos.Slot = 0,
+    hash: [32]u8 = [_]u8{0} ** 32,
+};
 pub const Status = struct {
     node_id: paxos.NodeId,
     database_id: u128,
@@ -505,6 +515,9 @@ pub const Node = struct {
     /// Recent chosen transaction batches, kept so a write waiter can be
     /// resolved even after the core window released the slot's cell.
     recent_batches: [64]RecentBatch = [_]RecentBatch{.{}} ** 64,
+    /// Recent per-slot history hashes, for vouching transfer anchors
+    /// (ZDS 0011). Indexed like `recent_batches`; slot 0 means empty.
+    recent_history: [64]HistoryMark = [_]HistoryMark{.{}} ** 64,
     /// The global ordered-history anchor H at `applied_slot`.
     history_hash: command.HashBytes,
     /// The history anchor frozen at `durable_state_slot`; trim candidates
@@ -1760,6 +1773,148 @@ pub const Node = struct {
         failpoint.hit("before_payload_gc_publish");
         try self.store.sweepUnreachable(&reachable);
         failpoint.hit("after_payload_gc_publish");
+    }
+
+    /// The history hash after applying `slot`, when this node can still
+    /// vouch for it: from the recent ring, the durable anchor, or the
+    /// chosen trim anchor. Null when the slot left every source.
+    pub fn historyHashAt(self: *const Node, slot: paxos.Slot) ?[32]u8 {
+        if (slot == 0) return null;
+        const mark = self.recent_history[@intCast(slot % self.recent_history.len)];
+        if (mark.slot == slot) return mark.hash;
+        if (slot == self.durable_state_slot) return self.history_hash_at_anchor;
+        if (slot == self.trim_state.through_slot) return self.trim_state.history_hash;
+        return null;
+    }
+
+    pub const TransferPin = struct {
+        node: *Node,
+        file: Io.File,
+        size: u64,
+        sha256: [32]u8,
+        anchor: applied_anchor.Anchor,
+
+        pub fn close(self: *TransferPin) void {
+            self.file.close(self.node.io);
+            self.node.journal.dir.deleteFile(
+                self.node.io,
+                transfer_pin_name,
+            ) catch {};
+            self.* = undefined;
+        }
+    };
+
+    /// Pins the durable anchor for a state transfer: publishes a fresh
+    /// anchor, then copies the synchronized image into a private file
+    /// the stream reads without blocking later anchors (ZDS 0011). The
+    /// copy is O(database) — the cost inherent to a full state transfer.
+    pub fn pinTransferImage(self: *Node) !TransferPin {
+        try self.createStateAnchor();
+        const anchor = applied_anchor.select(
+            self.io,
+            self.journal.dir,
+            self.identity.database_id,
+        ) orelse return error.StateUnavailable;
+
+        const source = try self.dir.openFile(self.io, db_file_name, .{});
+        defer source.close(self.io);
+        self.journal.dir.deleteFile(self.io, transfer_pin_name) catch {};
+        const pin = try self.journal.dir.createFile(
+            self.io,
+            transfer_pin_name,
+            .{ .read = true },
+        );
+        errdefer {
+            pin.close(self.io);
+            self.journal.dir.deleteFile(self.io, transfer_pin_name) catch {};
+        }
+        var sha = Sha256.init(.{});
+        var buffer: [64 * 1024]u8 = undefined;
+        var offset: u64 = 0;
+        while (true) {
+            const count = try source.readPositionalAll(self.io, &buffer, offset);
+            if (count == 0) break;
+            sha.update(buffer[0..count]);
+            try pin.writePositionalAll(self.io, buffer[0..count], offset);
+            offset += count;
+        }
+        return .{
+            .node = self,
+            .file = pin,
+            .size = offset,
+            .sha256 = sha.finalResult(),
+            .anchor = anchor,
+        };
+    }
+
+    /// Installs a verified anchor-pinned image as this node's base state
+    /// (ZDS 0011): the image becomes `current.db`, a fresh durable anchor
+    /// binds it, and the protocol node resumes at the anchor slot on the
+    /// same global slot line. The caller has already confirmed the image
+    /// digest and quorum-vouched `(anchor_slot, history_hash)`.
+    pub fn installTransferredState(
+        self: *Node,
+        begin: wire.SnapshotBegin,
+    ) !void {
+        if (self.fatal_storage_error) return error.StorageFailed;
+        if (!self.capabilities.materializes) return error.RoleCannotWrite;
+        if (begin.configuration_id != self.identity.configuration_id) {
+            return error.ConfigurationMismatch;
+        }
+        if (begin.anchor_slot <= self.applied_slot) return error.StaleTransfer;
+        if (self.live_transaction) return error.TransactionOpen;
+
+        const image_sha = try fileSha256(self.io, self.dir, transfer_install_name);
+        if (!std.mem.eql(u8, &image_sha, &begin.image_sha256)) {
+            return error.TransferDigestMismatch;
+        }
+
+        if (self.db_open) {
+            self.db.close();
+            self.db_open = false;
+        }
+        self.capture_batch_id = null;
+        self.needs_resync = false;
+        self.dir.deleteFile(self.io, wal_file_name) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+        self.dir.deleteFile(self.io, shm_file_name) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+        try self.dir.rename(transfer_install_name, self.dir, db_file_name, self.io);
+        try durability.syncPathnameTransition(self.io, self.dir, db_file_name);
+
+        self.history_hash = begin.history_hash;
+        self.history_hash_at_anchor = begin.history_hash;
+        self.last_chain = begin.last_chain;
+        self.last_data_slot = begin.last_data_slot;
+        self.last_batch_id = begin.last_batch_id;
+        self.page_size = begin.sqlite_page_size;
+        self.applied_slot = begin.anchor_slot;
+        self.recent_batches = [_]RecentBatch{.{}} ** 64;
+        self.recent_history = [_]HistoryMark{.{}} ** 64;
+
+        self.anchor_generation += 1;
+        try applied_anchor.publish(self.io, self.journal.dir, .{
+            .generation = self.anchor_generation,
+            .database_id = self.identity.database_id,
+            .global_slot = begin.anchor_slot,
+            .configuration_id = self.identity.configuration_id,
+            .history_hash = begin.history_hash,
+            .sqlite_page_size = begin.sqlite_page_size,
+            .sqlite_page_count = begin.db_size / begin.sqlite_page_size,
+            .last_data_slot = begin.last_data_slot,
+            .last_batch_id = begin.last_batch_id,
+            .last_chain = begin.last_chain,
+        });
+        self.durable_state_slot = begin.anchor_slot;
+
+        // The protocol node resumes at the anchor; everything below it is
+        // covered by the installed image, everything above arrives through
+        // ordinary catch-up.
+        try self.continueOnConfiguration(begin.anchor_slot);
     }
 
     /// This node's progress report for trim coordination and monitoring.
@@ -3227,12 +3382,16 @@ pub const Node = struct {
                         ] = .{ .slot = entry.slot, .batch_id = batch.batch_id };
                     },
                 },
-                .stop => {
+                .stop => |stop| {
                     if (self.capture_batch_id != null) {
                         self.capture_batch_id = null;
                         self.needs_resync = true;
                     }
-                    self.membership_change_pending = true;
+                    // A stop at or below the running configuration is
+                    // replayed history, not a pending handover.
+                    if (stop.configuration_id > self.identity.configuration_id) {
+                        self.membership_change_pending = true;
+                    }
                 },
             }
             // Every chosen entry advances the global history anchor,
@@ -3244,6 +3403,8 @@ pub const Node = struct {
                 entry.slot,
                 entry.value,
             );
+            self.recent_history[@intCast(entry.slot % self.recent_history.len)] =
+                .{ .slot = entry.slot, .hash = self.history_hash };
             self.applied_slot = entry.slot;
         }
     }
@@ -3492,8 +3653,10 @@ pub const Node = struct {
                     self.last_batch_id = batch.batch_id;
                 },
             },
-            .stop => {
-                self.membership_change_pending = true;
+            .stop => |stop| {
+                if (stop.configuration_id > self.identity.configuration_id) {
+                    self.membership_change_pending = true;
+                }
             },
         }
         self.history_hash = history.advance(
@@ -3503,6 +3666,8 @@ pub const Node = struct {
             slot,
             entry,
         );
+        self.recent_history[@intCast(slot % self.recent_history.len)] =
+            .{ .slot = slot, .hash = self.history_hash };
     }
 
     fn openLiveDatabase(self: *Node) !void {
