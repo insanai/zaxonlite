@@ -19,6 +19,16 @@ const Case = struct {
     maximum_count: i64,
 };
 
+/// One anchor-ladder crash case: the committed baseline row survives.
+fn anchorCase(comptime failpoint: []const u8) Case {
+    return .{
+        .failpoint = failpoint,
+        .operation = .anchor,
+        .minimum_count = 1,
+        .maximum_count = 1,
+    };
+}
+
 const cases = [_]Case{
     .{ .failpoint = "before_payload_sync", .minimum_count = 0, .maximum_count = 0 },
     .{ .failpoint = "after_payload_sync", .minimum_count = 0, .maximum_count = 0 },
@@ -38,16 +48,16 @@ const cases = [_]Case{
     // row was committed before the crash, so recovery must always present
     // exactly one row, pass integrity, and keep accepting writes and
     // anchors afterwards.
-    .{ .failpoint = "before_db_sync", .operation = .anchor, .minimum_count = 1, .maximum_count = 1 },
-    .{ .failpoint = "after_db_sync", .operation = .anchor, .minimum_count = 1, .maximum_count = 1 },
-    .{ .failpoint = "before_applied_write", .operation = .anchor, .minimum_count = 1, .maximum_count = 1 },
-    .{ .failpoint = "after_applied_barrier", .operation = .anchor, .minimum_count = 1, .maximum_count = 1 },
-    .{ .failpoint = "before_trim_file", .operation = .anchor, .minimum_count = 1, .maximum_count = 1 },
-    .{ .failpoint = "after_trim_file", .operation = .anchor, .minimum_count = 1, .maximum_count = 1 },
-    .{ .failpoint = "before_segment_unlink", .operation = .anchor, .minimum_count = 1, .maximum_count = 1 },
-    .{ .failpoint = "after_segment_unlink", .operation = .anchor, .minimum_count = 1, .maximum_count = 1 },
-    .{ .failpoint = "before_payload_gc_publish", .operation = .anchor, .minimum_count = 1, .maximum_count = 1 },
-    .{ .failpoint = "after_payload_gc_publish", .operation = .anchor, .minimum_count = 1, .maximum_count = 1 },
+    anchorCase("before_db_sync"),
+    anchorCase("after_db_sync"),
+    anchorCase("before_applied_write"),
+    anchorCase("after_applied_barrier"),
+    anchorCase("before_trim_file"),
+    anchorCase("after_trim_file"),
+    anchorCase("before_segment_unlink"),
+    anchorCase("after_segment_unlink"),
+    anchorCase("before_payload_gc_publish"),
+    anchorCase("after_payload_gc_publish"),
 };
 
 pub fn main(init: std.process.Init) !u8 {
@@ -81,6 +91,39 @@ pub fn main(init: std.process.Init) !u8 {
     return 0;
 }
 
+/// Fills the crashed child's command line into caller-owned storage.
+/// Process-kill recovery is identical under both sync policies, so every
+/// case runs with `--sync os`.
+fn caseArgv(
+    operation: Operation,
+    assignment: []const u8,
+    zaxon: []const u8,
+    directory: []const u8,
+    storage: *[10][]const u8,
+) []const []const u8 {
+    switch (operation) {
+        .write => {
+            storage.* = .{
+                "/usr/bin/env", assignment,
+                zaxon,          "exec",
+                "--data",       directory,
+                "--sql",        "insert into t(v) values ('crash')",
+                "--sync",       "os",
+            };
+            return storage[0..10];
+        },
+        .anchor => {
+            storage[0..8].* = .{
+                "/usr/bin/env", assignment,
+                zaxon,          "anchor",
+                "--data",       directory,
+                "--sync",       "os",
+            };
+            return storage[0..8];
+        },
+    }
+}
+
 fn runCase(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -106,22 +149,8 @@ fn runCase(
         .{case.failpoint},
     );
     defer gpa.free(assignment);
-    // Process-kill recovery is identical under both sync policies.
-    const argv: []const []const u8 = switch (case.operation) {
-        .write => &.{
-            "/usr/bin/env",       assignment,
-            zaxon,                "exec",
-            "--data",             directory,
-            "--sql",              "insert into t(v) values ('crash')",
-            "--sync",             "os",
-        },
-        .anchor => &.{
-            "/usr/bin/env", assignment,
-            zaxon,          "anchor",
-            "--data",       directory,
-            "--sync",       "os",
-        },
-    };
+    var argv_storage: [10][]const u8 = undefined;
+    const argv = caseArgv(case.operation, assignment, zaxon, directory, &argv_storage);
     var child = try std.process.spawn(io, .{
         .argv = argv,
         .stdin = .ignore,
