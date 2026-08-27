@@ -494,6 +494,9 @@ pub const Node = struct {
     /// One-shot enrollment binding retained until the fetched registry is
     /// verified and installed.
     join_descriptor: ?JoinDescriptor = null,
+    /// Campaigning withheld while a joining data voter has nothing
+    /// applied; leading would starve its own catch-up and transfer.
+    join_campaign_hold: bool = false,
     members: [types.log_options.max_members]paxos.NodeId,
     member_count: u16,
     leader_priority: u32,
@@ -822,6 +825,17 @@ pub const Node = struct {
         }
 
         self.log.core.setCampaignEnabled(capabilities.campaigns);
+        // A materializing voter that joins an existing cluster with no
+        // applied state must not lead: catch-up and snapshot escalation
+        // run against the leader, so winning the election would starve
+        // its own recovery forever. It still votes; campaigning resumes
+        // once any state is applied.
+        if (capabilities.campaigns and capabilities.materializes and
+            identity.configuration_id > 1 and self.applied_slot == 0)
+        {
+            self.join_campaign_hold = true;
+            self.log.core.setCampaignEnabled(false);
+        }
         if (single and capabilities.campaigns) {
             // Volatile leadership: campaign on every open. A one-member
             // quorum completes phase one immediately.
@@ -1986,6 +2000,16 @@ pub const Node = struct {
 
     /// Creates a state anchor once execution has run far enough past the
     /// durable one. Returns whether an anchor was published.
+    /// Re-enables campaigning once a joining voter has applied any state
+    /// (through catch-up or an installed transfer); the host calls this
+    /// from its periodic duties.
+    pub fn releaseCampaignHold(self: *Node) void {
+        if (!self.join_campaign_hold) return;
+        if (self.applied_slot == 0) return;
+        self.join_campaign_hold = false;
+        self.log.core.setCampaignEnabled(self.capabilities.campaigns);
+    }
+
     pub fn maybeCreateStateAnchor(self: *Node) !bool {
         // A node with no anchor at all still recovers from genesis, so
         // the first anchor publishes promptly; afterwards the slot
@@ -2314,7 +2338,15 @@ pub const Node = struct {
                 durable,
             );
         }
-        self.log.core.setCampaignEnabled(self.capabilities.campaigns);
+        // The continuation may still be stateless (a joiner installing
+        // its fetched registry); the campaign hold lifts only once
+        // something is applied.
+        if (self.join_campaign_hold and self.applied_slot > 0) {
+            self.join_campaign_hold = false;
+        }
+        self.log.core.setCampaignEnabled(
+            self.capabilities.campaigns and !self.join_campaign_hold,
+        );
         if (self.single and self.capabilities.campaigns) {
             try self.log.campaign(.noop, self.effects);
             try self.consumeEffects();

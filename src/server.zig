@@ -1942,6 +1942,7 @@ pub const Server = struct {
                 {
                     self.requestJoinRegistry();
                 }
+                self.node.releaseCampaignHold();
 
                 // A member that observes a further-ahead leader asks for
                 // the decided suffix it is missing. When repeated range
