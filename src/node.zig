@@ -38,6 +38,7 @@ const types = @import("types.zig");
 const applied_anchor = @import("applied_anchor.zig");
 const history = @import("history.zig");
 const journal_mod = @import("journal.zig");
+const trim = @import("trim.zig");
 const payload_store_mod = @import("payload_store.zig");
 const checkpoint_proof = @import("checkpoint_proof.zig");
 const sqlite = @import("sqlite.zig");
@@ -498,11 +499,17 @@ pub const Node = struct {
     durable_state_slot: paxos.Slot = 0,
     /// Generation counter of the alternating APPLIED records.
     anchor_generation: u64 = 0,
+    /// Durable local trim state: the adopted cluster anchor plus the
+    /// active transfer leases capping deletion (ZDS 0011).
+    trim_state: trim.State = .{},
     /// Recent chosen transaction batches, kept so a write waiter can be
     /// resolved even after the core window released the slot's cell.
     recent_batches: [64]RecentBatch = [_]RecentBatch{.{}} ** 64,
     /// The global ordered-history anchor H at `applied_slot`.
     history_hash: command.HashBytes,
+    /// The history anchor frozen at `durable_state_slot`; trim candidates
+    /// bind exactly this pair.
+    history_hash_at_anchor: command.HashBytes = [_]u8{0} ** 32,
     last_chain: command.HashBytes,
     last_data_slot: paxos.Slot = 0,
     /// Batch identity at `last_data_slot`, kept because the consensus
@@ -735,6 +742,14 @@ pub const Node = struct {
             else => return err,
         }
         errdefer self.journal.close();
+        if (try trim.load(io, self.journal.dir)) |stored| {
+            self.trim_state = stored;
+            self.journal.noteTrimAnchor(
+                stored.trim_id,
+                stored.through_slot,
+                stored.history_hash,
+            );
+        }
 
         // Materialize the image from the durable anchor plus the retained
         // journal suffix (ZDS 0011 recovery ladder), then restore the core
@@ -1599,6 +1614,161 @@ pub const Node = struct {
             .last_chain = self.last_chain,
         });
         self.durable_state_slot = self.applied_slot;
+        self.history_hash_at_anchor = self.history_hash;
+
+        // A one-member configuration is its own only data replica: the
+        // conservative trim degenerates to the fresh anchor, chosen and
+        // reclaimed inline (ZDS 0011).
+        if (self.single and self.capabilities.votes) {
+            if (self.durable_state_slot > self.trim_state.through_slot) {
+                try self.proposeTrim(.{
+                    .through_slot = self.durable_state_slot,
+                    .history_hash = self.history_hash_at_anchor,
+                });
+                try self.reclaim();
+            }
+        }
+    }
+
+    /// Proposes a chosen trim entry. Leader only; the candidate comes
+    /// from the minimum durable-state frontier of every data replica.
+    pub fn proposeTrim(self: *Node, candidate: trim.Candidate) !void {
+        if (self.fatal_storage_error) return error.StorageFailed;
+        const record = command.TrimRecord{
+            .trim_id = self.trim_state.trim_id + 1,
+            .through_slot = candidate.through_slot,
+            .history_hash = candidate.history_hash,
+            .configuration_id = self.identity.configuration_id,
+            .policy = 0,
+        };
+        _ = try self.log.append(.{ .trim = record }, self.effects);
+        try self.consumeEffects();
+    }
+
+    /// Adopts a chosen trim record: validates it against the durable trim
+    /// state, persists the TRIM file, installs the core anchor, and
+    /// leaves physical reclamation to the next pump.
+    fn adoptChosenTrim(self: *Node, record: command.TrimRecord) !void {
+        switch (trim.classify(&self.trim_state, record)) {
+            .ignore => return,
+            .corrupt => {
+                self.fatal_storage_error = true;
+                return error.TrimRegression;
+            },
+            .adopt => {},
+        }
+        self.trim_state.trim_id = record.trim_id;
+        self.trim_state.through_slot = record.through_slot;
+        self.trim_state.history_hash = record.history_hash;
+        self.trim_state.configuration_id = record.configuration_id;
+        failpoint.hit("before_trim_file");
+        try trim.store(self.io, self.journal.dir, self.trim_state);
+        failpoint.hit("after_trim_file");
+        try self.log.installChosenTrim(.{
+            .trim_id = record.trim_id,
+            .chosen_trim_slot = record.through_slot,
+            .history_hash = record.history_hash,
+        }, self.effects);
+        self.journal.noteTrimAnchor(
+            record.trim_id,
+            record.through_slot,
+            record.history_hash,
+        );
+    }
+
+    /// Records a chosen transfer lease; deletion is capped at its base
+    /// until completion, whatever happens to the sender.
+    fn trackLease(self: *Node, lease: command.TransferLease) void {
+        for (self.trim_state.leases[0..self.trim_state.lease_count]) |held| {
+            if (held.lease_id == lease.lease_id) return;
+        }
+        if (self.trim_state.lease_count >= trim.max_leases) return;
+        self.trim_state.leases[self.trim_state.lease_count] = .{
+            .lease_id = lease.lease_id,
+            .receiver_id = lease.receiver_id,
+            .base_slot = lease.base_slot,
+            .expiry_ticks_left = lease.expires_after_leader_ticks,
+        };
+        self.trim_state.lease_count += 1;
+        trim.store(self.io, self.journal.dir, self.trim_state) catch {
+            self.fatal_storage_error = true;
+        };
+    }
+
+    fn releaseLease(self: *Node, lease_id: u64) void {
+        var index: u8 = 0;
+        while (index < self.trim_state.lease_count) : (index += 1) {
+            if (self.trim_state.leases[index].lease_id == lease_id) break;
+        } else return;
+        self.trim_state.lease_count -= 1;
+        self.trim_state.leases[index] =
+            self.trim_state.leases[self.trim_state.lease_count];
+        trim.store(self.io, self.journal.dir, self.trim_state) catch {
+            self.fatal_storage_error = true;
+        };
+    }
+
+    /// Physically reclaims journal segments and payload objects below the
+    /// local delete floor. Called from the host pump, never inline in the
+    /// commit path.
+    pub fn reclaim(self: *Node) !void {
+        if (self.trim_state.through_slot == 0) return;
+        const floor = trim.deleteFloor(
+            self.trim_state.through_slot,
+            self.durable_state_slot,
+            std.math.maxInt(u64),
+            self.trim_state.leasesSlice(),
+        );
+        if (floor <= self.journal.trimmed_through) return;
+        failpoint.hit("before_segment_unlink");
+        try self.journal.trimThrough(floor);
+        failpoint.hit("after_segment_unlink");
+        try self.sweepPayloads();
+    }
+
+    /// Deletes payload objects no retained journal record references.
+    /// The reachable set is streamed from the retained segments, so a
+    /// crash can leak an object but never delete a reachable one.
+    fn sweepPayloads(self: *Node) !void {
+        var reachable = std.AutoHashMap([32]u8, void).init(self.gpa);
+        defer reachable.deinit();
+        var it = try self.journal.iterate(1);
+        defer it.close();
+        while (try it.next()) |write| {
+            const entry = switch (write) {
+                .accept => |accept| accept.value,
+                .commit => |commit| commit.value,
+                else => continue,
+            };
+            switch (entry) {
+                .command => |cmd| switch (cmd) {
+                    .transaction_batch => |batch| {
+                        try reachable.put(batch.payload_hash, {});
+                    },
+                    else => {},
+                },
+                .stop => {},
+            }
+        }
+        failpoint.hit("before_payload_gc_publish");
+        try self.store.sweepUnreachable(&reachable);
+        failpoint.hit("after_payload_gc_publish");
+    }
+
+    /// This node's progress report for trim coordination and monitoring.
+    pub fn frontier(self: *const Node) trim.Frontier {
+        return .{
+            .node_id = self.identity.node_id,
+            .configuration_id = self.identity.configuration_id,
+            .durable_state_slot = if (self.capabilities.materializes)
+                self.durable_state_slot
+            else
+                0,
+            .history_hash = self.history_hash_at_anchor,
+            .executed_slot = self.applied_slot,
+            .persisted_slot = self.journal.persistedThrough(),
+            .local_delete_floor = self.journal.trimmed_through,
+        };
     }
 
     /// Creates a state anchor once execution has run far enough past the
@@ -2717,10 +2887,24 @@ pub const Node = struct {
                     try self.outbox.append(self.gpa, envelope);
                 }
             }
+            const writes_before_accounting = self.effects.writes_count;
             self.accountCommitted(self.effects.committedSlice()) catch |err| {
                 self.fatal_storage_error = true;
                 return err;
             };
+            // Accounting can adopt a chosen trim, which appends its own
+            // durable marker; journal the tail before the reset below
+            // would discard it. Derived records ride the next barrier.
+            if (self.effects.writes_count > writes_before_accounting) {
+                const tail = self.effects.writes[writes_before_accounting..
+                    self.effects.writes_count];
+                self.journal.appendWrites(tail) catch |err| {
+                    self.fatal_storage_error = true;
+                    return err;
+                };
+                // Derived records (trim anchors) ride the next barrier.
+                self.effects.confirmWritesDurable();
+            }
             // Everything accounted is journal-durable and consumed, so its
             // consensus cells may be reused (ZDS 0011 memory floor).
             self.journal.noteChosen(self.log.decidedThrough());
@@ -2804,16 +2988,34 @@ pub const Node = struct {
         for (committed) |entry| {
             switch (entry.value) {
                 .command => |cmd| switch (cmd) {
-                    // Trim and lease records occupy slots like noops here;
-                    // their retention side effects land with the ZDS 0011
-                    // trim orchestration.
-                    .noop, .read_barrier, .trim, .transfer_lease, .lease_complete => {
+                    .noop, .read_barrier => {
                         if (self.capture_batch_id != null) {
                             // Our captured write lost its slot; the live
                             // WAL contains frames the log never decided.
                             self.capture_batch_id = null;
                             self.needs_resync = true;
                         }
+                    },
+                    .trim => |record| {
+                        if (self.capture_batch_id != null) {
+                            self.capture_batch_id = null;
+                            self.needs_resync = true;
+                        }
+                        try self.adoptChosenTrim(record);
+                    },
+                    .transfer_lease => |lease| {
+                        if (self.capture_batch_id != null) {
+                            self.capture_batch_id = null;
+                            self.needs_resync = true;
+                        }
+                        self.trackLease(lease);
+                    },
+                    .lease_complete => |complete| {
+                        if (self.capture_batch_id != null) {
+                            self.capture_batch_id = null;
+                            self.needs_resync = true;
+                        }
+                        self.releaseLease(complete.lease_id);
                     },
                     .transaction_batch => |batch| {
                         if (batch.database_id != self.identity.database_id or
@@ -2980,6 +3182,7 @@ pub const Node = struct {
                 self.anchor_generation = anchor.generation;
                 anchor_config = anchor.configuration_id;
                 self.history_hash = anchor.history_hash;
+                self.history_hash_at_anchor = anchor.history_hash;
                 self.last_chain = anchor.last_chain;
                 self.last_data_slot = anchor.last_data_slot;
                 self.last_batch_id = anchor.last_batch_id;
