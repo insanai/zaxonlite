@@ -1,0 +1,37 @@
+{
+ "format": 1,
+ "run_at_utc": "2026-08-27T11:13:26.942996+00:00",
+ "workload_matches_primary": true,
+ "correctness": {
+  "zaxonlite": {
+   "orders": 372,
+   "all_nodes_equal": true,
+   "integrity": true
+  },
+  "rqlite": {
+   "orders": 372,
+   "all_nodes_equal": true,
+   "integrity": true
+  }
+ },
+ "results": {
+  "zaxonlite": {
+   "healthy_operations_per_second": 225.8,
+   "follower_down_operations_per_second": 315.7,
+   "leader_down_operations_per_second": 182.1,
+   "leader_crash_to_first_success_ms": 643.6,
+   "restarted_follower_catch_up_ms": 241.0,
+   "restarted_leader_catch_up_ms": 496.4,
+   "total_cluster_restart_ms": 492.8
+  },
+  "rqlite": {
+   "healthy_operations_per_second": 172.0,
+   "follower_down_operations_per_second": 221.1,
+   "leader_down_operations_per_second": 98.2,
+   "leader_crash_to_first_success_ms": 2032.3,
+   "restarted_follower_catch_up_ms": 890.7,
+   "restarted_leader_catch_up_ms": 589.0,
+   "total_cluster_restart_ms": 1567.2
+  }
+ }
+}
