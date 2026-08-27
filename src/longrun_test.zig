@@ -29,6 +29,11 @@ pub fn main(init: std.process.Init) !u8 {
         const text = iterator.next() orelse break :blk @as(u64, 20_000);
         break :blk std.fmt.parseInt(u64, text, 10) catch 20_000;
     };
+    // Below one full segment (16,384 records at two records per write)
+    // nothing rotates, so the reclamation assertions cannot hold.
+    if (writes < 10_000) {
+        return fail("{d} writes cannot rotate a segment; use 10000 or more", .{writes});
+    }
 
     var random_bytes: [8]u8 = undefined;
     io.random(&random_bytes);
@@ -58,6 +63,12 @@ pub fn main(init: std.process.Init) !u8 {
             if (index % 1_000 == 999) {
                 _ = try node.maybeCreateStateAnchor();
                 try node.reclaim();
+            }
+            if (index % 2_000 == 1_999) {
+                std.debug.print(
+                    "longrun: {d}/{d} writes\n",
+                    .{ index + 1, writes },
+                );
             }
         }
         try node.createStateAnchor();
