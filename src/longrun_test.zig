@@ -47,75 +47,10 @@ pub fn main(init: std.process.Init) !u8 {
     defer Io.Dir.cwd().deleteTree(io, directory) catch {};
 
     const started = std.Io.Clock.Timestamp.now(io, .awake);
-    {
-        const node = try Node.open(gpa, io, .{ .directory = directory });
-        defer node.close();
-        _ = try node.exec("create table t(id integer primary key, v integer)");
-        var sql_buffer: [96:0]u8 = undefined;
-        for (0..writes) |index| {
-            const sql = std.fmt.bufPrintZ(
-                &sql_buffer,
-                "insert into t(v) values ({d})",
-                .{index},
-            ) catch unreachable;
-            _ = try node.exec(sql);
-            // The host pump's periodic duties, at a test-friendly cadence.
-            if (index % 1_000 == 999) {
-                _ = try node.maybeCreateStateAnchor();
-                try node.reclaim();
-            }
-            if (index % 2_000 == 1_999) {
-                std.debug.print(
-                    "longrun: {d}/{d} writes\n",
-                    .{ index + 1, writes },
-                );
-            }
-        }
-        try node.createStateAnchor();
-        try node.reclaim();
-
-        const status = node.status();
-        if (node.identity.configuration_id != 1) {
-            return fail("configuration moved to {d}", .{
-                node.identity.configuration_id,
-            });
-        }
-        if (status.retained_first_slot <= 1) {
-            return fail("no segment was physically reclaimed", .{});
-        }
-        // Retention stays bounded: the suffix above the trim plus the
-        // active segment, never the whole history.
-        if (status.journal_segment_count > 4) {
-            return fail("{d} retained segments; retention is unbounded", .{
-                status.journal_segment_count,
-            });
-        }
-        if (status.chosen_trim_slot == 0 or
-            status.durable_state_slot == 0)
-        {
-            return fail("anchor or trim never advanced", .{});
-        }
-    }
-
-    // Restart: the image below the anchor is authoritative, the journal
-    // holds only the suffix, and recovery must still be complete.
-    {
-        const node = try Node.open(gpa, io, .{ .directory = directory });
-        defer node.close();
-        var result = try node.query(gpa, "select count(*), sum(v) from t");
-        defer result.deinit();
-        const count = try std.fmt.parseInt(u64, result.rows[0][0].?, 10);
-        const sum = try std.fmt.parseInt(u64, result.rows[0][1].?, 10);
-        if (count != writes) {
-            return fail("recovered {d} rows, wrote {d}", .{ count, writes });
-        }
-        if (sum != writes * (writes - 1) / 2) {
-            return fail("recovered sum {d} is wrong", .{sum});
-        }
-        const report = try node.integrityCheck();
-        if (!report.ok()) return fail("integrity check failed", .{});
-        _ = try node.exec("insert into t(v) values (-1)");
-    }
+    const wrote = try writePhase(gpa, io, directory, writes);
+    if (wrote != 0) return wrote;
+    const recovered = try restartPhase(gpa, io, directory, writes);
+    if (recovered != 0) return recovered;
 
     const finished = std.Io.Clock.Timestamp.now(io, .awake);
     const elapsed_ms: u64 = @intCast(@divTrunc(
@@ -126,6 +61,88 @@ pub fn main(init: std.process.Init) !u8 {
         "longrun: {d} writes, bounded retention, anchored restart ok ({d} ms)\n",
         .{ writes, elapsed_ms },
     );
+    return 0;
+}
+
+fn writePhase(
+    gpa: std.mem.Allocator,
+    io: Io,
+    directory: []const u8,
+    writes: u64,
+) !u8 {
+    const node = try Node.open(gpa, io, .{ .directory = directory });
+    defer node.close();
+    _ = try node.exec("create table t(id integer primary key, v integer)");
+    var sql_buffer: [96:0]u8 = undefined;
+    for (0..writes) |index| {
+        const sql = std.fmt.bufPrintZ(
+            &sql_buffer,
+            "insert into t(v) values ({d})",
+            .{index},
+        ) catch unreachable;
+        _ = try node.exec(sql);
+        // The host pump's periodic duties, at a test-friendly cadence.
+        if (index % 1_000 == 999) {
+            _ = try node.maybeCreateStateAnchor();
+            try node.reclaim();
+        }
+        if (index % 2_000 == 1_999) {
+            std.debug.print(
+                "longrun: {d}/{d} writes\n",
+                .{ index + 1, writes },
+            );
+        }
+    }
+    try node.createStateAnchor();
+    try node.reclaim();
+
+    const status = node.status();
+    if (node.identity.configuration_id != 1) {
+        return fail("configuration moved to {d}", .{
+            node.identity.configuration_id,
+        });
+    }
+    if (status.retained_first_slot <= 1) {
+        return fail("no segment was physically reclaimed", .{});
+    }
+    // Retention stays bounded: the suffix above the trim plus the
+    // active segment, never the whole history.
+    if (status.journal_segment_count > 4) {
+        return fail("{d} retained segments; retention is unbounded", .{
+            status.journal_segment_count,
+        });
+    }
+    if (status.chosen_trim_slot == 0 or
+        status.durable_state_slot == 0)
+    {
+        return fail("anchor or trim never advanced", .{});
+    }
+    return 0;
+}
+
+// Restart: the image below the anchor is authoritative, the journal
+// holds only the suffix, and recovery must still be complete.
+fn restartPhase(
+    gpa: std.mem.Allocator,
+    io: Io,
+    directory: []const u8,
+    writes: u64,
+) !u8 {
+    const node = try Node.open(gpa, io, .{ .directory = directory });
+    defer node.close();
+    var result = try node.query(gpa, "select count(*), sum(v) from t");
+    defer result.deinit();
+    const count = try std.fmt.parseInt(u64, result.rows[0][0].?, 10);
+    const sum = try std.fmt.parseInt(u64, result.rows[0][1].?, 10);
+    if (count != writes) {
+        return fail("recovered {d} rows, wrote {d}", .{ count, writes });
+    }
+    if (sum != writes * (writes - 1) / 2) {
+        return fail("recovered sum {d} is wrong", .{sum});
+    }
+    const report = try node.integrityCheck();
+    if (!report.ok()) return fail("integrity check failed", .{});
+    _ = try node.exec("insert into t(v) values (-1)");
     return 0;
 }
 

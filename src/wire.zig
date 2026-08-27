@@ -483,6 +483,33 @@ pub fn encodeEnvelope(
     return buffer[0..cursor.offset];
 }
 
+fn decodePromiseRange(reader: *types.ReadCursor) WireError!types.Log.Message {
+    var message = types.Log.Message{ .promise_range = .{
+        .ballot = try types.decodeBallot(reader),
+        .anchor = .{
+            .trim_id = try reader.int(u64),
+            .chosen_trim_slot = try reader.int(u64),
+            .history_hash = undefined,
+        },
+        .chosen_through = 0,
+        .first = 0,
+        .last = 0,
+        .accepted_count = 0,
+        .more = false,
+    } };
+    const range = &message.promise_range;
+    const hash = try reader.take(32);
+    @memcpy(&range.anchor.history_hash, hash);
+    range.chosen_through = try reader.int(u64);
+    range.first = try reader.int(u64);
+    range.last = try reader.int(u64);
+    range.accepted_count = try reader.int(u32);
+    const more_raw = try reader.byte();
+    if (more_raw > 1) return error.InvalidFrame;
+    range.more = more_raw == 1;
+    return message;
+}
+
 pub fn decodeEnvelope(body: []const u8) WireError!types.Log.Envelope {
     var reader = types.ReadCursor{ .buffer = body };
     const from = try reader.int(u32);
@@ -503,32 +530,7 @@ pub fn decodeEnvelope(body: []const u8) WireError!types.Log.Envelope {
                 .value = try types.decodeEntry(&reader),
             },
         } },
-        .promise_range => blk: {
-            var message = types.Log.Message{ .promise_range = .{
-                .ballot = try types.decodeBallot(&reader),
-                .anchor = .{
-                    .trim_id = try reader.int(u64),
-                    .chosen_trim_slot = try reader.int(u64),
-                    .history_hash = undefined,
-                },
-                .chosen_through = 0,
-                .first = 0,
-                .last = 0,
-                .accepted_count = 0,
-                .more = false,
-            } };
-            const range = &message.promise_range;
-            const hash = try reader.take(32);
-            @memcpy(&range.anchor.history_hash, hash);
-            range.chosen_through = try reader.int(u64);
-            range.first = try reader.int(u64);
-            range.last = try reader.int(u64);
-            range.accepted_count = try reader.int(u32);
-            const more_raw = try reader.byte();
-            if (more_raw > 1) return error.InvalidFrame;
-            range.more = more_raw == 1;
-            break :blk message;
-        },
+        .promise_range => try decodePromiseRange(&reader),
         .accept => .{ .accept = .{
             .ballot = try types.decodeBallot(&reader),
             .slot = try reader.int(u64),
