@@ -580,10 +580,12 @@ fn runJoinLadder(cluster: *Cluster, endpoints: []const Endpoint) !void {
 
     step("receiver dies after staging the transferred image");
     try cluster.spawnNode(3, &updated_ids, &updated_ports, "after_transfer_stage");
+    trickle(cluster, endpoints);
     cluster.waitNodeExit(3);
 
     step("receiver dies after the digest check, before the install rename");
     try cluster.spawnNode(3, &updated_ids, &updated_ports, "before_transfer_install");
+    trickle(cluster, endpoints);
     cluster.waitNodeExit(3);
 
     step("sender dies pinning its image; another voter completes the send");
@@ -596,6 +598,7 @@ fn runJoinLadder(cluster: *Cluster, endpoints: []const Endpoint) !void {
         30_000,
     ));
     try cluster.spawnNode(3, &updated_ids, &updated_ports, "after_transfer_install");
+    trickle(cluster, endpoints);
     cluster.waitNodeExit(leader_index);
     try cluster.spawnNode(
         leader_index,
@@ -610,6 +613,7 @@ fn runJoinLadder(cluster: *Cluster, endpoints: []const Endpoint) !void {
     // so the previous restart discarded it and transferred again; this
     // rung crashes after the anchor is durable.
     try cluster.spawnNode(3, &updated_ids, &updated_ports, "after_transfer_anchor");
+    trickle(cluster, endpoints);
     cluster.waitNodeExit(3);
 
     step("clean start converges from the installed anchor");
