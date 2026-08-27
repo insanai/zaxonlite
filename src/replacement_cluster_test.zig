@@ -345,6 +345,30 @@ fn waitForLeader(cluster: *Cluster, endpoint: Endpoint, deadline_ms: u64) u32 {
     fail(cluster, "timeout waiting for a leader at port {d}", .{endpoint.port});
 }
 
+/// Polls status until trim coordination has chosen a nonzero trim slot.
+/// A survivor whose journal replay froze the pre-handover configuration
+/// hashes its history leaves differently, so every trim round dies on
+/// error.HistoryMismatch and the chosen slot never advances.
+fn waitForTrimSlot(cluster: *Cluster, endpoint: Endpoint, deadline_ms: u64) void {
+    var elapsed: u64 = 0;
+    while (elapsed <= deadline_ms) {
+        poll: {
+            const body = rpcTry(cluster, endpoint, "{\"op\":\"status\"}") orelse
+                break :poll;
+            defer cluster.gpa.free(body);
+            const parsed = parse(cluster, body);
+            defer parsed.deinit();
+            if (!isOk(&parsed)) break :poll;
+            const slot = fieldInt(&parsed, "chosen_trim_slot") orelse break :poll;
+            if (slot > 0) return;
+        }
+        elapsed += 250;
+        cluster.io.sleep(.fromMilliseconds(250), .awake) catch {};
+    }
+    fail(cluster, "chosen_trim_slot never advanced at port {d}; " ++
+        "diverged history hashes freeze trim coordination", .{endpoint.port});
+}
+
 fn expectErrorCode(
     cluster: *Cluster,
     body: ?[]u8,
@@ -889,6 +913,40 @@ pub fn main(init: std.process.Init) !u8 {
             "--tls-cert",  admin_cert,      "--tls-key",         admin_key,
             "--tls-ca",    ca_path,
         }) catch fail(&cluster, "zaxon replace-voter retry failed", .{});
+    }
+
+    step("trim coordination still completes after the replacement");
+    // Regression: journal replay across the membership handover once froze
+    // the configuration used for history-leaf hashing, so a survivor
+    // restarted after the swap disagreed with its peers' history hashes
+    // and trim coordination silently stalled on error.HistoryMismatch.
+    // Fresh writes plus a durable anchor on every data voter make a trim
+    // candidate proposable; the chosen slot must then advance everywhere.
+    {
+        const voter_endpoints = [_]Endpoint{
+            cluster.endpointOf(0),
+            cluster.endpointOf(1),
+            cluster.endpointOf(3),
+        };
+        for (0..4) |_| {
+            gpa.free(mustCallAny(
+                &cluster,
+                &voter_endpoints,
+                "{\"op\":\"exec\",\"sql\":\"insert into t(v) values ('pre-trim')\"}",
+                60_000,
+            ));
+        }
+        for (0..voter_endpoints.len) |index| {
+            gpa.free(mustCallAny(
+                &cluster,
+                voter_endpoints[index .. index + 1],
+                "{\"op\":\"anchor\"}",
+                30_000,
+            ));
+        }
+        for (voter_endpoints) |endpoint| {
+            waitForTrimSlot(&cluster, endpoint, 60_000);
+        }
     }
 
     step("stop cluster");
