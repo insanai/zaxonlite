@@ -1885,6 +1885,21 @@ pub const Server = struct {
         return buffer[0..count];
     }
 
+    /// The next registry peer to probe for joiner recovery, rotating so
+    /// a dead or unhelpful peer never wedges the join.
+    fn nextRecoveryPeer(self: *Server) ?paxos.NodeId {
+        const members = self.node.members[0..self.node.member_count];
+        if (members.len <= 1) return null;
+        var index: usize = 0;
+        while (index < members.len) : (index += 1) {
+            const pick = members[(self.recovery_probe + index) % members.len];
+            if (pick == self.node.identity.node_id) continue;
+            self.recovery_probe = (self.recovery_probe + index + 1) % members.len;
+            return pick;
+        }
+        return null;
+    }
+
     fn requestSnapshot(self: *Server, from: paxos.NodeId) void {
         if (self.snapshot_source != null and
             self.tick_count < self.snapshot_requested_tick + 400)
