@@ -72,6 +72,13 @@ jobs:
       - name: Zig format check
         run: zig fmt --check build.zig src
 
+      # The style checker lives in the paxos-zig checkout at the
+      # workspace root and scans both trees, including the per-file
+      # code-line pins.
+      - name: Project style check
+        working-directory: .
+        run: sh tools/check-style.sh
+
       # Only src/sqlite/ may import the translated SQLite C module
       # (ZDS 0009). A plain grep keeps that boundary honest.
       - name: SQLite C import boundary
