@@ -163,6 +163,39 @@ pub const PayloadStore = struct {
         return bytes;
     }
 
+    /// Deletes every stored object absent from `reachable`. The caller
+    /// owns the reachability proof (a streamed scan of every retained
+    /// journal record); a crash mid-sweep leaks objects but never removes
+    /// a reachable one.
+    pub fn sweepUnreachable(
+        self: *PayloadStore,
+        reachable: *const std.AutoHashMap(Hash, void),
+    ) !void {
+        var shards = self.dir.iterate();
+        while (shards.next(self.io) catch null) |shard| {
+            if (shard.kind != .directory or shard.name.len != 2) continue;
+            var shard_name: [2]u8 = shard.name[0..2].*;
+            var shard_dir = self.dir.openDir(
+                self.io,
+                &shard_name,
+                .{ .iterate = true },
+            ) catch continue;
+            defer shard_dir.close(self.io);
+            var objects = shard_dir.iterate();
+            while (objects.next(self.io) catch null) |object| {
+                if (object.kind != .file or object.name.len != 62) continue;
+                var hex: [64]u8 = undefined;
+                @memcpy(hex[0..2], &shard_name);
+                @memcpy(hex[2..], object.name[0..62]);
+                var digest: Hash = undefined;
+                _ = std.fmt.hexToBytes(&digest, &hex) catch continue;
+                if (reachable.contains(digest)) continue;
+                var object_name: [62]u8 = object.name[0..62].*;
+                shard_dir.deleteFile(self.io, &object_name) catch {};
+            }
+        }
+    }
+
     /// Removes one payload object. The caller owns the reachability proof.
     pub fn remove(self: *PayloadStore, digest: Hash) !void {
         var path_buffer: [65]u8 = undefined;
