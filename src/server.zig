@@ -1885,6 +1885,14 @@ pub const Server = struct {
         return buffer[0..count];
     }
 
+    /// Undoes the last rotation advance so the same peer is probed
+    /// again; used when the probe could not actually be sent.
+    fn retreatRecoveryProbe(self: *Server) void {
+        const count = self.node.member_count;
+        if (count == 0) return;
+        self.recovery_probe = (self.recovery_probe + count - 1) % count;
+    }
+
     /// The next registry peer to probe for joiner recovery, rotating so
     /// a dead or unhelpful peer never wedges the join.
     fn nextRecoveryPeer(self: *Server) ?paxos.NodeId {
@@ -1901,12 +1909,19 @@ pub const Server = struct {
     }
 
     fn requestSnapshot(self: *Server, from: paxos.NodeId) void {
+        _ = self.requestSnapshotSent(from);
+    }
+
+    /// Like `requestSnapshot`, but reports whether a request actually
+    /// went out: a peer whose sender connection is not up yet must not
+    /// consume a recovery probe.
+    fn requestSnapshotSent(self: *Server, from: paxos.NodeId) bool {
         if (self.snapshot_source != null and
             self.tick_count < self.snapshot_requested_tick + 400)
         {
-            return;
+            return true;
         }
-        const sender = self.senderFor(from) orelse return;
+        const sender = self.senderFor(from) orelse return false;
         self.snapshot_source = from;
         self.snapshot_requested_tick = self.tick_count;
         var body: [wire.SnapshotRequest.encoded_size]u8 = undefined;
@@ -1914,8 +1929,9 @@ pub const Server = struct {
             .applied_slot = self.node.applied_slot,
         }).encode(&body);
         const frame = wire.frameAlloc(self.gpa, .snapshot_request, &.{encoded}) catch
-            return;
+            return false;
         sender.enqueue(frame);
+        return true;
     }
 
     // ------------------------------------------------------------------
@@ -1975,7 +1991,12 @@ pub const Server = struct {
                 {
                     if (self.nextRecoveryPeer()) |peer| {
                         self.node.requestCatchUp(peer) catch {};
-                        self.requestSnapshot(peer);
+                        if (!self.requestSnapshotSent(peer)) {
+                            // The peer's sender is not connected yet;
+                            // retry the same peer on the next probe
+                            // instead of burning the rotation slot.
+                            self.retreatRecoveryProbe();
+                        }
                         self.pump();
                     }
                 }
