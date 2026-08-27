@@ -227,15 +227,16 @@ pub const Journal = struct {
 
     /// Unlinks every sealed segment wholly at or below `floor`, after a
     /// successor manifest generation is durable. Only complete segments
-    /// go; the caller has already made its TRIM state durable.
-    pub fn trimThrough(self: *Journal, floor: u64) !void {
+    /// go; the caller has already made its TRIM state durable. Returns
+    /// whether any segment was removed.
+    pub fn trimThrough(self: *Journal, floor: u64) !bool {
         var keep: usize = 0;
         while (keep < self.segments.items.len and
             self.segments.items[keep].last_slot <= floor)
         {
             keep += 1;
         }
-        if (keep == 0) return;
+        if (keep == 0) return false;
 
         const removed = try self.gpa.dupe(
             manifest_mod.SegmentEntry,
@@ -264,6 +265,7 @@ pub const Journal = struct {
             };
         }
         try durability.syncDirectory(self.dir);
+        return true;
     }
 
     /// Streams retained commits in `[first, first + count - 1]` to `sink`,
@@ -710,7 +712,7 @@ test "trimming unlinks sealed prefixes and keeps the promise rollup" {
     try testing.expectEqual(@as(usize, 1), journal.segments.items.len);
 
     journal.noteTrimAnchor(1, segment.capacity_records - 1, [_]u8{5} ** 32);
-    try journal.trimThrough(segment.capacity_records - 1);
+    try testing.expect(try journal.trimThrough(segment.capacity_records - 1));
     try testing.expectEqual(@as(usize, 0), journal.segments.items.len);
     journal.close();
 

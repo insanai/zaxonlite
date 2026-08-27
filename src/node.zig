@@ -512,6 +512,8 @@ pub const Node = struct {
     /// Durable local trim state: the adopted cluster anchor plus the
     /// active transfer leases capping deletion (ZDS 0011).
     trim_state: trim.State = .{},
+    /// Chosen-trim generation the payload sweep last ran for.
+    swept_trim_id: u64 = 0,
     /// Recent chosen transaction batches, kept so a write waiter can be
     /// resolved even after the core window released the slot's cell.
     recent_batches: [64]RecentBatch = [_]RecentBatch{.{}} ** 64,
@@ -1739,11 +1741,17 @@ pub const Node = struct {
             std.math.maxInt(u64),
             self.trim_state.leasesSlice(),
         );
-        if (floor <= self.journal.trimmed_through) return;
+        if (floor == 0) return;
         failpoint.hit("before_segment_unlink");
-        try self.journal.trimThrough(floor);
+        const removed = try self.journal.trimThrough(floor);
         failpoint.hit("after_segment_unlink");
-        try self.sweepPayloads();
+        // The payload sweep streams the whole retained journal, so it
+        // runs when history was removed or the chosen trim advanced —
+        // never on every pump.
+        if (removed or self.trim_state.trim_id > self.swept_trim_id) {
+            try self.sweepPayloads();
+            self.swept_trim_id = self.trim_state.trim_id;
+        }
     }
 
     /// Deletes payload objects no retained journal record references.
