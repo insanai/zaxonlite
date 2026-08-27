@@ -43,8 +43,8 @@ write is framed, checksummed, appended, and fsynced before the consensus
 layer is allowed to proceed. A write is acknowledged only after its slot
 commits and carries the client's own batch. The SQLite file is just
 materialized state: delete `current.db` and the node rebuilds it from the
-last snapshot plus the journal suffix. If you remember one thing about
-operating zaxonlite, remember this one.
+last durable state anchor plus the journal suffix. If you remember one
+thing about operating zaxonlite, remember this one.
 
 ## What you get
 
@@ -59,9 +59,11 @@ operating zaxonlite, remember this one.
 - Three read levels: `any` (local, possibly stale, labeled, with a
   freshness bound), `leader`, and `linearizable` (a quorum read fence with
   no log append and no disk sync per read).
-- Snapshots and epoch rollover: online checkpoints seal 2,048-slot epochs,
-  every member builds a byte-identical generation, and rollover is
-  crash-resumable.
+- Bounded recovery without rollover: slots are 64-bit and never reset,
+  periodic durable state anchors bound restart replay to the journal
+  suffix, and the cluster trims history it has certified as applied
+  everywhere -- no epoch seal, no full-database copy or hash on the write
+  path, whatever the database size.
 - Decided membership: served clusters persist a consensus-decided
   registry, and `zaxon replace-voter` replaces one failed data voter
   online -- same database identity, client connections stay open, and the
@@ -203,7 +205,7 @@ sh benchmarks/compare-rqlite-3node.sh     # needs installed rqlited/rqlite
 
 Production TCP requires mutual TLS 1.3. Peer certificate common names are
 bound to configured node IDs, and TLS covers SQL, results, payloads, and
-snapshots. An optional provider-file PSK adds sequenced HMAC protection
+state transfers. An optional provider-file PSK adds sequenced HMAC protection
 inside TLS. `--dev-psk` is for loopback experiments only; plaintext TCP is
 gated behind test failpoints; local single-node service uses an owner-only
 Unix socket. The decided membership registry is the authorization
@@ -212,7 +214,7 @@ is rejected even with an otherwise valid certificate. Privileged
 membership operations additionally require a `zaxon-admin-<name>`
 certificate from the server's allow-list.
 
-Files on disk (database, WAL, journal, snapshots, backups) are plaintext.
+Files on disk (database, WAL, journal, backups) are plaintext.
 If you need protection from someone holding the disk, use full-disk or
 filesystem encryption. We would rather tell you that than have you assume
 otherwise.
@@ -270,10 +272,9 @@ browsers refuse to load from `file://`).
 data/
   LOCK                     # exclusive process lock
   identity                 # node/database IDs, current configuration
-  paxos-<config>.log       # framed, checksummed protocol journal
+  consensus/               # lifetime journal: slot-named segments,
+                           #   MANIFEST, APPLIED.0/1 anchors, TRIM state
   payloads/aa/<hash>       # immutable frame payloads by SHA-256
-  snapshots/<config>/      # db image + manifest per sealed epoch
-  CURRENT                  # installed snapshot pointer
   registries/<config>      # canonical decided-registry blobs
   REGISTRY                 # active decided-registry pointer
   PENDING-OP               # one in-flight replacement request, if any
