@@ -1909,12 +1909,177 @@ pub const Node = struct {
         self: *Node,
         request: *const registry.ReplacementRequest,
     ) !void {
-        _ = request;
         if (!self.capabilities.serves_writes) return error.RoleCannotWrite;
-        // Voter replacement is rewired onto transfer leases and the
-        // anchor-pinned state transfer (ZDS 0011, ZDS 0008); until that
-        // lands the operation is unavailable rather than half-migrated.
-        return error.StateTransferUnavailable;
+        if (self.fatal_storage_error) return error.StorageFailed;
+        const decided = self.decidedRegistry() orelse
+            return error.NoDecidedRegistry;
+        if (try self.pendingOperation()) |pending| {
+            if (!pending.matches(request)) return error.OperationConflict;
+            if (pending.phase == .proposed) return error.OperationAlreadyProposed;
+        }
+        switch (try decided.validateRequest(request)) {
+            .fresh => {},
+            .retry => return error.OperationAlreadyComplete,
+        }
+        if (self.needs_resync) try self.resyncImage();
+        if (self.live_transaction) return error.TransactionOpen;
+        if (self.capture_batch_id != null) return error.WriteInFlight;
+
+        // The request is durable before anything is proposed, so an
+        // ambiguous crash resolves by operation ID.
+        try self.persistPendingOperation(request, .prepared);
+        failpoint.hit("after_pending_op");
+
+        // The stop sign binds only the canonical next registry and the
+        // seed reconstructing it. State rides the retained journal and
+        // the anchor-pinned transfer, never a snapshot generation
+        // (ZDS 0011); global slots continue across the transition.
+        const next = try decided.successor(request);
+        const metadata = renderStopMetadata(next.digest(), request);
+        var voter_buffer: [types.log_options.max_members]paxos.NodeId = undefined;
+        const next_voters = next.voterIds(&voter_buffer);
+        _ = try self.log.reconfigure(
+            next.configuration_id,
+            next_voters,
+            metadata.slice(),
+            self.effects,
+        );
+        try self.consumeEffects();
+        failpoint.hit("after_replacement_submission");
+        try self.persistPendingOperation(request, .proposed);
+        failpoint.hit("after_replacement_proposed");
+    }
+
+    /// Completes a decided membership change on a survivor: reconstructs
+    /// and durably installs the next registry, advances the identity, and
+    /// continues the protocol node on the same global slot line
+    /// (ZDS 0008 over ZDS 0011). A voter the stop sign removed stays
+    /// permanently sealed on its final configuration.
+    pub fn completeMembershipChange(self: *Node) !void {
+        const stop = self.log.isReconfigured() orelse return error.NoStopSign;
+        const stop_slot = self.log.stopSlot() orelse return error.NoStopSign;
+        // Nothing can be chosen beyond a sealed configuration, so the
+        // handover waits only for the stop itself to be applied.
+        if (self.applied_slot < stop_slot) return error.StopNotApplied;
+        std.debug.assert(self.applied_slot == stop_slot);
+        const parsed = try parseStopMetadata(stop.metadataSlice());
+
+        if (self.capabilities.votes) {
+            var still_member = false;
+            for (stop.membersSlice()) |member| {
+                if (member == self.identity.node_id) still_member = true;
+            }
+            if (!still_member) return error.RetiredByReconfiguration;
+        }
+
+        const decided = self.decidedRegistry() orelse
+            return error.NoDecidedRegistry;
+        const next = try reconstructNextRegistry(
+            decided,
+            &parsed,
+            stop.configuration_id,
+        );
+        try registry.storeBlob(self.io, self.dir, &next);
+        failpoint.hit("after_registry_blob");
+        try registry.activatePointer(self.io, self.dir, next.configuration_id);
+        failpoint.hit("after_registry_pointer");
+
+        self.identity.configuration_id = next.configuration_id;
+        try writeIdentity(self.io, self.dir, self.identity);
+        self.decided_registry = next;
+        try self.adoptDecidedMembers();
+        try self.continueOnConfiguration(stop_slot);
+
+        if (try self.pendingOperation()) |pending| {
+            if (parsed.seed) |seed| {
+                if (pending.operation_id == seed.operation_id) {
+                    try self.clearPendingOperation();
+                }
+            }
+        }
+        self.membership_change_pending = false;
+    }
+
+    /// Installs the decided registry a joining replacement fetched from a
+    /// peer, verified against the enrollment join descriptor, then joins
+    /// the configuration it names at the empty global slot line. The
+    /// pointer write commits the install; a crash before it repeats the
+    /// fetch on restart.
+    pub fn installFetchedRegistry(self: *Node, blob: []const u8) !void {
+        const join = self.join_descriptor orelse return error.NoJoinPending;
+        var fetched = registry.Decided.decode(blob) catch
+            return error.RegistryMismatch;
+        fetched.validate() catch return error.RegistryMismatch;
+        if (fetched.database_id != self.identity.database_id or
+            fetched.configuration_id != join.configuration_id or
+            !std.mem.eql(u8, &fetched.digest(), &join.registry_digest))
+        {
+            return error.RegistryMismatch;
+        }
+
+        try registry.storeBlob(self.io, self.dir, &fetched);
+        failpoint.hit("after_registry_blob");
+        try registry.activatePointer(self.io, self.dir, fetched.configuration_id);
+        failpoint.hit("after_registry_pointer");
+        try durableDeleteFile(self.io, self.dir, join_file_name);
+        self.join_descriptor = null;
+
+        self.identity.configuration_id = fetched.configuration_id;
+        try writeIdentity(self.io, self.dir, self.identity);
+        self.decided_registry = fetched;
+        try self.adoptDecidedMembers();
+        try self.continueOnConfiguration(self.applied_slot);
+    }
+
+    /// Refreshes the member table from the decided registry.
+    fn adoptDecidedMembers(self: *Node) !void {
+        var member_storage: [types.log_options.max_members]paxos.NodeId = undefined;
+        const members = self.decided_registry.?.voterIds(&member_storage);
+        var found_self = false;
+        for (members) |member| {
+            if (member == self.identity.node_id) found_self = true;
+        }
+        if (found_self != self.capabilities.votes) {
+            return error.RoleMembershipMismatch;
+        }
+        @memcpy(self.members[0..members.len], members);
+        self.member_count = @intCast(members.len);
+        self.single = self.capabilities.votes and members.len == 1;
+    }
+
+    /// Restarts the protocol node under the current identity and member
+    /// table at `floor`, keeping the global slot line and the adopted
+    /// trim anchor. Accepted-only state above the floor belongs to the
+    /// sealed configuration and is discarded, exactly as a restart is.
+    fn continueOnConfiguration(self: *Node, floor: paxos.Slot) !void {
+        var membership: Log.Membership = undefined;
+        try membership.init(self.members[0..self.member_count]);
+        const durable = try self.gpa.create(Log.DurableState);
+        defer self.gpa.destroy(durable);
+        durable.* = .{};
+        durable.anchor = self.log.trimAnchor();
+        if (self.capabilities.votes) {
+            try self.log.restoreAt(
+                self.identity.node_id,
+                self.identity.configuration_id,
+                &membership,
+                durable,
+                floor,
+                self.leader_priority,
+            );
+        } else {
+            try self.log.restoreLearner(
+                self.identity.node_id,
+                self.identity.configuration_id,
+                &membership,
+                durable,
+            );
+        }
+        self.log.core.setCampaignEnabled(self.capabilities.campaigns);
+        if (self.single and self.capabilities.campaigns) {
+            try self.log.campaign(.noop, self.effects);
+            try self.consumeEffects();
+        }
     }
 
     pub fn backup(self: *Node, destination: []const u8) !void {
@@ -3415,63 +3580,74 @@ pub const Node = struct {
     };
 
     const StopMetadata = struct {
-        name: [16]u8,
-        manifest_hash: [32]u8,
-        /// Digest of the canonical next decided registry; null for `zx1`
-        /// metadata written by registry-less embedded and local hosts.
-        registry_digest: ?[32]u8,
+        /// Digest of the canonical next decided registry.
+        registry_digest: [32]u8,
         /// Present only for a decided voter replacement.
         seed: ?StopSeed,
     };
 
+    const StopMetadataText = struct {
+        buffer: [types.log_options.max_metadata_bytes]u8,
+        len: usize,
+
+        fn slice(self: *const StopMetadataText) []const u8 {
+            return self.buffer[0..self.len];
+        }
+    };
+
+    /// Renders zx3 stop metadata: the next registry digest plus the
+    /// replacement seed every survivor reconstructs the registry from.
+    fn renderStopMetadata(
+        digest: [32]u8,
+        request: *const registry.ReplacementRequest,
+    ) StopMetadataText {
+        var text = StopMetadataText{ .buffer = undefined, .len = 0 };
+        const digest_hex = std.fmt.bytesToHex(digest, .lower);
+        const rendered = std.fmt.bufPrint(
+            &text.buffer,
+            "zx3 {s} {x:0>16} {x:0>8} {x:0>8} {s}",
+            .{
+                &digest_hex,
+                request.operation_id,
+                request.old_node_id,
+                request.new_node_id,
+                request.new_endpoint,
+            },
+        ) catch unreachable;
+        text.len = rendered.len;
+        return text;
+    }
+
     fn parseStopMetadata(metadata: []const u8) !StopMetadata {
         var parts = std.mem.tokenizeScalar(u8, metadata, ' ');
         const tag = parts.next() orelse return error.CorruptStopSign;
-        const versioned = std.mem.eql(u8, tag, "zx2");
-        if (!versioned and !std.mem.eql(u8, tag, "zx1")) {
+        if (!std.mem.eql(u8, tag, "zx3")) return error.CorruptStopSign;
+        const registry_hex = parts.next() orelse return error.CorruptStopSign;
+        if (registry_hex.len != 64) return error.CorruptStopSign;
+        var result = StopMetadata{ .registry_digest = undefined, .seed = null };
+        _ = std.fmt.hexToBytes(&result.registry_digest, registry_hex) catch
             return error.CorruptStopSign;
-        }
-        const snapshot_name = parts.next() orelse return error.CorruptStopSign;
-        if (snapshot_name.len != 16) return error.CorruptStopSign;
-        const manifest_hash_hex = parts.next() orelse return error.CorruptStopSign;
-        if (manifest_hash_hex.len != 64) return error.CorruptStopSign;
-        var result = StopMetadata{
-            .name = snapshot_name[0..16].*,
-            .manifest_hash = undefined,
-            .registry_digest = null,
-            .seed = null,
-        };
-        _ = std.fmt.hexToBytes(&result.manifest_hash, manifest_hash_hex) catch
-            return error.CorruptStopSign;
-        if (versioned) {
-            const registry_hex = parts.next() orelse return error.CorruptStopSign;
-            if (registry_hex.len != 64) return error.CorruptStopSign;
-            var registry_digest: [32]u8 = undefined;
-            _ = std.fmt.hexToBytes(&registry_digest, registry_hex) catch
+        if (parts.next()) |operation_hex| {
+            if (operation_hex.len != 16) return error.CorruptStopSign;
+            const old_hex = parts.next() orelse return error.CorruptStopSign;
+            if (old_hex.len != 8) return error.CorruptStopSign;
+            const new_hex = parts.next() orelse return error.CorruptStopSign;
+            if (new_hex.len != 8) return error.CorruptStopSign;
+            const endpoint = parts.next() orelse return error.CorruptStopSign;
+            registry.validateEndpoint(endpoint) catch
                 return error.CorruptStopSign;
-            result.registry_digest = registry_digest;
-            if (parts.next()) |operation_hex| {
-                if (operation_hex.len != 16) return error.CorruptStopSign;
-                const old_hex = parts.next() orelse return error.CorruptStopSign;
-                if (old_hex.len != 8) return error.CorruptStopSign;
-                const new_hex = parts.next() orelse return error.CorruptStopSign;
-                if (new_hex.len != 8) return error.CorruptStopSign;
-                const endpoint = parts.next() orelse return error.CorruptStopSign;
-                registry.validateEndpoint(endpoint) catch
-                    return error.CorruptStopSign;
-                var seed = StopSeed{
-                    .operation_id = std.fmt.parseInt(u64, operation_hex, 16) catch
-                        return error.CorruptStopSign,
-                    .old_node_id = std.fmt.parseInt(paxos.NodeId, old_hex, 16) catch
-                        return error.CorruptStopSign,
-                    .new_node_id = std.fmt.parseInt(paxos.NodeId, new_hex, 16) catch
-                        return error.CorruptStopSign,
-                    .endpoint = [_]u8{0} ** registry.max_endpoint_bytes,
-                    .endpoint_len = @intCast(endpoint.len),
-                };
-                @memcpy(seed.endpoint[0..endpoint.len], endpoint);
-                result.seed = seed;
-            }
+            var seed = StopSeed{
+                .operation_id = std.fmt.parseInt(u64, operation_hex, 16) catch
+                    return error.CorruptStopSign,
+                .old_node_id = std.fmt.parseInt(paxos.NodeId, old_hex, 16) catch
+                    return error.CorruptStopSign,
+                .new_node_id = std.fmt.parseInt(paxos.NodeId, new_hex, 16) catch
+                    return error.CorruptStopSign,
+                .endpoint = [_]u8{0} ** registry.max_endpoint_bytes,
+                .endpoint_len = @intCast(endpoint.len),
+            };
+            @memcpy(seed.endpoint[0..endpoint.len], endpoint);
+            result.seed = seed;
         }
         if (parts.next() != null) return error.CorruptStopSign;
         return result;
@@ -3487,8 +3663,7 @@ pub const Node = struct {
         parsed: *const StopMetadata,
         next_configuration: u64,
     ) !registry.Decided {
-        const expected_digest = parsed.registry_digest orelse
-            return error.CorruptStopSign;
+        const expected_digest = parsed.registry_digest;
         var base = decided.*;
         if (base.configuration_id == next_configuration) {
             // The pointer already advanced in a previous crashed rollover.
