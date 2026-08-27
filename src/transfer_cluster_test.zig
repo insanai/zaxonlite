@@ -300,14 +300,18 @@ fn waitForLeader(cluster: *Cluster, endpoint: Endpoint, deadline_ms: u64) u32 {
     fail(cluster, "timeout waiting for a leader at port {d}", .{endpoint.port});
 }
 
-/// The linearizable row count of table t as observed through `endpoint`.
-fn countRows(cluster: *Cluster, endpoint: Endpoint, deadline_ms: u64) i64 {
-    const endpoints = [_]Endpoint{endpoint};
+/// The row count of table t at `level`, served by any of `endpoints`.
+fn countRows(
+    cluster: *Cluster,
+    endpoints: []const Endpoint,
+    comptime level: []const u8,
+    deadline_ms: u64,
+) i64 {
     const body = mustCallAny(
         cluster,
-        &endpoints,
+        endpoints,
         "{\"op\":\"query\",\"sql\":\"select count(*) from t\"," ++
-            "\"level\":\"linearizable\"}",
+            "\"level\":\"" ++ level ++ "\"}",
         deadline_ms,
     );
     defer cluster.gpa.free(body);
@@ -670,29 +674,21 @@ fn runJoinLadder(cluster: *Cluster, endpoints: []const Endpoint) !void {
     _ = applied;
     gpa.free(mustCallAny(
         cluster,
-        active[2..3],
+        &active,
         "{\"op\":\"exec\",\"sql\":\"insert into t(v) values ('post-transfer')\"}",
         60_000,
     ));
     // Trickle writes may be retried through a dying leader, so the exact
     // total varies; the invariants are replica equality and the full
     // seed prefix surviving the transfer.
-    const baseline = countRows(cluster, active[0], 60_000);
+    const baseline = countRows(cluster, &active, "linearizable", 60_000);
     if (baseline < seed_rows + 1) {
         fail(cluster, "only {d} rows survived; the seed prefix is short", .{
             baseline,
         });
     }
-    for (active[1..]) |endpoint| {
-        const count = countRows(cluster, endpoint, 60_000);
-        if (count != baseline) {
-            fail(cluster, "port {d} sees {d} rows, port {d} sees {d}", .{
-                endpoint.port,
-                count,
-                active[0].port,
-                baseline,
-            });
-        }
+    for (active) |endpoint| {
+        waitReplicaCount(cluster, endpoint, baseline, 60_000);
     }
 
     step("the transferred replica survives its own restart");
@@ -701,22 +697,43 @@ fn runJoinLadder(cluster: *Cluster, endpoints: []const Endpoint) !void {
     waitForConfiguration(cluster, receiver, 2, 60_000);
     gpa.free(mustCallAny(
         cluster,
-        active[2..3],
+        &active,
         "{\"op\":\"exec\",\"sql\":\"insert into t(v) values ('post-restart')\"}",
         60_000,
     ));
-    const after = countRows(cluster, active[0], 60_000);
+    const after = countRows(cluster, &active, "linearizable", 60_000);
     if (after < baseline + 1) {
         fail(cluster, "restart lost rows: {d} then {d}", .{ baseline, after });
     }
-    for (active[1..]) |endpoint| {
-        const count = countRows(cluster, endpoint, 60_000);
-        if (count != after) {
-            fail(cluster, "after restart port {d} sees {d}, expected {d}", .{
-                endpoint.port,
-                count,
-                after,
-            });
-        }
+    for (active) |endpoint| {
+        waitReplicaCount(cluster, endpoint, after, 60_000);
     }
+}
+
+/// Polls one replica's locally served count until it reaches `expected`;
+/// replication lag is tolerated, divergence is not.
+fn waitReplicaCount(
+    cluster: *Cluster,
+    endpoint: Endpoint,
+    expected: i64,
+    deadline_ms: u64,
+) void {
+    const single = [_]Endpoint{endpoint};
+    var elapsed: u64 = 0;
+    while (elapsed <= deadline_ms) {
+        const count = countRows(cluster, &single, "any", 10_000);
+        if (count >= expected) {
+            if (count > expected) {
+                fail(cluster, "port {d} sees {d} rows, expected {d}", .{
+                    endpoint.port,
+                    count,
+                    expected,
+                });
+            }
+            return;
+        }
+        elapsed += 250;
+        cluster.io.sleep(.fromMilliseconds(250), .awake) catch {};
+    }
+    fail(cluster, "port {d} never reached {d} rows", .{ endpoint.port, expected });
 }
