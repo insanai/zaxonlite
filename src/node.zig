@@ -1735,9 +1735,16 @@ pub const Node = struct {
     /// commit path.
     pub fn reclaim(self: *Node) !void {
         if (self.trim_state.through_slot == 0) return;
+        // A witness holds no materialized state: its trim anchor alone is
+        // its recovery base, so it deletes through the anchor (ZDS 0011).
+        // A data replica is additionally capped by its durable anchor.
+        const durable_cap = if (self.capabilities.materializes)
+            self.durable_state_slot
+        else
+            self.trim_state.through_slot;
         const floor = trim.deleteFloor(
             self.trim_state.through_slot,
-            self.durable_state_slot,
+            durable_cap,
             std.math.maxInt(u64),
             self.trim_state.leasesSlice(),
         );
