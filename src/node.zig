@@ -2162,12 +2162,22 @@ pub const Node = struct {
     /// fetch on restart.
     pub fn installFetchedRegistry(self: *Node, blob: []const u8) !void {
         const join = self.join_descriptor orelse return error.NoJoinPending;
-        var fetched = registry.Decided.decode(blob) catch
+        // Stored blobs are canonical bytes plus a 32-byte digest trailer;
+        // the join descriptor binds the digest of the canonical bytes.
+        if (blob.len <= 32) return error.RegistryMismatch;
+        const encoded = blob[0 .. blob.len - 32];
+        var blob_digest: [32]u8 = undefined;
+        Sha256.hash(encoded, &blob_digest, .{});
+        if (!std.mem.eql(u8, &blob_digest, blob[blob.len - 32 ..]) or
+            !std.mem.eql(u8, &blob_digest, &join.registry_digest))
+        {
+            return error.RegistryMismatch;
+        }
+        var fetched = registry.Decided.decode(encoded) catch
             return error.RegistryMismatch;
         fetched.validate() catch return error.RegistryMismatch;
         if (fetched.database_id != self.identity.database_id or
-            fetched.configuration_id != join.configuration_id or
-            !std.mem.eql(u8, &fetched.digest(), &join.registry_digest))
+            fetched.configuration_id != join.configuration_id)
         {
             return error.RegistryMismatch;
         }

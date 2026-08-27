@@ -36,7 +36,6 @@ const sqlite = @import("sqlite.zig");
 const prepared = @import("prepared.zig");
 const search_api = @import("search_api.zig");
 const payload_store_mod = @import("payload_store.zig");
-const checkpoint_proof = @import("checkpoint_proof.zig");
 const enrollment = @import("enrollment.zig");
 const failpoint = @import("failpoint.zig");
 const roles = @import("roles.zig");
@@ -997,6 +996,8 @@ pub const Server = struct {
     last_learner_heartbeat_tick: ?u64 = null,
     snapshot_source: ?paxos.NodeId = null,
     snapshot_requested_tick: u64 = 0,
+    catch_up_last_decided: paxos.Slot = 0,
+    catch_up_stalled: u32 = 0,
     /// Latest per-peer progress reports for trim coordination (ZDS 0011).
     frontiers: [types.log_options.max_members]?trim.Frontier =
         [_]?trim.Frontier{null} ** types.log_options.max_members,
@@ -1890,7 +1891,12 @@ pub const Server = struct {
         const sender = self.senderFor(from) orelse return;
         self.snapshot_source = from;
         self.snapshot_requested_tick = self.tick_count;
-        const frame = wire.frameAlloc(self.gpa, .snapshot_request, &.{}) catch return;
+        var body: [wire.SnapshotRequest.encoded_size]u8 = undefined;
+        const encoded = (wire.SnapshotRequest{
+            .applied_slot = self.node.applied_slot,
+        }).encode(&body);
+        const frame = wire.frameAlloc(self.gpa, .snapshot_request, &.{encoded}) catch
+            return;
         sender.enqueue(frame);
     }
 
@@ -1938,12 +1944,25 @@ pub const Server = struct {
                 }
 
                 // A member that observes a further-ahead leader asks for
-                // the decided suffix it is missing.
+                // the decided suffix it is missing. When repeated range
+                // recovery makes no progress the gap sits below cluster
+                // retention, and only a full-image transfer closes it.
                 if (self.tick_count % 20 == 0 and !self.node.isLeader()) {
                     if (self.node.currentLeader()) |leader| {
                         if (leader != self.node.identity.node_id and
                             self.observed_leader_decided > self.node.log.decidedThrough())
                         {
+                            const decided = self.node.log.decidedThrough();
+                            if (decided > self.catch_up_last_decided) {
+                                self.catch_up_last_decided = decided;
+                                self.catch_up_stalled = 0;
+                            } else {
+                                self.catch_up_stalled += 1;
+                            }
+                            if (self.catch_up_stalled >= 10) {
+                                self.catch_up_stalled = 0;
+                                self.requestSnapshot(leader);
+                            }
                             self.node.requestCatchUp(leader) catch {};
                             self.pump();
                         }
@@ -2331,7 +2350,7 @@ pub const Server = struct {
                 .payload_request => self.onPayloadRequest(body, hello.node_id),
                 .fence_request => self.onFenceRequest(body, hello.node_id),
                 .fence_ack => self.onFenceAck(body, hello.node_id),
-                .snapshot_request => self.onSnapshotRequest(hello.node_id),
+                .snapshot_request => self.onSnapshotRequest(body, hello.node_id),
                 .snapshot_begin => try self.onSnapshotBegin(
                     body,
                     &install,
@@ -2601,15 +2620,94 @@ pub const Server = struct {
         self.pump();
     }
 
-    fn onSnapshotRequest(self: *Server, from: paxos.NodeId) void {
-        // Anchor-pinned state transfer replaces the snapshot stream
-        // (ZDS 0011); until it lands a lagging peer is told nothing and
-        // retries, so no half-format transfer can happen.
-        std.log.warn(
-            "node {d}: peer {d} needs state transfer; not yet wired in this build",
-            .{ self.node.identity.node_id, from },
-        );
-        return;
+    fn onSnapshotRequest(self: *Server, body: []const u8, from: paxos.NodeId) void {
+        const request = wire.SnapshotRequest.decode(body) catch return;
+        const sender = self.senderFor(from) orelse return;
+
+        // Serve a full-image transfer only when the retained journal can
+        // no longer cover the peer's gap; otherwise range recovery over
+        // ordinary commit envelopes is cheaper and does the same job.
+        self.mutex.lockUncancelable(self.io);
+        if (!self.node.capabilities.materializes or
+            self.node.journal.retainedFirstSlot() <= request.applied_slot + 1)
+        {
+            self.mutex.unlock(self.io);
+            return;
+        }
+        var pin = self.node.pinTransferImage() catch |err| {
+            self.mutex.unlock(self.io);
+            std.log.warn("transfer pin failed: {s}", .{@errorName(err)});
+            return;
+        };
+        const registry_digest: [32]u8 = if (self.node.decidedRegistry()) |decided|
+            decided.digest()
+        else
+            [_]u8{0} ** 32;
+        const registry_blob: ?[]u8 = if (self.node.decidedRegistry()) |decided|
+            self.node.readRegistryBlob(self.gpa, decided.configuration_id) catch null
+        else
+            null;
+        self.mutex.unlock(self.io);
+        defer pin.close();
+
+        // The decided registry blob goes ahead of the image: a joining
+        // replacement needs it first, and a receiver that already holds
+        // it verifies and ignores the duplicate.
+        if (registry_blob) |blob| {
+            defer self.gpa.free(blob);
+            if (blob.len > 0 and blob.len <= wire.RegistryData.max_blob_bytes) {
+                var body_buffer: [wire.RegistryData.max_encoded_size]u8 = undefined;
+                if ((wire.RegistryData{
+                    .configuration_id = pin.anchor.configuration_id,
+                    .blob = blob,
+                }).encode(&body_buffer)) |encoded| {
+                    if (wire.frameAlloc(self.gpa, .registry_data, &.{encoded})) |frame| {
+                        _ = sender.enqueueBackpressure(frame);
+                    } else |_| {}
+                } else |_| {}
+            }
+        }
+
+        const begin = wire.SnapshotBegin{
+            .configuration_id = pin.anchor.configuration_id,
+            .anchor_slot = pin.anchor.global_slot,
+            .history_hash = pin.anchor.history_hash,
+            .db_size = pin.size,
+            .image_sha256 = pin.sha256,
+            .sqlite_page_size = pin.anchor.sqlite_page_size,
+            .last_data_slot = pin.anchor.last_data_slot,
+            .last_batch_id = pin.anchor.last_batch_id,
+            .last_chain = pin.anchor.last_chain,
+            .registry_digest = registry_digest,
+        };
+        var begin_buffer: [wire.SnapshotBegin.encoded_size]u8 = undefined;
+        const begin_encoded = begin.encode(&begin_buffer);
+        const begin_frame = wire.frameAlloc(
+            self.gpa,
+            .snapshot_begin,
+            &.{begin_encoded},
+        ) catch return;
+        if (!sender.enqueueBackpressure(begin_frame)) return;
+
+        var offset: u64 = 0;
+        const chunk = self.gpa.alloc(u8, snapshot_chunk_bytes) catch return;
+        defer self.gpa.free(chunk);
+        while (offset < pin.size) {
+            const read = pin.file.readPositionalAll(self.io, chunk, offset) catch
+                return;
+            if (read == 0) break;
+            var offset_bytes: [8]u8 = undefined;
+            std.mem.writeInt(u64, &offset_bytes, offset, .little);
+            const frame = wire.frameAlloc(
+                self.gpa,
+                .snapshot_chunk,
+                &.{ &offset_bytes, chunk[0..read] },
+            ) catch return;
+            if (!sender.enqueueBackpressure(frame)) return;
+            offset += read;
+        }
+        const end_frame = wire.frameAlloc(self.gpa, .snapshot_end, &.{}) catch return;
+        _ = sender.enqueueBackpressure(end_frame);
     }
 
     fn onSnapshotBegin(
@@ -2618,13 +2716,39 @@ pub const Server = struct {
         install: *InstallState,
         from: paxos.NodeId,
     ) !void {
-        _ = self;
-        _ = from;
-        _ = body;
-        _ = install;
-        // The anchor-pinned state transfer replaces the snapshot stream
-        // (ZDS 0011); no half-format install is accepted meanwhile.
-        return error.InvalidFrame;
+        const begin = try wire.SnapshotBegin.decode(body);
+        install.reset(self.io, self.gpa);
+
+        self.mutex.lockUncancelable(self.io);
+        const stale = begin.configuration_id != self.node.identity.configuration_id or
+            begin.anchor_slot <= self.node.applied_slot;
+        const oversized = begin.db_size > self.options.max_transfer_bytes;
+        self.mutex.unlock(self.io);
+        if (stale) return;
+        if (oversized) return error.InvalidFrame;
+
+        // Never trust a single sender for base state: a read quorum of
+        // the current voters must vouch the anchor's history binding
+        // before any image byte is staged (ZDS 0011).
+        try self.confirmHistoryQuorum(begin.anchor_slot, begin.history_hash, from);
+
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (begin.anchor_slot <= self.node.applied_slot) return;
+        self.node.dir.deleteFile(self.io, node_mod.transfer_install_name) catch {};
+        const file = try self.node.dir.createFile(
+            self.io,
+            node_mod.transfer_install_name,
+            .{ .read = true },
+        );
+        install.file = file;
+        install.configuration_id = begin.configuration_id;
+        install.db_size = begin.db_size;
+        install.received = 0;
+        install.manifest = try self.gpa.dupe(u8, body);
+        if (self.installation == .not_applicable or self.installation == .failed) {
+            self.installation = .transferring;
+        }
     }
 
     fn onRegistryRequest(self: *Server, body: []const u8, from: paxos.NodeId) void {
@@ -2702,17 +2826,53 @@ pub const Server = struct {
     }
 
     fn onSnapshotChunk(self: *Server, body: []const u8, install: *InstallState) !void {
-        _ = self;
-        _ = body;
-        _ = install;
-        return error.InvalidFrame;
+        const chunk = try wire.SnapshotChunk.decode(body);
+        const file = install.file orelse return;
+        const chunk_end = std.math.add(u64, chunk.offset, chunk.bytes.len) catch
+            return error.InvalidFrame;
+        if (chunk.offset != install.received or
+            chunk.bytes.len == 0 or
+            chunk.bytes.len > snapshot_chunk_bytes or
+            chunk_end > install.db_size)
+        {
+            return error.InvalidFrame;
+        }
+        try file.writePositionalAll(self.io, chunk.bytes, chunk.offset);
+        install.received += chunk.bytes.len;
     }
 
     fn onSnapshotEnd(self: *Server, install: *InstallState, from: paxos.NodeId) !void {
-        _ = self;
-        _ = install;
-        _ = from;
-        return error.InvalidFrame;
+        const file = install.file orelse return;
+        if (install.received != install.db_size) return error.InvalidFrame;
+        try durability.syncFile(self.io, file);
+        file.close(self.io);
+        install.file = null;
+        const manifest = install.manifest orelse return;
+        defer {
+            self.gpa.free(manifest);
+            install.manifest = null;
+        }
+        const begin = try wire.SnapshotBegin.decode(manifest);
+
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.snapshot_source = null;
+        if (self.installation == .transferring) self.installation = .verifying;
+        self.node.installTransferredState(begin) catch |err| {
+            std.log.warn("state install failed: {s}", .{@errorName(err)});
+            if (self.installation != .not_applicable) {
+                self.installation = .failed;
+                self.installation_failure = err;
+            }
+            return;
+        };
+        if (self.installation != .not_applicable) {
+            self.installation = .installed;
+            self.installation_failure = null;
+        }
+        self.observed_leader_decided = 0;
+        self.node.requestCatchUp(from) catch {};
+        self.pump();
     }
 
     fn onCheckpointProofRequest(
@@ -2720,9 +2880,22 @@ pub const Server = struct {
         body: []const u8,
         from: paxos.NodeId,
     ) void {
-        _ = self;
-        _ = from;
-        _ = body;
+        const probe = wire.HistoryProbe.decode(body) catch return;
+        const sender = self.senderFor(from) orelse return;
+        self.mutex.lockUncancelable(self.io);
+        const local = self.node.historyHashAt(probe.slot);
+        self.mutex.unlock(self.io);
+        const hash = local orelse return;
+        if (!std.mem.eql(u8, &hash, &probe.hash)) return;
+
+        var reply_buffer: [wire.HistoryProbe.encoded_size]u8 = undefined;
+        const encoded = probe.encode(&reply_buffer);
+        const frame = wire.frameAlloc(
+            self.gpa,
+            .checkpoint_proof_reply,
+            &.{encoded},
+        ) catch return;
+        sender.enqueue(frame);
     }
 
     fn onCheckpointProofReply(
@@ -2730,9 +2903,87 @@ pub const Server = struct {
         body: []const u8,
         from: paxos.NodeId,
     ) void {
-        _ = self;
-        _ = from;
-        _ = body;
+        const vouch = wire.HistoryProbe.decode(body) catch return;
+        self.proof_mutex.lockUncancelable(self.io);
+        defer self.proof_mutex.unlock(self.io);
+        const waiter = self.proof_waiter orelse return;
+        if (waiter.nonce != vouch.nonce or waiter.slot != vouch.slot or
+            !std.mem.eql(u8, &waiter.hash, &vouch.hash))
+        {
+            return;
+        }
+        waiter.noteAck(from);
+    }
+
+    /// Blocks until a read quorum of the current voters vouches that the
+    /// chosen history through `slot` has hash `hash`. The transfer sender
+    /// counts as the first vouch; the local node vouches for itself when
+    /// it can.
+    fn confirmHistoryQuorum(
+        self: *Server,
+        slot: paxos.Slot,
+        hash: [32]u8,
+        source: paxos.NodeId,
+    ) !void {
+        self.mutex.lockUncancelable(self.io);
+        const members = self.node.memberIds();
+        var waiter = HistoryProbeWaiter{
+            .nonce = 0,
+            .slot = slot,
+            .hash = hash,
+            .needed = members.len / 2 + 1,
+        };
+        @memcpy(waiter.voters[0..members.len], members);
+        waiter.voter_count = @intCast(members.len);
+        self.mutex.unlock(self.io);
+        if (waiter.voter_count == 0) return error.HistoryQuorum;
+
+        self.proof_mutex.lockUncancelable(self.io);
+        if (self.proof_waiter != null) {
+            self.proof_mutex.unlock(self.io);
+            return error.HistoryProbeBusy;
+        }
+        var nonce = self.next_proof_nonce;
+        self.next_proof_nonce +%= 1;
+        if (self.next_proof_nonce == 0) self.next_proof_nonce = 1;
+        if (nonce == 0) nonce = 1;
+        waiter.nonce = nonce;
+        waiter.noteAck(source);
+        self.proof_waiter = &waiter;
+        self.proof_mutex.unlock(self.io);
+        defer {
+            self.proof_mutex.lockUncancelable(self.io);
+            if (self.proof_waiter == &waiter) self.proof_waiter = null;
+            self.proof_mutex.unlock(self.io);
+        }
+
+        var probe_buffer: [wire.HistoryProbe.encoded_size]u8 = undefined;
+        const encoded = (wire.HistoryProbe{
+            .nonce = nonce,
+            .slot = slot,
+            .hash = hash,
+        }).encode(&probe_buffer);
+        for (self.senders.items) |sender| {
+            if (!waiter.isVoter(sender.peer.id)) continue;
+            const frame = try wire.frameAlloc(
+                self.gpa,
+                .checkpoint_proof_request,
+                &.{encoded},
+            );
+            sender.enqueue(frame);
+        }
+
+        var elapsed_ms: u64 = 0;
+        while (elapsed_ms < 2_000) : (elapsed_ms += 1) {
+            self.proof_mutex.lockUncancelable(self.io);
+            const confirmed = waiter.ack_count >= waiter.needed;
+            self.proof_mutex.unlock(self.io);
+            if (confirmed) return;
+            if (self.isShutdown()) return error.Shutdown;
+            self.io.sleep(.fromMilliseconds(1), .awake) catch
+                return error.HistoryQuorum;
+        }
+        return error.HistoryQuorum;
     }
 
     // ------------------------------------------------------------------
