@@ -1559,14 +1559,21 @@ pub const Server = struct {
             };
         }
 
-        // A decided membership stop waits for the transfer-lease handover
-        // (ZDS 0008 over global slots); nothing else may proceed past it.
+        // A decided membership stop completes here: the survivor installs
+        // the next registry and continues on the same global slot line; a
+        // removed voter retires on its final configuration (ZDS 0008).
         if (!self.retired and self.node.membership_change_pending) {
-            std.log.warn(
-                "node {d}: decided membership change pending; " ++
-                    "handover not yet wired in this build",
-                .{self.node.identity.node_id},
-            );
+            self.node.completeMembershipChange() catch |err| switch (err) {
+                error.RetiredByReconfiguration => {
+                    self.retired = true;
+                    self.failEverything();
+                },
+                error.StopNotApplied => {},
+                else => std.log.warn(
+                    "membership completion failed: {s}",
+                    .{@errorName(err)},
+                ),
+            };
         }
 
         if (self.node.identity.configuration_id != previous_configuration) {
@@ -1922,6 +1929,14 @@ pub const Server = struct {
                 self.reportLeaderChangeLocked();
                 self.wakeWaiters();
                 self.closeExpiredConnections();
+
+                // A joining replacement fetches the decided registry it
+                // was enrolled against before it can participate.
+                if (self.tick_count % 20 == 0 and
+                    self.node.join_descriptor != null)
+                {
+                    self.requestJoinRegistry();
+                }
 
                 // A member that observes a further-ahead leader asks for
                 // the decided suffix it is missing.
@@ -2644,9 +2659,47 @@ pub const Server = struct {
     ) !void {
         const data = wire.RegistryData.decode(body) catch
             return error.InvalidFrame;
+        {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            if (self.node.join_descriptor != null) {
+                // A joining replacement adopts the registry it enrolled
+                // against, then joins its configuration at slot zero and
+                // catches up through the retained journal (ZDS 0011).
+                self.node.installFetchedRegistry(data.blob) catch |err| {
+                    std.log.warn(
+                        "fetched registry rejected: {s}",
+                        .{@errorName(err)},
+                    );
+                    return;
+                };
+                self.enterConfigurationLocked();
+                self.pump();
+                return;
+            }
+        }
         if (install.registry_blob) |old| self.gpa.free(old);
         install.registry_blob = try self.gpa.dupe(u8, data.blob);
         install.registry_blob_configuration = data.configuration_id;
+    }
+
+    /// Asks every connected peer for the decided registry blob named by
+    /// this node's join descriptor.
+    fn requestJoinRegistry(self: *Server) void {
+        const join = self.node.join_descriptor orelse return;
+        var request_buffer: [wire.RegistryRequest.encoded_size]u8 = undefined;
+        const encoded = (wire.RegistryRequest{
+            .configuration_id = join.configuration_id,
+        }).encode(&request_buffer);
+        for (self.senders.items) |sender| {
+            if (!sender.isConnected()) continue;
+            const frame = wire.frameAlloc(
+                self.gpa,
+                .registry_request,
+                &.{encoded},
+            ) catch return;
+            sender.enqueue(frame);
+        }
     }
 
     fn onSnapshotChunk(self: *Server, body: []const u8, install: *InstallState) !void {
