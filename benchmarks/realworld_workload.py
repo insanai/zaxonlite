@@ -34,21 +34,21 @@ TRANSIENT_RQLITE_TEXT = (
 
 
 SCHEMA = (
-    """create table customers(
+    """create table if not exists customers(
         id integer primary key,
         email text not null unique,
         region text not null,
         tier integer not null,
         created_at integer not null
     )""",
-    """create table products(
+    """create table if not exists products(
         id integer primary key,
         sku text not null unique,
         name text not null,
         price_cents integer not null check(price_cents > 0),
         stock integer not null check(stock >= 0)
     )""",
-    """create table orders(
+    """create table if not exists orders(
         id integer primary key,
         operation_id text not null unique,
         customer_id integer not null references customers(id),
@@ -59,21 +59,21 @@ SCHEMA = (
         metadata text not null,
         created_at integer not null
     )""",
-    """create table order_lines(
+    """create table if not exists order_lines(
         order_id integer primary key references orders(id),
         product_id integer not null,
         quantity integer not null,
         line_total_cents integer not null
     )""",
-    """create table order_ledger(
+    """create table if not exists order_ledger(
         operation_id text primary key,
         order_id integer not null unique,
         amount_cents integer not null,
         recorded_at integer not null
     )""",
-    "create index orders_customer_time on orders(customer_id, created_at desc)",
-    "create index order_lines_product on order_lines(product_id)",
-    """create trigger order_fanout after insert on orders begin
+    "create index if not exists orders_customer_time on orders(customer_id, created_at desc)",
+    "create index if not exists order_lines_product on order_lines(product_id)",
+    """create trigger if not exists order_fanout after insert on orders begin
         insert into order_lines(order_id, product_id, quantity, line_total_cents)
             values(new.id, new.product_id, new.quantity,
                    new.quantity * new.unit_price_cents);
@@ -88,14 +88,14 @@ SCHEMA = (
 SEED_DATA = (
     f"""with recursive n(x) as (
         values(1) union all select x + 1 from n where x < {CUSTOMERS}
-    ) insert into customers(id, email, region, tier, created_at)
+    ) insert or ignore into customers(id, email, region, tier, created_at)
       select x, printf('customer-%04d@example.test', x),
              case x % 4 when 0 then 'apac' when 1 then 'amer'
                           when 2 then 'emea' else 'latam' end,
              1 + (x % 3), 1700000000 + x from n""",
     f"""with recursive n(x) as (
         values(1) union all select x + 1 from n where x < {PRODUCTS}
-    ) insert into products(id, sku, name, price_cents, stock)
+    ) insert or ignore into products(id, sku, name, price_cents, stock)
       select x, printf('SKU-%05d', x), printf('Catalog product %05d', x),
              500 + (x * 17), {INITIAL_STOCK} from n""",
 )
@@ -311,7 +311,7 @@ class ZaxonWireConnection:
         raw = socket.create_connection(endpoint, timeout=timeout)
         self.socket = tls_context.wrap_socket(
             raw, server_hostname=f"zaxon-node-{node_id}")
-        hello = struct.pack("<HB", 6, 1)
+        hello = struct.pack("<HB", 9, 1)
         hello += struct.pack("<I", 0) + bytes(16) + struct.pack("<Q", 0)
         self.send_frame(1, hello)
 
