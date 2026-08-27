@@ -32,10 +32,12 @@ zig build -Doptimize=ReleaseFast
 benchmarks/compare-rqlite-3node.sh > rqlite-comparison.json
 ```
 
-The 20 July 2026 development run used Homebrew rqlite v10.2.7 / SQLite 3.53.2
-on Darwin arm64. It is a single-host observation, not a portable performance
-claim; rerun the harness on target hardware before making a capacity decision.
-The raw finalized run is
+The 27 August 2026 run used zaxon 0.6.0 against Homebrew rqlite v10.2.7 /
+SQLite 3.53.2 on Darwin arm64. It is a single-host observation, not a
+portable performance claim; rerun the harness on target hardware before
+making a capacity decision. The raw finalized run is
+[`results/rqlite-v10.2.7-darwin-arm64-2026-08-27.json`](results/rqlite-v10.2.7-darwin-arm64-2026-08-27.json).
+The earlier 20 July 2026 recording is retained as
 [`results/rqlite-v10.2.7-darwin-arm64-2026-07-20.json`](results/rqlite-v10.2.7-darwin-arm64-2026-07-20.json).
 
 ## Real-world failure and recovery simulation
@@ -72,9 +74,13 @@ Tune with `--phase-operations`, `--warmup-operations`, `--concurrency`,
 `--seed`, and the binary-path options shown by `--help`. Set `KEEP_RUN_DIR=1`
 or pass `--keep-run-dir` to retain every node directory and process log.
 The recorded full result is
-[`results/realworld-rqlite-v10.2.7-darwin-arm64-2026-07-20.json`](results/realworld-rqlite-v10.2.7-darwin-arm64-2026-07-20.json).
+[`results/realworld-rqlite-v10.2.7-darwin-arm64-2026-08-27.json`](results/realworld-rqlite-v10.2.7-darwin-arm64-2026-08-27.json).
 The consecutive validation run is retained as
-[`results/realworld-rqlite-v10.2.7-darwin-arm64-2026-07-20-repeat-summary.json`](results/realworld-rqlite-v10.2.7-darwin-arm64-2026-07-20-repeat-summary.json).
+[`results/realworld-rqlite-v10.2.7-darwin-arm64-2026-08-27-repeat-summary.json`](results/realworld-rqlite-v10.2.7-darwin-arm64-2026-08-27-repeat-summary.json).
+The 20 July 2026 recordings are retained beside them; they predate the
+`--sync full` default, so their zaxonlite writes did not pay the full
+cache-flush barrier and their throughput rows are not comparable to the
+durability-matched 27 August run.
 
 ## dqlite (deferred execution)
 
