@@ -2696,8 +2696,16 @@ pub const Server = struct {
             self.node.journal.retainedFirstSlot() <= request.applied_slot + 1)
         {
             self.mutex.unlock(self.io);
+            std.log.info(
+                "node {d}: declining transfer for peer {d}; range recovery covers it",
+                .{ self.node.identity.node_id, from },
+            );
             return;
         }
+        std.log.info(
+            "node {d}: pinning transfer image for peer {d}",
+            .{ self.node.identity.node_id, from },
+        );
         var pin = self.node.pinTransferImage() catch |err| {
             self.mutex.unlock(self.io);
             std.log.warn("transfer pin failed: {s}", .{@errorName(err)});
