@@ -568,6 +568,31 @@ fn runScenario(cluster: *Cluster) !void {
     try runJoinLadder(cluster, &endpoints);
 }
 
+/// Proves a node's last run died at the armed failpoint and not for
+/// some other reason: `spawnNode` truncates the log, and the failpoint
+/// prints its name before `_exit`, so the line must be present.
+fn expectFailpointHit(cluster: *Cluster, index: usize, name: []const u8) void {
+    const body = Io.Dir.cwd().readFileAlloc(
+        cluster.io,
+        cluster.nodes[index].log_path,
+        cluster.gpa,
+        .limited(1 << 20),
+    ) catch fail(cluster, "cannot read node {d} log", .{cluster.nodes[index].id});
+    defer cluster.gpa.free(body);
+    var line_buffer: [96]u8 = undefined;
+    const line = std.fmt.bufPrint(
+        &line_buffer,
+        "failpoint '{s}' hit",
+        .{name},
+    ) catch unreachable;
+    if (std.mem.indexOf(u8, body, line) == null) {
+        fail(cluster, "node {d} exited without hitting {s}", .{
+            cluster.nodes[index].id,
+            name,
+        });
+    }
+}
+
 /// The join crash ladder: the receiver dies at every stateless-phase
 /// transfer failpoint in sequence, the sender is killed mid-copy on one
 /// rung with another peer completing the send, and the final clean start
@@ -589,20 +614,24 @@ fn runJoinLadder(cluster: *Cluster, endpoints: []const Endpoint) !void {
     step("receiver dies mid-stream on a transferred chunk");
     try cluster.spawnNode(3, &updated_ids, &updated_ports, "after_transfer_chunk");
     cluster.waitNodeExit(3);
+    expectFailpointHit(cluster, 3, "after_transfer_chunk");
 
     step("receiver dies after staging the transferred image");
     try cluster.spawnNode(3, &updated_ids, &updated_ports, "after_transfer_stage");
     cluster.waitNodeExit(3);
+    expectFailpointHit(cluster, 3, "after_transfer_stage");
 
     step("receiver dies after the digest check, before the install rename");
     try cluster.spawnNode(3, &updated_ids, &updated_ports, "before_transfer_install");
     cluster.waitNodeExit(3);
+    expectFailpointHit(cluster, 3, "before_transfer_install");
 
     step("receiver dies after the install rename, before the anchor");
     // No anchor binds the renamed image, so the next start discards it
     // and transfers again.
     try cluster.spawnNode(3, &updated_ids, &updated_ports, "after_transfer_install");
     cluster.waitNodeExit(3);
+    expectFailpointHit(cluster, 3, "after_transfer_install");
 
     step("sender dies mid-copy while pinning; another peer completes the send");
     // The joiner's recovery probes rotate from the lowest registry peer,
@@ -618,8 +647,10 @@ fn runJoinLadder(cluster: *Cluster, endpoints: []const Endpoint) !void {
     ));
     try cluster.spawnNode(3, &updated_ids, &updated_ports, "after_transfer_anchor");
     cluster.waitNodeExit(0);
+    expectFailpointHit(cluster, 0, "during_transfer_pin");
     try cluster.spawnNode(0, &updated_ids, &updated_ports, null);
     cluster.waitNodeExit(3);
+    expectFailpointHit(cluster, 3, "after_transfer_anchor");
 
     step("clean start converges from the installed anchor");
     try cluster.spawnNode(3, &updated_ids, &updated_ports, null);
