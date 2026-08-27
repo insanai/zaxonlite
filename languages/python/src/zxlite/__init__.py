@@ -40,7 +40,7 @@ __version__ = "0.6.0"
 
 # ZDS 0010 invariant 13: the SDK and the native library must agree on
 # the native major/minor version before any handle is opened.
-_EXPECTED_NATIVE_VERSION = (0, 3)
+_EXPECTED_NATIVE_VERSION = (0, 6)
 
 
 def _check_native_version() -> None:
