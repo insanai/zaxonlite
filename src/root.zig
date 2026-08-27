@@ -35,7 +35,6 @@ pub const payload_store = @import("payload_store.zig");
 pub const PayloadStore = payload_store.PayloadStore;
 /// Canonical evidence that a transferable checkpoint is tied to the stop
 /// sign already chosen by Paxos; receivers confirm its digest with a quorum.
-pub const checkpoint_proof = @import("checkpoint_proof.zig");
 /// SQLite WAL frame capture and deterministic page-level apply.
 pub const wal = @import("wal.zig");
 /// Narrow SQLite C API bindings; the only module that touches the C header.
@@ -140,7 +139,6 @@ test {
     _ = @import("trim.zig");
     _ = @import("journal.zig");
     _ = @import("payload_store.zig");
-    _ = @import("checkpoint_proof.zig");
     _ = @import("sqlite.zig");
     _ = @import("guard.zig");
     _ = @import("prepared.zig");

@@ -702,31 +702,8 @@ pub const SnapshotBegin = struct {
         }
         return begin;
     }
-};        const configuration_id = try reader.int(u64);
-        const name = try reader.take(16);
-        const db_size = try reader.int(u64);
-        const manifest_len = try reader.int(u32);
-        if (manifest_len > max_manifest_bytes) return error.InvalidFrame;
-        const manifest = try reader.take(manifest_len);
-        const proof_len = try reader.int(u16);
-        if (proof_len == 0 or proof_len > max_proof_bytes) {
-            return error.InvalidFrame;
-        }
-        const proof = try reader.take(proof_len);
-        if (reader.offset != body.len) return error.InvalidFrame;
-        return .{
-            .configuration_id = configuration_id,
-            .name = name[0..16].*,
-            .db_size = db_size,
-            .manifest = manifest,
-            .proof = proof,
-        };
-    }
 };
 
-/// A receiver asks configured voters whether they retain the same proof for
-/// the sealed epoch. Matching replies are read-quorum evidence about a stop
-/// sign Paxos already chose; they do not constitute a new consensus phase.
 /// A read-quorum probe that the chosen history through `slot` has hash
 /// `hash` (ZDS 0011). A voter that can vouch echoes the probe back on
 /// the `checkpoint_proof_reply` kind; one that cannot stays silent.
