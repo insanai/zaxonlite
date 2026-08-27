@@ -405,16 +405,24 @@ test "a state anchor bounds recovery and survives image loss" {
         try testing.expectEqual(@as(u64, 1), node.identity.configuration_id);
         try testing.expect(node.durable_state_slot > 0);
         try testing.expectEqual(node.applied_slot, node.durable_state_slot);
+        // The one-member configuration trims itself to the fresh anchor.
+        try testing.expectEqual(node.durable_state_slot, node.trim_state.through_slot);
+        try testing.expectEqual(
+            node.trim_state.through_slot,
+            node.log.trimAnchor().chosen_trim_slot,
+        );
 
         _ = try node.exec("insert into items(v) values ('water')");
         try testing.expectEqual(@as(i64, 3), try countItems(node));
     }
 
-    // Restart resumes from the anchor plus the journal suffix.
+    // Restart resumes from the anchor plus the journal suffix, and the
+    // adopted trim anchor survives replay.
     {
         const node = try openNode(dir);
         defer node.close();
         try testing.expectEqual(@as(i64, 3), try countItems(node));
+        try testing.expect(node.log.trimAnchor().chosen_trim_slot > 0);
         const report = try node.integrityCheck();
         try testing.expect(report.ok());
         try node.createStateAnchor();

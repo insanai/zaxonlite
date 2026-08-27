@@ -290,6 +290,11 @@ fn appliedAtLeast(parsed: *const Parsed, target: i64) bool {
     return applied >= target;
 }
 
+fn trimmedAtLeast(parsed: *const Parsed, target: i64) bool {
+    const trimmed = fieldInt(parsed, "chosen_trim_slot") orelse return false;
+    return trimmed >= target;
+}
+
 fn configurationAtLeast(parsed: *const Parsed, target: i64) bool {
     const configuration = fieldInt(parsed, "configuration_id") orelse return false;
     return configuration >= target;
@@ -885,6 +890,11 @@ fn runScenario(
         );
     }
     expectAllDigestsEqual(&cluster, "after journal catch-up");
+
+    step("conservative trim advances once every data replica reported");
+    for (cluster.endpoints) |endpoint| {
+        waitFor(&cluster, endpoint, trimmedAtLeast, 1, 30_000, "chosen trim");
+    }
 
     step("delete a follower image; node rebuilds from anchor plus suffix");
     const rebuild_follower = (leaderIndex(&cluster) + 2) % 3;
