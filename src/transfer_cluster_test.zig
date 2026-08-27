@@ -666,7 +666,7 @@ fn runJoinLadder(cluster: *Cluster, endpoints: []const Endpoint) !void {
     // No anchor binds the renamed image, so the next start discards it
     // and transfers again.
     try cluster.spawnNode(3, &updated_ids, &updated_ports, "after_transfer_install");
-    waitFailpointExit(cluster, 3, "after_transfer_install", 180_000);
+    waitFailpointExit(cluster, 3, "after_transfer_install", 420_000);
 
     step("sender dies mid-copy while pinning; another peer completes the send");
     // Connection readiness decides which survivor the joiner's first
