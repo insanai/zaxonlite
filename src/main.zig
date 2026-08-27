@@ -60,7 +60,7 @@ const usage_text =
     \\                    --old-node <id> --new-node <id>@<host>:<port>
     \\  leader            Show the current leader (client mode).
     \\  wait              Wait for --applied <slot> and/or --leader (client mode).
-    \\  snapshot          Take a snapshot and seal the current journal epoch.
+    \\  anchor            Publish a durable state anchor for fast recovery.
     \\  backup            Stream a consistent logical backup. --to <path>.
     \\  integrity-check   Verify SQLite image, descriptor chain, and payloads.
     \\  recover           Rebuild from authoritative state and verify it.
@@ -452,7 +452,7 @@ fn executeLocalNodeCommand(
         if (options.json) try out.writeAll("]}\n");
         return exit_ok;
     }
-    if (std.mem.eql(u8, command, "snapshot") or
+    if (std.mem.eql(u8, command, "anchor") or
         std.mem.eql(u8, command, "backup") or
         std.mem.eql(u8, command, "integrity-check") or
         std.mem.eql(u8, command, "recover") or
@@ -478,18 +478,18 @@ fn executeLocalMaintenanceCommand(
     out: *std.Io.Writer,
     err_out: *std.Io.Writer,
 ) !u8 {
-    if (std.mem.eql(u8, command, "snapshot")) {
-        try node.snapshot();
+    if (std.mem.eql(u8, command, "anchor")) {
+        try node.createStateAnchor();
         const status = node.status();
         if (options.json) {
             try out.print(
-                "{{\"configuration_id\":{d},\"snapshot\":\"{s}\"}}\n",
-                .{ status.configuration_id, if (status.snapshot) |name| &name else "" },
+                "{{\"durable_state_slot\":{d}}}\n",
+                .{status.durable_state_slot},
             );
         } else {
             try out.print(
-                "snapshot installed; epoch sealed, now at configuration {d}\n",
-                .{status.configuration_id},
+                "state anchor published at slot {d}\n",
+                .{status.durable_state_slot},
             );
         }
         return exit_ok;
@@ -1035,8 +1035,8 @@ fn buildRemoteRequestBody(
         );
         return false;
     }
-    if (std.mem.eql(u8, command, "snapshot")) {
-        try writer.writeAll("{\"op\":\"snapshot\"}");
+    if (std.mem.eql(u8, command, "anchor")) {
+        try writer.writeAll("{\"op\":\"anchor\"}");
         return true;
     }
     if (std.mem.eql(u8, command, "integrity-check")) {

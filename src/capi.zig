@@ -1287,10 +1287,11 @@ export fn zaxonlite_free(pointer: ?[*:0]u8) void {
     gpa.free(raw[0 .. body.len + 1]);
 }
 
-/// Takes an online snapshot and seals the current journal epoch.
-export fn zaxonlite_snapshot(pointer: ?*anyopaque) c_int {
+/// Publishes a durable state anchor so recovery resumes from it instead
+/// of replaying the whole retained journal (ZDS 0011).
+export fn zaxonlite_state_anchor(pointer: ?*anyopaque) c_int {
     const handle = handleOf(pointer) orelse return misuse_code;
-    handle.node.snapshot() catch |err| return mapError(handle, err);
+    handle.node.createStateAnchor() catch |err| return mapError(handle, err);
     return ok_code;
 }
 

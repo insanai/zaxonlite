@@ -355,7 +355,7 @@ int main(int argc, char **argv) {
           zaxonlite_live_commit(db, &live_changes) == 2 &&
               zaxonlite_live_rollback(db) == 2);
 
-    CHECK("snapshot", zaxonlite_snapshot(db) == 0);
+    CHECK("anchor", zaxonlite_state_anchor(db) == 0);
     CHECK("integrity", zaxonlite_integrity_check(db) == 0);
 
     int64_t expired = -1;

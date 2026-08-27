@@ -356,7 +356,7 @@ pub const SharedNode = struct {
         defer self.exit();
         try self.acquireExclusive();
         defer self.releaseExclusive();
-        return self.inner.snapshot();
+        return self.inner.createStateAnchor();
     }
 
     /// SQLite extended result code of the node's most recent saved SQL
