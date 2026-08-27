@@ -119,6 +119,10 @@ jobs:
         if: runner.os == 'Linux'
         run: zig build test-replace-cluster
 
+      - name: Beyond-retention transfer crash ladder
+        if: runner.os == 'Linux'
+        run: zig build test-transfer-cluster
+
   # The long-run gate rotates journal segments many times and proves
   # bounded retention plus anchored restart (ZDS 0011). It is nightly
   # work, not per-push work.
