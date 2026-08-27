@@ -175,20 +175,45 @@ pub fn load(
 
     const storage = try gpa.alloc(SegmentEntry, segment_count);
     errdefer gpa.free(storage);
-    var previous_last: u64 = manifest.trimmed_through;
-    for (storage) |*entry| {
-        entry.first_slot = readInt(u64, bytes, &offset);
-        entry.last_slot = readInt(u64, bytes, &offset);
-        readBytes(bytes, &offset, &entry.digest);
-        // Retained segments are contiguous ascending ranges starting just
-        // above the trimmed prefix.
-        if (entry.first_slot != previous_last + 1 or entry.last_slot < entry.first_slot) {
+    try readSegmentTable(&manifest, storage, bytes, &offset);
+    manifest.segments = storage;
+    return .{ .manifest = manifest, .storage = storage };
+}
+
+fn readSegmentTable(
+    manifest: *const Manifest,
+    storage: []SegmentEntry,
+    bytes: []const u8,
+    offset: *usize,
+) !void {
+    var previous_last: u64 = 0;
+    for (storage, 0..) |*entry, index| {
+        entry.first_slot = readInt(u64, bytes, offset);
+        entry.last_slot = readInt(u64, bytes, offset);
+        readBytes(bytes, offset, &entry.digest);
+        // Retained segments are contiguous ascending ranges. The oldest
+        // may straddle the trim anchor: physical reclamation removes only
+        // whole segments, so its first slot sits at or below the anchor
+        // plus one, never above it (that would be a hole in retained
+        // history).
+        const contiguous = if (index == 0)
+            entry.first_slot <= manifest.trimmed_through + 1
+        else
+            entry.first_slot == previous_last + 1;
+        if (!contiguous or entry.last_slot < entry.first_slot) {
             return error.CorruptManifest;
         }
         previous_last = entry.last_slot;
     }
-    manifest.segments = storage;
-    return .{ .manifest = manifest, .storage = storage };
+    // The active segment continues the sealed chain; with everything
+    // sealed reclaimed, it must still cover the slot after the anchor.
+    if (storage.len > 0) {
+        if (manifest.active_first_slot != previous_last + 1) {
+            return error.CorruptManifest;
+        }
+    } else if (manifest.active_first_slot > manifest.trimmed_through + 1) {
+        return error.CorruptManifest;
+    }
 }
 
 fn writeInt(comptime T: type, out: []u8, offset: *usize, value: T) void {

@@ -434,6 +434,14 @@ const ParsedTrailer = struct {
     digest_end: u64,
 };
 
+/// Reads and validates one segment header without adopting the file, so
+/// the journal can check ancestry before trusting an active segment.
+pub fn peekHeader(io: Io, dir: Io.Dir, name: []const u8) !Header {
+    const file = try dir.openFile(io, name, .{});
+    defer file.close(io);
+    return readHeader(io, file);
+}
+
 fn readHeader(io: Io, file: Io.File) !Header {
     var bytes: [header_size]u8 = undefined;
     const read = file.readPositionalAll(io, &bytes, 0) catch return error.CorruptSegment;

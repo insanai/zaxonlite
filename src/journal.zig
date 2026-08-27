@@ -163,6 +163,9 @@ pub const Journal = struct {
         if (durable.promised.lessThan(self.max_promised)) {
             try durable.apply(.{ .promise = self.max_promised });
         }
+        // Trimmed history was durably persisted before it was deleted;
+        // progress never regresses below the certified trim frontier.
+        self.persisted = @max(self.persisted, self.trimmed_through);
         return self;
     }
 
@@ -523,6 +526,22 @@ pub const Journal = struct {
             },
             else => {},
         }
+        // The resumed active segment must be this database's and chain
+        // onto the last sealed segment; a swapped-in stray would
+        // otherwise be appended to silently.
+        const header = segment.peekHeader(self.io, self.dir, name) catch
+            return error.CorruptJournal;
+        if (header.database_id != self.database_id or
+            header.first_global_slot != self.active_first_slot or
+            (self.segments.items.len > 0 and
+                !std.mem.eql(
+                    u8,
+                    &header.previous_segment_digest,
+                    &previous_digest,
+                )))
+        {
+            return error.CorruptJournal;
+        }
         self.active = try segment.Writer.adopt(self.io, self.dir, name);
     }
 
@@ -530,6 +549,10 @@ pub const Journal = struct {
     /// validating segment identity, digests, and sequence continuity.
     fn replay(self: *Journal, durable: *types.Log.DurableState, info: *ReplayInfo) !void {
         var expected: ?u64 = null;
+        // The oldest retained segment's ancestor was legitimately deleted
+        // by trimming, so only links between adjacent retained segments
+        // are checkable.
+        var previous_digest: ?[32]u8 = null;
         for (self.segments.items) |entry| {
             var name_buffer: [20]u8 = undefined;
             const name = segmentName(&name_buffer, entry.first_slot);
@@ -541,7 +564,26 @@ pub const Journal = struct {
             {
                 return error.CorruptJournal;
             }
+            // A self-consistent but foreign segment (stale copy, forged
+            // manifest row) must not replay: its header must name the
+            // manifest's slot range and chain onto its predecessor.
+            if (reader.header.first_global_slot != entry.first_slot) {
+                return error.CorruptJournal;
+            }
+            if (previous_digest) |digest| {
+                if (!std.mem.eql(
+                    u8,
+                    &reader.header.previous_segment_digest,
+                    &digest,
+                )) {
+                    return error.CorruptJournal;
+                }
+            }
+            previous_digest = entry.digest;
             const trailer = reader.trailer.?;
+            if (@max(trailer.last_global_slot, entry.first_slot) != entry.last_slot) {
+                return error.CorruptJournal;
+            }
             if (durable.promised.lessThan(trailer.max_promised)) {
                 try durable.apply(.{ .promise = trailer.max_promised });
             }
@@ -726,4 +768,42 @@ test "trimming unlinks sealed prefixes and keeps the promise rollup" {
         @as(u64, segment.capacity_records),
         reopened.retainedFirstSlot(),
     );
+}
+
+test "a trim anchor inside a retained segment survives reopening" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Two sealed segments plus an active one; the anchor lands strictly
+    // inside the second segment, so reclamation removes only the first
+    // and the retained chain starts below the anchor. Cluster nodes hit
+    // this shape whenever their delete floor lags the chosen trim.
+    var journal = try Journal.create(io, testing.allocator, tmp.dir, 42);
+    var slot: u64 = 1;
+    while (slot <= 2 * segment.capacity_records + 10) : (slot += 1) {
+        journal.noteChosen(slot -| 1);
+        try journal.appendWrites(&.{testWrite(slot)});
+    }
+    try journal.sync();
+    try testing.expectEqual(@as(usize, 2), journal.segments.items.len);
+    const anchor = journal.segments.items[1].first_slot + 100;
+    try testing.expect(anchor < journal.segments.items[1].last_slot);
+
+    journal.noteTrimAnchor(1, anchor, [_]u8{7} ** 32);
+    try testing.expect(try journal.trimThrough(anchor));
+    try testing.expectEqual(@as(usize, 1), journal.segments.items.len);
+    try testing.expect(journal.segments.items[0].first_slot <= anchor);
+    const retained_first = journal.segments.items[0].first_slot;
+    journal.close();
+
+    // Reopening must accept the straddling manifest and keep both the
+    // anchor and the retained chain.
+    var durable = types.Log.DurableState{};
+    var info: ReplayInfo = undefined;
+    var reopened = try Journal.open(io, testing.allocator, tmp.dir, 42, &durable, &info);
+    defer reopened.close();
+    try testing.expectEqual(anchor, reopened.trimmed_through);
+    try testing.expectEqual(retained_first, reopened.retainedFirstSlot());
+    try testing.expect(durable.committedAt(2 * segment.capacity_records + 10) != null);
 }
