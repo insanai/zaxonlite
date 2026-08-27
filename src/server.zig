@@ -262,6 +262,10 @@ pub const ServeOptions = struct {
     /// disables mmap; nonzero is an explicit operator opt-in bounded at
     /// 1 GiB (ZDS 0009).
     mmap_size: u64 = 0,
+    /// Retention horizon in slots below the chosen trim (ZDS 0011).
+    retention_slots: u64 = 0,
+    /// Hard journal-byte ceiling refusing writes; zero disables.
+    journal_cap_bytes: u64 = 0,
     /// Honor `failpoint` RPCs (test controllers only).
     enable_failpoints: bool = false,
     tick_ms: u64 = 25,
@@ -545,6 +549,8 @@ pub fn serve(
         .registry_nodes = registry_nodes,
         .test_storage_delay_ms = options.test_faults.storage_delay_ms,
         .mmap_size = options.mmap_size,
+        .retention_slots = options.retention_slots,
+        .journal_cap_bytes = options.journal_cap_bytes,
     }) catch |err| {
         try diagnostic.write(
             err_out,
@@ -4256,6 +4262,11 @@ pub const Server = struct {
                 out,
                 "unavailable",
                 "durable storage failed; node stopped",
+            ),
+            error.RecoveryRetentionExceeded => try writeErrorResponse(
+                out,
+                "unavailable",
+                "journal storage ceiling reached; awaiting trim or capacity",
             ),
             else => try writeErrorResponse(out, "internal", @errorName(err)),
         }

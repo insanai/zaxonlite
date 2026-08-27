@@ -110,6 +110,10 @@ const usage_text =
     \\                      (disabled); maximum 1073741824 (1 GiB). A mapped
     \\                      I/O fault can terminate the process; opting in
     \\                      accepts that operational risk.
+    \\  --retention-slots <n>  Keep the most recent n slots of journal
+    \\                      history below the chosen trim (default 0).
+    \\  --journal-cap-bytes <n>  Refuse writes at this journal size rather
+    \\                      than delete unproven history (default 0: off).
     \\  --enable-failpoints Honor failpoint RPCs (test controllers only).
     \\  --segment-records <n>  Test-only journal segment size (64..16384);
     \\                      requires --enable-failpoints.
@@ -159,6 +163,8 @@ const Options = struct {
     revocation_file: ?[]const u8 = null,
     sync: ?[]const u8 = null,
     mmap_size: ?u64 = null,
+    retention_slots: ?u64 = null,
+    journal_cap_bytes: ?u64 = null,
     segment_records: ?usize = null,
     enable_failpoints: bool = false,
     dev_psk: bool = false,
@@ -794,6 +800,8 @@ fn serveCommand(
         .enable_failpoints = options.enable_failpoints,
         .allow_insecure_test_tcp = options.insecure_test_tcp,
         .mmap_size = options.mmap_size orelse 0,
+        .retention_slots = options.retention_slots orelse 0,
+        .journal_cap_bytes = options.journal_cap_bytes orelse 0,
     }, err_out);
 }
 
@@ -1549,6 +1557,16 @@ fn parseOptionFlag(
             return optError(err_out, "--mmap-size needs a value");
         options.mmap_size = std.fmt.parseInt(u64, text, 10) catch
             return optError(err_out, "--mmap-size must be an integer byte count");
+    } else if (std.mem.eql(u8, arg, "--retention-slots")) {
+        const text = iterator.next() orelse
+            return optError(err_out, "--retention-slots needs a value");
+        options.retention_slots = std.fmt.parseInt(u64, text, 10) catch
+            return optError(err_out, "--retention-slots must be an integer");
+    } else if (std.mem.eql(u8, arg, "--journal-cap-bytes")) {
+        const text = iterator.next() orelse
+            return optError(err_out, "--journal-cap-bytes needs a value");
+        options.journal_cap_bytes = std.fmt.parseInt(u64, text, 10) catch
+            return optError(err_out, "--journal-cap-bytes must be an integer");
     } else if (std.mem.eql(u8, arg, "--segment-records")) {
         const text = iterator.next() orelse
             return optError(err_out, "--segment-records needs a value");
