@@ -315,7 +315,7 @@ jobs:
           /tmp/zxlite-wheel-test/bin/pip install wheelhouse/*.whl
           version="${GITHUB_REF_NAME#v}"
           /tmp/zxlite-wheel-test/bin/python -c \
-            "import zxlite; assert zxlite.__version__ == '${version:-0.3.0}'"
+            "import zxlite; assert zxlite.__version__ == '${version:-0.4.0}'"
 
       - name: Upload macOS wheel
         uses: actions/upload-artifact@v4
@@ -384,7 +384,7 @@ jobs:
           python -m venv "$env:RUNNER_TEMP\zxlite-wheel-test"
           $wheel = (Get-ChildItem wheelhouse\*.whl).FullName
           & "$env:RUNNER_TEMP\zxlite-wheel-test\Scripts\pip.exe" install $wheel
-          $version = if ($env:GITHUB_REF_NAME) { $env:GITHUB_REF_NAME.TrimStart("v") } else { "0.3.0" }
+          $version = if ($env:GITHUB_REF_NAME) { $env:GITHUB_REF_NAME.TrimStart("v") } else { "0.4.0" }
           & "$env:RUNNER_TEMP\zxlite-wheel-test\Scripts\python.exe" -c `
             "import zxlite; assert zxlite.__version__ == '$version'"
 

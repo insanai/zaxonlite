@@ -36,7 +36,7 @@ from .dbapi import (
 from .rows import Row
 from .server import Member, Server, start_server
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 # ZDS 0010 invariant 13: the SDK and the native library must agree on
 # the native major/minor version before any handle is opened.
