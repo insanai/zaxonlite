@@ -754,7 +754,14 @@ pub const Node = struct {
         // Materialize the image from the durable anchor plus the retained
         // journal suffix (ZDS 0011 recovery ladder), then restore the core
         // at the consumed floor so its window resumes exactly there.
-        if (!fresh_journal) try self.materializeFromJournal();
+        if (!fresh_journal) {
+            self.materializeFromJournal() catch |err| {
+                // Replaying the suffix over a corrupt image fails inside
+                // SQLite; rebuild from the genesis-retained journal.
+                if (err != error.SqliteError) return err;
+                try self.discardImageAndRematerialize();
+            };
+        }
         if (capabilities.votes) {
             try self.log.restoreAt(
                 identity.node_id,
@@ -1774,7 +1781,14 @@ pub const Node = struct {
     /// Creates a state anchor once execution has run far enough past the
     /// durable one. Returns whether an anchor was published.
     pub fn maybeCreateStateAnchor(self: *Node) !bool {
-        if (self.applied_slot < self.durable_state_slot + anchor_interval_slots) {
+        // A node with no anchor at all still recovers from genesis, so
+        // the first anchor publishes promptly; afterwards the slot
+        // cadence governs (ZDS 0011 Q5).
+        const first_anchor_due =
+            self.durable_state_slot == 0 and self.applied_slot > 0;
+        if (!first_anchor_due and
+            self.applied_slot < self.durable_state_slot + anchor_interval_slots)
+        {
             return false;
         }
         try self.createStateAnchor();
@@ -3191,11 +3205,10 @@ pub const Node = struct {
             }
         }
         if (base == 0) {
-            // No usable anchor: only a journal retained from genesis can
-            // rebuild the image; anything else needs a state transfer.
-            if (self.journal.trimmed_through != 0 or
-                self.journal.retainedFirstSlot() > 1)
-            {
+            // No usable anchor: only a journal physically retained from
+            // genesis can rebuild the image; anything else needs a state
+            // transfer. A chosen trim alone does not destroy records.
+            if (self.journal.retainedFirstSlot() > 1) {
                 return error.StateUnavailable;
             }
             self.dir.deleteFile(self.io, db_file_name) catch |err| switch (err) {
@@ -3242,9 +3255,7 @@ pub const Node = struct {
     /// been trimmed; the durable frontier restarts at zero and re-anchors
     /// on the next cadence.
     fn discardImageAndRematerialize(self: *Node) !void {
-        if (self.journal.trimmed_through != 0 or
-            self.journal.retainedFirstSlot() > 1)
-        {
+        if (self.journal.retainedFirstSlot() > 1) {
             return error.StateUnavailable;
         }
         self.dir.deleteFile(self.io, db_file_name) catch |err| switch (err) {

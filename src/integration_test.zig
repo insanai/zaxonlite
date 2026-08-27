@@ -404,8 +404,9 @@ test "a state anchor bounds recovery and survives image loss" {
         try node.createStateAnchor();
         try testing.expectEqual(@as(u64, 1), node.identity.configuration_id);
         try testing.expect(node.durable_state_slot > 0);
-        try testing.expectEqual(node.applied_slot, node.durable_state_slot);
-        // The one-member configuration trims itself to the fresh anchor.
+        // The one-member configuration trims itself to the fresh anchor;
+        // the trim entry itself occupies the slot after the anchor.
+        try testing.expectEqual(node.durable_state_slot + 1, node.applied_slot);
         try testing.expectEqual(node.durable_state_slot, node.trim_state.through_slot);
         try testing.expectEqual(
             node.trim_state.through_slot,
