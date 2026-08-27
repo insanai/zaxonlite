@@ -1,9 +1,10 @@
 //! The embedded zaxonlite node host.
 //!
-//! One node owns one data directory: a framed protocol journal, a
-//! content-addressed payload store, snapshots, and a materialized SQLite
-//! image. The journal plus payloads are authoritative; the SQLite file is
-//! reconstructed from snapshot plus committed journal suffix on every open.
+//! One node owns one data directory: a segmented lifetime journal, a
+//! content-addressed payload store, durable state anchors, and a
+//! materialized SQLite image. The journal plus payloads are authoritative;
+//! the SQLite file is reconstructed from the durable anchor plus the
+//! retained journal suffix on every open.
 //!
 //! Ordering contract per write:
 //!   execute -> capture frames -> persist payload -> Paxos append ->
@@ -119,7 +120,6 @@ pub const RecentBatch = struct {
     slot: paxos.Slot = 0,
     batch_id: u128 = 0,
 };
-
 
 const HistoryMark = struct {
     slot: paxos.Slot = 0,
@@ -764,6 +764,32 @@ pub const Node = struct {
                 stored.through_slot,
                 stored.history_hash,
             );
+        }
+        // The TRIM file and the journal's replayed anchor are written in
+        // that order, so a crash between them leaves the file one record
+        // ahead; re-installing it keeps the core's anchor at the frontier
+        // that already licensed deletion. Twins under one id, or a journal
+        // ahead of the file, mean corruption and fail closed.
+        const replayed = durable.anchor;
+        if (self.trim_state.trim_id == replayed.trim_id) {
+            if (replayed.trim_id != 0 and
+                (self.trim_state.through_slot != replayed.chosen_trim_slot or
+                    !std.mem.eql(
+                        u8,
+                        &self.trim_state.history_hash,
+                        &replayed.history_hash,
+                    )))
+            {
+                return error.TrimRegression;
+            }
+        } else if (self.trim_state.trim_id > replayed.trim_id) {
+            try durable.apply(.{ .trim_anchor = .{
+                .trim_id = self.trim_state.trim_id,
+                .chosen_trim_slot = self.trim_state.through_slot,
+                .history_hash = self.trim_state.history_hash,
+            } });
+        } else {
+            return error.TrimRegression;
         }
 
         // Materialize the image from the durable anchor plus the retained
@@ -1704,6 +1730,11 @@ pub const Node = struct {
         for (self.trim_state.leases[0..self.trim_state.lease_count]) |held| {
             if (held.lease_id == lease.lease_id) return;
         }
+        // Admission is deterministic: every replica applies the same
+        // chosen lease sequence against the same fixed table, so a lease
+        // past capacity is dropped identically everywhere and simply does
+        // not cap trimming; the sender's pinned image copy, not the
+        // lease, is what keeps a running transfer safe (ZDS 0011).
         if (self.trim_state.lease_count >= trim.max_leases) return;
         self.trim_state.leases[self.trim_state.lease_count] = .{
             .lease_id = lease.lease_id,
@@ -1928,8 +1959,9 @@ pub const Node = struct {
 
         // The protocol node resumes at the anchor; everything below it is
         // covered by the installed image, everything above arrives through
-        // ordinary catch-up.
-        try self.continueOnConfiguration(begin.anchor_slot);
+        // ordinary catch-up. The transfer stays inside one configuration,
+        // so the promise and votes above the anchor must survive it.
+        try self.continueOnConfigurationPreserving(begin.anchor_slot);
     }
 
     /// This node's progress report for trim coordination and monitoring.
@@ -2232,12 +2264,35 @@ pub const Node = struct {
     /// trim anchor. Accepted-only state above the floor belongs to the
     /// sealed configuration and is discarded, exactly as a restart is.
     fn continueOnConfiguration(self: *Node, floor: paxos.Slot) !void {
-        var membership: Log.Membership = undefined;
-        try membership.init(self.members[0..self.member_count]);
         const durable = try self.gpa.create(Log.DurableState);
         defer self.gpa.destroy(durable);
         durable.* = .{};
         durable.anchor = self.log.trimAnchor();
+        try self.restoreCoreOn(durable, floor);
+    }
+
+    /// Same-configuration continuation onto an installed state image. The
+    /// image discharges every slot at or below `floor`, but the node's
+    /// open Paxos obligations survive it: the durable promise and every
+    /// vote above the floor are carried into the restored core, so a
+    /// transfer can never let an older ballot win a slot this node
+    /// already helped choose. Discarding them is safe only across a
+    /// configuration change, where the new configuration id fences the
+    /// old ballot line.
+    fn continueOnConfigurationPreserving(self: *Node, floor: paxos.Slot) !void {
+        const durable = try self.gpa.create(Log.DurableState);
+        defer self.gpa.destroy(durable);
+        durable.* = self.log.core.durable;
+        try self.restoreCoreOn(durable, floor);
+    }
+
+    fn restoreCoreOn(
+        self: *Node,
+        durable: *const Log.DurableState,
+        floor: paxos.Slot,
+    ) !void {
+        var membership: Log.Membership = undefined;
+        try membership.init(self.members[0..self.member_count]);
         if (self.capabilities.votes) {
             try self.log.restoreAt(
                 self.identity.node_id,
@@ -3255,8 +3310,8 @@ pub const Node = struct {
             // durable marker; journal the tail before the reset below
             // would discard it. Derived records ride the next barrier.
             if (self.effects.writes_count > writes_before_accounting) {
-                const tail = self.effects.writes[writes_before_accounting..
-                    self.effects.writes_count];
+                const tail = self.effects
+                    .writes[writes_before_accounting..self.effects.writes_count];
                 self.journal.appendWrites(tail) catch |err| {
                     self.fatal_storage_error = true;
                     return err;
@@ -3467,8 +3522,8 @@ pub const Node = struct {
         });
         defer file.close(self.io);
         try wal.applyPayload(self.io, file, &view);
-        // `current.db` is a materialized cache, rebuilt from the snapshot,
-        // accepted journal records, and payload store on every open. The page
+        // `current.db` is a materialized cache, rebuilt from the durable
+        // anchor, accepted journal records, and payload store on every open. The page
         // writes need to finish before local reads, but do not require a
         // second power-loss barrier per chosen transaction.
     }
@@ -3500,9 +3555,6 @@ pub const Node = struct {
     // Recovery
     // ------------------------------------------------------------------
 
-    /// Rebuilds the materialized SQLite image from the snapshot base plus
-    /// every committed transaction payload of the current epoch, applying
-    /// pages offline in slot order.
     /// Refuses to open over any journal v1 artifact: the ZDS 0011 format
     /// cut has no bridge, and guessing would risk both histories.
     fn rejectLegacyArtifacts(io: Io, dir: Io.Dir) !void {
@@ -3572,6 +3624,13 @@ pub const Node = struct {
             self.durable_state_slot = 0;
         }
         self.applied_slot = base;
+        if (base > 0 and self.journal.retainedFirstSlot() > base + 1) {
+            // The retained journal no longer reaches the anchor: the
+            // newest anchor generation was lost and the fallback sits
+            // below what reclamation already deleted. Serving the stale
+            // image would silently skip the gap.
+            return error.StateUnavailable;
+        }
 
         const file = try self.dir.createFile(self.io, db_file_name, .{
             .read = true,
@@ -3579,26 +3638,66 @@ pub const Node = struct {
         });
         defer file.close(self.io);
 
-        // Commit records can sit in arrival order in the journal, so the
-        // contiguous suffix is applied in passes until a full pass makes
-        // no progress; each pass is one streaming read.
-        var progressed = true;
-        while (progressed) {
-            progressed = false;
-            var it = try self.journal.iterate(self.applied_slot + 1);
-            defer it.close();
-            while (try it.next()) |write| {
-                const commit = switch (write) {
-                    .commit => |commit| commit,
-                    else => continue,
-                };
-                if (commit.slot != self.applied_slot + 1) continue;
-                try self.applyEntryToImage(file, commit.slot, commit.value, anchor_config);
-                self.applied_slot = commit.slot;
-                progressed = true;
+        // Entries fold into the history hash under the configuration
+        // they were chosen in; a replayed stop advances the cursor the
+        // same way the live handover does. A genesis rebuild starts at
+        // the database's first configuration.
+        var config_cursor: u64 = if (base == 0) 1 else anchor_config;
+
+        // Commit records sit in arrival order in the journal, but the
+        // reorder distance is bounded by the consensus window (the core
+        // only journals in-window commits), so one streaming pass with a
+        // window-sized park ring applies the whole contiguous suffix.
+        const window = types.log_options.window_slots;
+        const Parked = struct { slot: paxos.Slot = 0, value: types.Entry = undefined };
+        const parked = try self.gpa.alloc(Parked, window);
+        defer self.gpa.free(parked);
+        @memset(parked, .{});
+
+        var it = try self.journal.iterate(self.applied_slot + 1);
+        defer it.close();
+        while (try it.next()) |write| {
+            const commit = switch (write) {
+                .commit => |commit| commit,
+                else => continue,
+            };
+            if (commit.slot <= self.applied_slot) continue;
+            if (commit.slot == self.applied_slot + 1) {
+                try self.applyReplayCommit(file, commit.slot, commit.value, &config_cursor);
+                while (true) {
+                    const cell = &parked[@intCast((self.applied_slot + 1) % window)];
+                    if (cell.slot != self.applied_slot + 1) break;
+                    const value = cell.value;
+                    cell.slot = 0;
+                    try self.applyReplayCommit(file, self.applied_slot + 1, value, &config_cursor);
+                }
+            } else if (commit.slot - self.applied_slot <= window) {
+                parked[@intCast(commit.slot % window)] =
+                    .{ .slot = commit.slot, .value = commit.value };
             }
         }
         try durability.syncFile(self.io, file);
+    }
+
+    /// Applies one replayed commit and advances the configuration cursor
+    /// across stop entries: the stop itself is hashed under the outgoing
+    /// configuration, everything after it under the incoming one, byte
+    /// for byte the ordering the live handover produces.
+    fn applyReplayCommit(
+        self: *Node,
+        file: Io.File,
+        slot: paxos.Slot,
+        value: types.Entry,
+        config_cursor: *u64,
+    ) !void {
+        try self.applyEntryToImage(file, slot, value, config_cursor.*);
+        switch (value) {
+            .stop => |stop| if (stop.configuration_id > config_cursor.*) {
+                config_cursor.* = stop.configuration_id;
+            },
+            else => {},
+        }
+        self.applied_slot = slot;
     }
 
     /// Discards the local image and its anchors, then re-materializes
@@ -3736,7 +3835,7 @@ pub const Node = struct {
     }
 
     /// After rebuild, the materialized image's recorded batch marker must
-    /// match the last committed transaction batch of the epoch.
+    /// match the last committed transaction batch in the retained journal.
     fn validateMaterializedBatch(self: *Node) !void {
         if (self.last_data_slot == 0) return;
         var batch_id_bytes: [16]u8 = undefined;
@@ -3755,8 +3854,9 @@ pub const Node = struct {
         }
     }
 
-    /// The chain identity at the base of the current epoch: the snapshot
-    /// manifest's chain, or the genesis chain for a fresh database.
+    /// The voter-replacement seed carried in zx3 stop metadata: the
+    /// operation id plus the retiring node, the joining node, and its
+    /// endpoint, from which every survivor rebuilds the next registry.
     const StopSeed = struct {
         operation_id: u64,
         old_node_id: paxos.NodeId,
@@ -3891,9 +3991,8 @@ pub const Node = struct {
         return next;
     }
 
-    /// Finishes a decided checkpoint: installs the snapshot pointer, starts
-    /// the next epoch's journal, switches the protocol node to the new
-    /// configuration, and garbage-collects covered files.
+    /// Reads the persisted registry blob for one configuration from the
+    /// data directory, bounded by the registry encoding limit.
     pub fn readRegistryBlob(
         self: *Node,
         gpa: std.mem.Allocator,
@@ -3908,7 +4007,6 @@ pub const Node = struct {
             .limited(registry.max_encoded_bytes + 32),
         );
     }
-
 };
 
 // ----------------------------------------------------------------------
