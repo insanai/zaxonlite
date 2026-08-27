@@ -5,9 +5,12 @@
 //! a certified chosen trim, then replaces a voter. The replacement joins
 //! with nothing, and the reclaimed prefix forces the anchor-pinned state
 //! transfer instead of range catch-up. The join runs a crash ladder: the
-//! receiver dies at every transfer failpoint in sequence, the sender dies
-//! once while pinning its image, and the final clean start must converge
-//! from the durable anchor it already installed.
+//! receiver dies at every stateless-phase transfer failpoint in sequence
+//! (`after_transfer_resume` is not a rung — it differs from
+//! `after_transfer_anchor` by in-memory state only, and a crash at or
+//! after the durable anchor ends the stateless phase), the sender dies
+//! mid-copy while pinning, and the final clean start must converge from
+//! the durable anchor it already installed.
 //!
 //! Usage: transfer-cluster-test <path-to-zaxon>
 
