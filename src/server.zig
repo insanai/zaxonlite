@@ -995,6 +995,9 @@ pub const Server = struct {
     learner_last_contact_tick: ?u64 = null,
     last_learner_heartbeat_tick: ?u64 = null,
     snapshot_source: ?paxos.NodeId = null,
+    /// Rotating cursor over registry peers for leaderless joiner
+    /// recovery probes.
+    recovery_probe: usize = 0,
     snapshot_requested_tick: u64 = 0,
     catch_up_last_decided: paxos.Slot = 0,
     catch_up_stalled: u32 = 0,
@@ -1944,6 +1947,24 @@ pub const Server = struct {
                 }
                 self.node.releaseCampaignHold();
 
+                // A stateless joiner cannot learn the leader from
+                // heartbeats: they are ignored above its zero promise
+                // until a first accepted vote arrives, and an idle
+                // cluster sends no accepts. Recovery must not wait for
+                // an application write, so the joiner probes the decided
+                // registry's peers directly; the sender side arbitrates
+                // between range recovery and an image transfer.
+                if (self.tick_count % 20 == 10 and
+                    self.node.join_campaign_hold and
+                    self.node.join_descriptor == null)
+                {
+                    if (self.nextRecoveryPeer()) |peer| {
+                        self.node.requestCatchUp(peer) catch {};
+                        self.requestSnapshot(peer);
+                        self.pump();
+                    }
+                }
+
                 // A member that observes a further-ahead leader asks for
                 // the decided suffix it is missing. When repeated range
                 // recovery makes no progress the gap sits below cluster
@@ -2840,6 +2861,7 @@ pub const Server = struct {
         }
         try file.writePositionalAll(self.io, chunk.bytes, chunk.offset);
         install.received += chunk.bytes.len;
+        failpoint.hit("after_transfer_chunk");
     }
 
     fn onSnapshotEnd(self: *Server, install: *InstallState, from: paxos.NodeId) !void {

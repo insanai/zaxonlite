@@ -1897,6 +1897,7 @@ pub const Node = struct {
             sha.update(buffer[0..count]);
             try pin.writePositionalAll(self.io, buffer[0..count], offset);
             offset += count;
+            failpoint.hit("during_transfer_pin");
         }
         failpoint.hit("after_transfer_pin");
         return .{
@@ -1980,6 +1981,7 @@ pub const Node = struct {
         // ordinary catch-up. The transfer stays inside one configuration,
         // so the promise and votes above the anchor must survive it.
         try self.continueOnConfigurationPreserving(begin.anchor_slot);
+        failpoint.hit("after_transfer_resume");
     }
 
     /// This node's progress report for trim coordination and monitoring.
