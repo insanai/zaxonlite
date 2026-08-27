@@ -111,6 +111,8 @@ const usage_text =
     \\                      I/O fault can terminate the process; opting in
     \\                      accepts that operational risk.
     \\  --enable-failpoints Honor failpoint RPCs (test controllers only).
+    \\  --segment-records <n>  Test-only journal segment size (64..16384);
+    \\                      requires --enable-failpoints.
     \\  --json              Machine-readable output on stdout.
     \\  --no-color          Plain shell output even on a color terminal.
     \\  --no-history        Never write the interactive shell history file.
@@ -157,6 +159,7 @@ const Options = struct {
     revocation_file: ?[]const u8 = null,
     sync: ?[]const u8 = null,
     mmap_size: ?u64 = null,
+    segment_records: ?usize = null,
     enable_failpoints: bool = false,
     dev_psk: bool = false,
     insecure_test_tcp: bool = false,
@@ -755,6 +758,23 @@ fn serveCommand(
             .listen_port = listen.port,
             .backends = backends.items,
         }, err_out);
+    }
+
+    if (options.segment_records) |records| {
+        // Test-only journal geometry: segment-scale scenarios (rotation,
+        // reclamation, beyond-retention transfer) shrink segments instead
+        // of writing millions of rows. Never raised above the production
+        // capacity the on-disk index is sized for.
+        if (!options.enable_failpoints) {
+            return usageError(
+                err_out,
+                "--segment-records is test-only; it requires --enable-failpoints",
+            );
+        }
+        if (records < 64 or records > zaxonlite.segment.capacity_records) {
+            return usageError(err_out, "--segment-records must be 64..16384");
+        }
+        zaxonlite.segment.rotation_records = records;
     }
 
     return server.serve(gpa, io, .{
@@ -1529,6 +1549,11 @@ fn parseOptionFlag(
             return optError(err_out, "--mmap-size needs a value");
         options.mmap_size = std.fmt.parseInt(u64, text, 10) catch
             return optError(err_out, "--mmap-size must be an integer byte count");
+    } else if (std.mem.eql(u8, arg, "--segment-records")) {
+        const text = iterator.next() orelse
+            return optError(err_out, "--segment-records needs a value");
+        options.segment_records = std.fmt.parseInt(usize, text, 10) catch
+            return optError(err_out, "--segment-records must be an integer");
     } else if (std.mem.eql(u8, arg, "--enable-failpoints")) {
         options.enable_failpoints = true;
     } else if (std.mem.eql(u8, arg, "--dev-psk")) {

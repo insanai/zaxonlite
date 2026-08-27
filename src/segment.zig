@@ -43,6 +43,12 @@ pub const format_version: u8 = 2;
 /// the sparse index and seal state in fixed storage.
 pub const capacity_records = 16384;
 
+/// Rotation threshold, `capacity_records` in production. Test harnesses
+/// lower it (never raise it — the sparse index and seal state are sized
+/// for the constant) so segment-scale scenarios like beyond-retention
+/// state transfer rotate and reclaim without millions of writes.
+pub var rotation_records: usize = capacity_records;
+
 /// One sparse index entry per this many records.
 pub const sparse_stride = 64;
 
@@ -220,7 +226,7 @@ pub const Writer = struct {
 
     /// Whether the segment reached its record capacity and must rotate.
     pub fn full(self: *const Writer) bool {
-        return self.record_count >= capacity_records;
+        return self.record_count >= rotation_records;
     }
 
     /// Appends one record. `slot` is zero for slot-less kinds; a promise
