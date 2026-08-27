@@ -852,18 +852,19 @@ fn runScenario(
     step("restart the killed leader");
     try cluster.spawnNode(leader_now, false);
 
-    step("epoch rollover with a stopped follower (snapshot transfer)");
+    step("state anchor with a stopped follower (journal catch-up)");
     const lag_follower = (leaderIndex(&cluster) + 1) % 3;
     cluster.killNode(lag_follower);
     execSql(&cluster, "insert into t(b) values ('pre-roll')", 15_000);
     {
-        const body = mustCall(&cluster, "{\"op\":\"snapshot\"}", 20_000);
+        const body = mustCall(&cluster, "{\"op\":\"anchor\"}", 20_000);
         cluster.gpa.free(body);
     }
     execSql(&cluster, "insert into t(b) values ('post-roll')", 15_000);
     try cluster.spawnNode(lag_follower, false);
-    // The restarted node is one sealed epoch behind and must install a
-    // transferred snapshot, then catch up within the new epoch.
+    // The restarted node catches up from the retained journal (ZDS 0011):
+    // slots are global, the configuration never changes, and history the
+    // survivors released from their windows is served from segments.
     {
         const leader_status_2 = mustCall(&cluster, "{\"op\":\"status\"}", 10_000);
         const parsed = parse(&cluster, leader_status_2);
@@ -871,26 +872,21 @@ fn runScenario(
         const target_applied = fieldInt(&parsed, "applied_slot") orelse 0;
         parsed.deinit();
         cluster.gpa.free(leader_status_2);
-        waitFor(
-            &cluster,
-            cluster.endpoints[lag_follower],
-            configurationAtLeast,
-            target_configuration,
-            45_000,
-            "snapshot install (configuration)",
-        );
+        if (target_configuration != 1) {
+            fail(&cluster, "configuration changed to {d}", .{target_configuration});
+        }
         waitFor(
             &cluster,
             cluster.endpoints[lag_follower],
             appliedAtLeast,
             target_applied,
             30_000,
-            "catch-up after snapshot install",
+            "catch-up after restart",
         );
     }
-    expectAllDigestsEqual(&cluster, "after snapshot transfer");
+    expectAllDigestsEqual(&cluster, "after journal catch-up");
 
-    step("delete a follower image; node rebuilds from snapshot plus suffix");
+    step("delete a follower image; node rebuilds from anchor plus suffix");
     const rebuild_follower = (leaderIndex(&cluster) + 2) % 3;
     cluster.killNode(rebuild_follower);
     {
@@ -915,7 +911,7 @@ fn runScenario(
             appliedAtLeast,
             target_applied,
             30_000,
-            "rebuild from snapshot plus suffix",
+            "rebuild from the retained journal",
         );
     }
     expectAllDigestsEqual(&cluster, "after image rebuild");

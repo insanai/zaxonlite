@@ -318,11 +318,11 @@ test "torn journal tail is truncated and the node reopens" {
         _ = try node.exec("insert into items(v) values ('tea')");
     }
 
-    // Append a partial record to the epoch journal, as a crashed append
-    // would leave behind.
+    // Append a partial record to the active journal segment, as a
+    // crashed append would leave behind.
     var node_dir = try std.Io.Dir.cwd().openDir(testing.io, dir, .{});
     defer node_dir.close(testing.io);
-    const journal_name = "paxos-0000000000000001.log";
+    const journal_name = "consensus/0000000000000001.zxj";
     const file = try node_dir.openFile(testing.io, journal_name, .{ .mode = .read_write });
     const end = try file.length(testing.io);
     try file.writePositionalAll(testing.io, &.{ 0x4a, 0x58, 0x01 }, end);
@@ -388,7 +388,7 @@ test "idempotent sessions execute a sequence exactly once" {
     }
 }
 
-test "snapshot seals the epoch and recovery uses snapshot plus suffix" {
+test "a state anchor bounds recovery and survives image loss" {
     const gpa = testing.allocator;
     var test_dir = try TestDir.init(gpa);
     defer test_dir.deinit(gpa);
@@ -401,59 +401,41 @@ test "snapshot seals the epoch and recovery uses snapshot plus suffix" {
         _ = try node.exec("create table items(id integer primary key, v text)");
         _ = try node.exec("insert into items(v) values ('tea'), ('coffee')");
 
-        try node.snapshot();
-        try testing.expectEqual(@as(u64, 2), node.identity.configuration_id);
-        try testing.expectEqual(@as(u32, 0), node.log.decidedThrough());
+        try node.createStateAnchor();
+        try testing.expectEqual(@as(u64, 1), node.identity.configuration_id);
+        try testing.expect(node.durable_state_slot > 0);
+        try testing.expectEqual(node.applied_slot, node.durable_state_slot);
 
         _ = try node.exec("insert into items(v) values ('water')");
         try testing.expectEqual(@as(i64, 3), try countItems(node));
     }
 
-    // Normal restart after a snapshot.
+    // Restart resumes from the anchor plus the journal suffix.
     {
         const node = try openNode(dir);
         defer node.close();
         try testing.expectEqual(@as(i64, 3), try countItems(node));
-        try testing.expectEqual(@as(u64, 2), node.identity.configuration_id);
+        const report = try node.integrityCheck();
+        try testing.expect(report.ok());
+        try node.createStateAnchor();
+        _ = try node.exec("insert into items(v) values ('mate')");
+        try testing.expectEqual(@as(i64, 4), try countItems(node));
     }
 
-    // Rebuild with no materialized image: snapshot base plus epoch suffix.
+    // Losing the image invalidates the anchor; the retained journal still
+    // rebuilds everything from genesis.
     var node_dir = try std.Io.Dir.cwd().openDir(testing.io, dir, .{});
     defer node_dir.close(testing.io);
     try node_dir.deleteFile(testing.io, "current.db");
     {
         const node = try openNode(dir);
         defer node.close();
-        try testing.expectEqual(@as(i64, 3), try countItems(node));
-        const report = try node.integrityCheck();
-        try testing.expect(report.ok());
-    }
-
-    // Several snapshot generations: old epochs and unreferenced payloads
-    // are garbage-collected, and the node keeps working.
-    {
-        const node = try openNode(dir);
-        defer node.close();
-        try node.snapshot();
-        _ = try node.exec("insert into items(v) values ('mate')");
-        try node.snapshot();
-        _ = try node.exec("insert into items(v) values ('cocoa')");
-        try testing.expectEqual(@as(i64, 5), try countItems(node));
-
-        // The first epoch's journal must be gone by now.
-        try testing.expectError(
-            error.FileNotFound,
-            node_dir.access(testing.io, "paxos-0000000000000001.log", .{}),
-        );
-    }
-    {
-        const node = try openNode(dir);
-        defer node.close();
-        try testing.expectEqual(@as(i64, 5), try countItems(node));
+        try testing.expectEqual(@as(i64, 4), try countItems(node));
         const report = try node.integrityCheck();
         try testing.expect(report.ok());
     }
 }
+
 
 test "recovery discards a corrupt materialized image even with an empty suffix" {
     const gpa = testing.allocator;
@@ -466,9 +448,8 @@ test "recovery discards a corrupt materialized image even with an empty suffix" 
         const node = try openNode(dir);
         defer node.close();
         _ = try node.exec("create table items(id integer primary key, v text)");
-        _ = try node.exec("insert into items(v) values ('snapshot-only')");
-        try node.snapshot();
-        try testing.expectEqual(@as(u32, 0), node.log.decidedThrough());
+        _ = try node.exec("insert into items(v) values ('anchor-only')");
+        try node.createStateAnchor();
     }
 
     // Damage a page in the non-authoritative working image. The current
@@ -491,108 +472,9 @@ test "recovery discards a corrupt materialized image even with an empty suffix" 
     try testing.expect(report.ok());
 }
 
-test "recovery completes rollover after CURRENT advances before identity" {
-    const gpa = testing.allocator;
-    var test_dir = try TestDir.init(gpa);
-    defer test_dir.deinit(gpa);
-    const dir = try test_dir.nodeDir(gpa);
-    defer gpa.free(dir);
 
-    var database_id: u128 = 0;
-    {
-        const node = try openNode(dir);
-        defer node.close();
-        _ = try node.exec("create table items(id integer primary key, v text)");
-        _ = try node.exec("insert into items(v) values ('durable')");
-        database_id = node.identity.database_id;
-        try node.snapshot();
-        try testing.expectEqual(@as(u64, 2), node.identity.configuration_id);
-    }
 
-    // Recreate the durable prefix immediately after CURRENT was installed:
-    // the sealed epoch-1 journal and snapshot exist, while identity still
-    // names epoch 1; the next-epoch journal has not been created yet.
-    var node_dir = try std.Io.Dir.cwd().openDir(testing.io, dir, .{});
-    defer node_dir.close(testing.io);
-    var identity_buffer: [256]u8 = undefined;
-    const identity = std.fmt.bufPrint(
-        &identity_buffer,
-        "format=1\nnode_id=1\ndatabase_id={x:0>32}\nconfiguration_id=1\n",
-        .{database_id},
-    ) catch unreachable;
-    const file = try node_dir.createFile(testing.io, "identity", .{
-        .read = true,
-        .truncate = true,
-    });
-    try file.writePositionalAll(testing.io, identity, 0);
-    try file.sync(testing.io);
-    file.close(testing.io);
-    // At the represented crash point the next-epoch journal has not received
-    // any protocol writes. Remove the later campaign record produced by the
-    // fully completed setup run.
-    try node_dir.deleteFile(testing.io, "paxos-0000000000000002.log");
-
-    const reopened = try openNode(dir);
-    defer reopened.close();
-    try testing.expectEqual(@as(u64, 2), reopened.identity.configuration_id);
-    try testing.expectEqual(@as(i64, 1), try countItems(reopened));
-    const report = try reopened.integrityCheck();
-    try testing.expect(report.ok());
-}
-
-test "recovery completes interrupted snapshot install without a stop sign" {
-    const gpa = testing.allocator;
-    var test_dir = try TestDir.init(gpa);
-    defer test_dir.deinit(gpa);
-    const dir = try test_dir.nodeDir(gpa);
-    defer gpa.free(dir);
-
-    var database_id: u128 = 0;
-    {
-        const node = try openNode(dir);
-        defer node.close();
-        _ = try node.exec("create table items(id integer primary key, v text)");
-        _ = try node.exec("insert into items(v) values ('transferred')");
-        database_id = node.identity.database_id;
-        try node.snapshot();
-    }
-
-    var node_dir = try std.Io.Dir.cwd().openDir(testing.io, dir, .{});
-    defer node_dir.close(testing.io);
-    var identity_buffer: [256]u8 = undefined;
-    const identity = std.fmt.bufPrint(
-        &identity_buffer,
-        "format=1\nnode_id=1\ndatabase_id={x:0>32}\nconfiguration_id=1\n",
-        .{database_id},
-    ) catch unreachable;
-    {
-        const file = try node_dir.createFile(testing.io, "identity", .{
-            .read = true,
-            .truncate = true,
-        });
-        try file.writePositionalAll(testing.io, identity, 0);
-        try file.sync(testing.io);
-        file.close(testing.io);
-    }
-    // A receiver that installed the snapshot but never learned the sealing
-    // stop sign has an empty old journal.
-    try node_dir.deleteFile(testing.io, "paxos-0000000000000001.log");
-    try node_dir.deleteFile(testing.io, "paxos-0000000000000002.log");
-    const empty = try node_dir.createFile(
-        testing.io,
-        "paxos-0000000000000001.log",
-        .{ .read = true },
-    );
-    try empty.sync(testing.io);
-    empty.close(testing.io);
-
-    const reopened = try openNode(dir);
-    defer reopened.close();
-    try testing.expectEqual(@as(u64, 2), reopened.identity.configuration_id);
-    try testing.expectEqual(@as(i64, 1), try countItems(reopened));
-}
-
-test "epoch capacity triggers automatic snapshot rollover" {
+test "writes continue past the consensus window with no rollover" {
     const gpa = testing.allocator;
     var test_dir = try TestDir.init(gpa);
     defer test_dir.deinit(gpa);
@@ -603,7 +485,8 @@ test "epoch capacity triggers automatic snapshot rollover" {
     defer node.close();
     _ = try node.exec("create table items(id integer primary key, v text)");
 
-    // Push past one bounded 2048-slot epoch.
+    // Push well past the 2048-cell window: slots are global and the
+    // configuration never changes (ZDS 0011).
     var buffer: [96]u8 = undefined;
     for (0..2075) |index| {
         const sql = try std.fmt.bufPrintZ(
@@ -614,10 +497,12 @@ test "epoch capacity triggers automatic snapshot rollover" {
         _ = try node.exec(sql);
     }
     try testing.expectEqual(@as(i64, 2075), try countItems(node));
-    try testing.expect(node.identity.configuration_id > 1);
+    try testing.expectEqual(@as(u64, 1), node.identity.configuration_id);
+    try testing.expect(node.log.decidedThrough() > 2075);
     const report = try node.integrityCheck();
     try testing.expect(report.ok());
 }
+
 
 test "failed SQL rolls back and replicates nothing" {
     const gpa = testing.allocator;
@@ -960,156 +845,8 @@ fn openRegistryNode(dir: []const u8) !*Node {
     });
 }
 
-test "snapshot rollover advances the decided registry with the epoch" {
-    const gpa = testing.allocator;
-    const io = testing.io;
-    var test_dir = try TestDir.init(gpa);
-    defer test_dir.deinit(gpa);
-    const dir = try test_dir.nodeDir(gpa);
-    defer gpa.free(dir);
 
-    {
-        const node = try openRegistryNode(dir);
-        defer node.close();
-        _ = try node.exec("create table items(id integer primary key, v text)");
-        _ = try node.exec("insert into items(v) values ('epoch one')");
-        try node.snapshot();
-        try testing.expectEqual(@as(u64, 2), node.identity.configuration_id);
-        const decided = node.decidedRegistry().?;
-        try testing.expectEqual(@as(u64, 2), decided.configuration_id);
-        try testing.expectEqual(@as(u64, 1), decided.predecessor_configuration_id);
-        try testing.expectEqual(@as(u128, 42), decided.database_id);
-    }
-    {
-        const pointer = try test_dir.tmp.dir.readFileAlloc(
-            io,
-            "node/REGISTRY",
-            gpa,
-            .limited(64),
-        );
-        defer gpa.free(pointer);
-        try testing.expectEqualStrings("0000000000000002", pointer);
-    }
 
-    // A second rollover retires the oldest registry blob, mirroring
-    // snapshot retention: the pointer target plus one fallback remain.
-    {
-        const node = try openRegistryNode(dir);
-        defer node.close();
-        try testing.expectEqual(@as(u64, 2), node.decidedRegistry().?.configuration_id);
-        _ = try node.exec("insert into items(v) values ('epoch two')");
-        try node.snapshot();
-        try testing.expectEqual(@as(u64, 3), node.decidedRegistry().?.configuration_id);
-        try testing.expectEqual(@as(i64, 2), try countItems(node));
-    }
-    try test_dir.tmp.dir.access(io, "node/registries/0000000000000002", .{});
-    try test_dir.tmp.dir.access(io, "node/registries/0000000000000003", .{});
-    try testing.expectError(
-        error.FileNotFound,
-        test_dir.tmp.dir.access(io, "node/registries/0000000000000001", .{}),
-    );
-}
-
-test "recovery completes registry rollover after CURRENT advances" {
-    const gpa = testing.allocator;
-    const io = testing.io;
-    var test_dir = try TestDir.init(gpa);
-    defer test_dir.deinit(gpa);
-    const dir = try test_dir.nodeDir(gpa);
-    defer gpa.free(dir);
-
-    var database_id: u128 = 0;
-    {
-        const node = try openRegistryNode(dir);
-        defer node.close();
-        _ = try node.exec("create table items(id integer primary key, v text)");
-        _ = try node.exec("insert into items(v) values ('durable')");
-        database_id = node.identity.database_id;
-        try node.snapshot();
-        try testing.expectEqual(@as(u64, 2), node.identity.configuration_id);
-    }
-
-    // Recreate the crash window after CURRENT was installed but before the
-    // REGISTRY pointer and identity advanced: both still name epoch 1 and
-    // the next-epoch journal does not exist yet.
-    var node_dir = try std.Io.Dir.cwd().openDir(testing.io, dir, .{});
-    defer node_dir.close(testing.io);
-    var identity_buffer: [256]u8 = undefined;
-    const identity = std.fmt.bufPrint(
-        &identity_buffer,
-        "format=2\nnode_id=1\ndatabase_id={x:0>32}\nconfiguration_id=1\nrole=data-voter\n",
-        .{database_id},
-    ) catch unreachable;
-    {
-        const file = try node_dir.createFile(testing.io, "identity", .{
-            .read = true,
-            .truncate = true,
-        });
-        try file.writePositionalAll(testing.io, identity, 0);
-        try file.sync(testing.io);
-        file.close(testing.io);
-    }
-    try node_dir.writeFile(io, .{
-        .sub_path = "REGISTRY",
-        .data = "0000000000000001",
-    });
-    try node_dir.deleteFile(testing.io, "paxos-0000000000000002.log");
-
-    const reopened = try openRegistryNode(dir);
-    defer reopened.close();
-    try testing.expectEqual(@as(u64, 2), reopened.identity.configuration_id);
-    try testing.expectEqual(@as(u64, 2), reopened.decidedRegistry().?.configuration_id);
-    try testing.expectEqual(@as(i64, 1), try countItems(reopened));
-    const pointer = try node_dir.readFileAlloc(io, "REGISTRY", gpa, .limited(64));
-    defer gpa.free(pointer);
-    try testing.expectEqualStrings("0000000000000002", pointer);
-}
-
-test "recovery completes registry rollover after the pointer advances" {
-    const gpa = testing.allocator;
-    var test_dir = try TestDir.init(gpa);
-    defer test_dir.deinit(gpa);
-    const dir = try test_dir.nodeDir(gpa);
-    defer gpa.free(dir);
-
-    var database_id: u128 = 0;
-    {
-        const node = try openRegistryNode(dir);
-        defer node.close();
-        _ = try node.exec("create table items(id integer primary key, v text)");
-        _ = try node.exec("insert into items(v) values ('durable')");
-        database_id = node.identity.database_id;
-        try node.snapshot();
-    }
-
-    // The crash window one step later than the previous test: CURRENT and
-    // REGISTRY both advanced, the identity file did not. Recovery must use
-    // the pointer's configuration, never fall back to the old registry.
-    var node_dir = try std.Io.Dir.cwd().openDir(testing.io, dir, .{});
-    defer node_dir.close(testing.io);
-    var identity_buffer: [256]u8 = undefined;
-    const identity = std.fmt.bufPrint(
-        &identity_buffer,
-        "format=2\nnode_id=1\ndatabase_id={x:0>32}\nconfiguration_id=1\nrole=data-voter\n",
-        .{database_id},
-    ) catch unreachable;
-    {
-        const file = try node_dir.createFile(testing.io, "identity", .{
-            .read = true,
-            .truncate = true,
-        });
-        try file.writePositionalAll(testing.io, identity, 0);
-        try file.sync(testing.io);
-        file.close(testing.io);
-    }
-    try node_dir.deleteFile(testing.io, "paxos-0000000000000002.log");
-
-    const reopened = try openRegistryNode(dir);
-    defer reopened.close();
-    try testing.expectEqual(@as(u64, 2), reopened.identity.configuration_id);
-    try testing.expectEqual(@as(u64, 2), reopened.decidedRegistry().?.configuration_id);
-    try testing.expectEqual(@as(i64, 1), try countItems(reopened));
-}
 
 test "a transaction above the protocol hard limit is rejected" {
     // The 64 MiB - 73 byte protocol payload bound (ZDS 0009): a single
@@ -1902,9 +1639,9 @@ test "checkpoint drains pooled readers and readers resume afterward" {
     thread.join();
     try testing.expectEqual(@as(usize, 0), worker.failures);
 
-    // The epoch rolled over and reads and writes still serve.
+    // The anchor published and reads and writes still serve.
     const after = try shared.status();
-    try testing.expect(after.snapshot != null);
+    try testing.expect(after.durable_state_slot > 0);
     _ = try shared.execPrepared("insert into items(v) values ('post')", &.{});
     var result = try shared.queryPrepared(gpa, "select count(*) from items", &.{});
     defer result.deinit();

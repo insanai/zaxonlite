@@ -380,11 +380,11 @@ pub fn main(init: std.process.Init) !u8 {
     try expect(
         gpa,
         io,
-        "snapshot seals the epoch",
-        &.{ "snapshot", "--data", data },
+        "anchor publishes a durable state anchor",
+        &.{ "anchor", "--data", data },
         null,
         0,
-        "snapshot installed",
+        "state anchor published",
         null,
     );
     try expect(

@@ -178,7 +178,7 @@ fn benchRecovery(
         },
     );
 
-    try node_ptr.*.snapshot();
+    try node_ptr.*.createStateAnchor();
     node_ptr.*.close();
     {
         var db_buffer: [96]u8 = undefined;

@@ -129,21 +129,29 @@ fn randomEnvelope(random: std.Random) types.Log.Envelope {
     const slot = random.intRangeAtMost(u32, 1, 255);
 
     const message: types.Log.Message = switch (random.intRangeAtMost(u8, 0, 8)) {
-        0 => .{ .prepare = .{ .ballot = ballot, .decided_through = slot } },
+        0 => .{ .prepare = .{ .ballot = ballot, .first = slot } },
         1 => .{ .promise = .{
             .ballot = ballot,
             .slot = slot,
             .accepted = .{ .ballot = ballot, .value = entry },
         } },
-        2 => .{ .promise_done = .{
+        2 => .{ .promise_range = .{
             .ballot = ballot,
-            .accepted_count = slot,
-            .decided_through = slot,
+            .anchor = .{
+                .trim_id = 1,
+                .chosen_trim_slot = slot,
+                .history_hash = batch.payload_hash,
+            },
+            .chosen_through = slot,
+            .first = slot,
+            .last = slot + 7,
+            .accepted_count = 3,
+            .more = random.boolean(),
         } },
         3 => .{ .accept = .{ .ballot = ballot, .slot = slot, .value = entry } },
         4 => .{ .accepted = .{ .ballot = ballot, .slot = slot, .decided_through = slot } },
         5 => .{ .commit = .{ .slot = slot, .value = entry } },
-        6 => .{ .learn = .{ .from_slot = slot } },
+        6 => .{ .learn = .{ .from_slot = slot, .count = 32 } },
         7 => .{ .nack = .{
             .rejected = ballot,
             .promised = ballot,
@@ -185,7 +193,7 @@ fn fuzzJournal(
 
         // A protocol-valid stream of random writes: ballots never regress
         // and accepts precede commits at each slot.
-        var journal = try journal_mod.Journal.create(io, dir, 1);
+        var journal = try journal_mod.Journal.create(io, gpa, dir, 1);
         const write_count = random.intRangeAtMost(usize, 1, 24);
         var slot: u32 = 1;
         var round: u64 = 1;
@@ -211,7 +219,7 @@ fn fuzzJournal(
             try journal.appendWrites(&.{write});
         }
         try journal.sync();
-        const end = journal.end_offset;
+        const end = journal.active.end_offset;
 
         // Random damage: garbage appended, or bytes flipped near the tail.
         const damage = random.intRangeAtMost(u8, 0, 2);
@@ -219,13 +227,13 @@ fn fuzzJournal(
             var garbage: [64]u8 = undefined;
             const garbage_len = random.intRangeAtMost(usize, 1, garbage.len);
             random.bytes(garbage[0..garbage_len]);
-            try journal.file.writePositionalAll(io, garbage[0..garbage_len], end);
+            try journal.active.file.writePositionalAll(io, garbage[0..garbage_len], end);
         } else if (damage == 2 and end > 0) {
             var byte: [1]u8 = undefined;
             const offset = random.intRangeLessThan(u64, 0, end);
-            _ = try journal.file.readPositionalAll(io, &byte, offset);
+            _ = try journal.active.file.readPositionalAll(io, &byte, offset);
             byte[0] ^= @as(u8, 1) << random.intRangeAtMost(u3, 0, 7);
-            try journal.file.writePositionalAll(io, &byte, offset);
+            try journal.active.file.writePositionalAll(io, &byte, offset);
         }
         journal.close();
 
@@ -241,7 +249,12 @@ fn fuzzJournal(
                 return error.LostValidRecords;
             }
         } else |err| switch (err) {
-            error.CorruptJournal, error.UnsupportedJournalVersion => {
+            error.CorruptJournal,
+            error.CorruptSegment,
+            error.UnsupportedSegmentVersion,
+            error.CorruptManifest,
+            error.SequenceGap,
+            => {
                 if (damage == 0) return error.RejectedValidJournal;
             },
             else => return err,
@@ -322,7 +335,7 @@ fn fuzzNode(
                 _ = node.exec("insert into missing_table values (1)") catch {};
             },
             // Snapshot: seal the epoch.
-            7 => try node.snapshot(),
+            7 => try node.createStateAnchor(),
             // Restart, sometimes with injected tail garbage or a deleted
             // materialized image.
             8, 9 => {

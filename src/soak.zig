@@ -113,7 +113,7 @@ pub fn main(init: std.process.Init) !u8 {
                 reads += 1;
             },
             93...95 => {
-                try node.snapshot();
+                try node.createStateAnchor();
                 snapshots += 1;
             },
             else => {
