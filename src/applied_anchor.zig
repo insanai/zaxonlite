@@ -32,7 +32,7 @@ const magic: u32 = 0x5041585a; // "ZXAP" in file byte order.
 const version: u16 = 1;
 
 /// Total encoded record size; both files are exactly this long.
-pub const record_size = 4 + 2 + 2 + 8 + 16 + 8 + 32 + 4 + 8 + 8 + 32 + 32;
+pub const record_size = 4 + 2 + 2 + 8 + 16 + 8 + 8 + 32 + 4 + 8 + 8 + 16 + 32 + 32;
 
 const file_names = [2][]const u8{ "APPLIED.0", "APPLIED.1" };
 
@@ -40,10 +40,15 @@ pub const Anchor = struct {
     generation: u64,
     database_id: u128,
     global_slot: u64,
+    /// The configuration in effect at the anchor slot; replay resumes
+    /// history leaves under it.
+    configuration_id: u64,
     history_hash: [32]u8,
     sqlite_page_size: u32,
     sqlite_page_count: u64,
     last_data_slot: u64,
+    /// Batch identity at `last_data_slot`; zero when no batch precedes.
+    last_batch_id: u128,
     last_chain: [32]u8,
 };
 
@@ -84,10 +89,12 @@ fn encode(anchor: Anchor, out: *[record_size]u8) void {
     writeInt(u64, out, &offset, anchor.generation);
     writeInt(u128, out, &offset, anchor.database_id);
     writeInt(u64, out, &offset, anchor.global_slot);
+    writeInt(u64, out, &offset, anchor.configuration_id);
     writeBytes(out, &offset, &anchor.history_hash);
     writeInt(u32, out, &offset, anchor.sqlite_page_size);
     writeInt(u64, out, &offset, anchor.sqlite_page_count);
     writeInt(u64, out, &offset, anchor.last_data_slot);
+    writeInt(u128, out, &offset, anchor.last_batch_id);
     writeBytes(out, &offset, &anchor.last_chain);
     var checksum: [32]u8 = undefined;
     Sha256.hash(out[0..offset], &checksum, .{});
@@ -116,16 +123,19 @@ fn readOne(io: Io, dir: Io.Dir, name: []const u8, database_id: u128) ?Anchor {
         .generation = generation,
         .database_id = database_id,
         .global_slot = readInt(u64, &bytes, &offset),
+        .configuration_id = readInt(u64, &bytes, &offset),
         .history_hash = undefined,
         .sqlite_page_size = undefined,
         .sqlite_page_count = undefined,
         .last_data_slot = undefined,
+        .last_batch_id = undefined,
         .last_chain = undefined,
     };
     readBytes(&bytes, &offset, &anchor.history_hash);
     anchor.sqlite_page_size = readInt(u32, &bytes, &offset);
     anchor.sqlite_page_count = readInt(u64, &bytes, &offset);
     anchor.last_data_slot = readInt(u64, &bytes, &offset);
+    anchor.last_batch_id = readInt(u128, &bytes, &offset);
     readBytes(&bytes, &offset, &anchor.last_chain);
     return anchor;
 }
@@ -158,10 +168,12 @@ fn sampleAnchor(generation: u64, slot: u64) Anchor {
         .generation = generation,
         .database_id = 77,
         .global_slot = slot,
+        .configuration_id = 1,
         .history_hash = [_]u8{1} ** 32,
         .sqlite_page_size = 4096,
         .sqlite_page_count = 12,
         .last_data_slot = slot - 1,
+        .last_batch_id = 7,
         .last_chain = [_]u8{2} ** 32,
     };
 }

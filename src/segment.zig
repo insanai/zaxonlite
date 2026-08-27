@@ -153,6 +153,71 @@ pub const Writer = struct {
         self.file.close(self.io);
     }
 
+    /// Reopens an unsealed active segment for appending after a restart.
+    /// The valid record prefix is rescanned to rebuild the digest, counts,
+    /// and sparse index; a torn tail is truncated away. The caller decodes
+    /// records separately; this pass only restores writer state.
+    pub fn adopt(io: Io, dir: Io.Dir, name: []const u8) !Writer {
+        var reader = try Reader.open(io, dir, name);
+        var end: u64 = header_size;
+        var count: u64 = 0;
+        var last: u64 = 0;
+        var sparse_count: u32 = 0;
+        var sparse: [max_sparse_entries]SparseEntry = undefined;
+        while (true) {
+            const start_offset = reader.offset;
+            const record = reader.next() catch {
+                // A record cut off by the end of the file is a torn tail
+                // from a crash and is truncated away; corruption strictly
+                // inside the durable prefix stops the node instead.
+                if (!recordTouchesEof(&reader, start_offset)) {
+                    reader.close();
+                    return error.CorruptSegment;
+                }
+                break;
+            } orelse break;
+            if (count % sparse_stride == 0 and record.slot != 0) {
+                sparse[sparse_count] = .{
+                    .slot = record.slot,
+                    .offset = start_offset,
+                };
+                sparse_count += 1;
+            }
+            end = reader.offset;
+            count += 1;
+            if (record.slot > last) last = record.slot;
+        }
+        reader.close();
+
+        const file = try dir.openFile(io, name, .{ .mode = .read_write });
+        errdefer file.close(io);
+        try file.setLength(io, end);
+        var hasher = Sha256.init(.{});
+        var buffer: [64 * 1024]u8 = undefined;
+        var position: u64 = 0;
+        while (position < end) {
+            const want: usize = @intCast(@min(buffer.len, end - position));
+            const read = try file.readPositionalAll(io, buffer[0..want], position);
+            if (read != want) return error.CorruptSegment;
+            hasher.update(buffer[0..want]);
+            position += want;
+        }
+        const header = try readHeader(io, file);
+        return .{
+            .io = io,
+            .file = file,
+            .hasher = hasher,
+            .end_offset = end,
+            .first_slot = header.first_global_slot,
+            .last_slot = last,
+            .record_count = count,
+            .max_promised = paxos.Ballot.zero,
+            .sparse_count = sparse_count,
+            .sparse = sparse,
+            .sealed = false,
+        };
+    }
+
     /// Whether the segment reached its record capacity and must rotate.
     pub fn full(self: *const Writer) bool {
         return self.record_count >= capacity_records;
@@ -342,6 +407,26 @@ pub const Reader = struct {
         return .{ .sequence = sequence, .kind = kind, .slot = slot, .payload = payload };
     }
 };
+
+/// Whether the record starting at `offset` could extend past the end of
+/// the file, which marks a torn tail rather than interior corruption.
+fn recordTouchesEof(reader: *const Reader, offset: u64) bool {
+    const remaining = reader.records_end - offset;
+    if (remaining < record_header_size) return true;
+    var header_bytes: [record_header_size]u8 = undefined;
+    const read = reader.file.readPositionalAll(
+        reader.io,
+        &header_bytes,
+        offset,
+    ) catch return true;
+    if (read != record_header_size) return true;
+    const payload_len = std.mem.readInt(
+        u32,
+        header_bytes[record_header_size - 8 ..][0..4],
+        .little,
+    );
+    return remaining < record_header_size + payload_len;
+}
 
 const ParsedTrailer = struct {
     trailer: Trailer,
