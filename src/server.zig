@@ -887,30 +887,29 @@ const FenceWaiter = struct {
     }
 };
 
-const CheckpointProofWaiter = struct {
+const HistoryProbeWaiter = struct {
     nonce: u64,
-    sealed_configuration_id: u64,
-    digest: [32]u8,
-    /// Voters of the sealed configuration, from the proof itself. Only
-    /// distinct IDs drawn from this set count toward the quorum; the
-    /// proposed next voter never does.
-    sealed_members: [types.log_options.max_members]paxos.NodeId =
+    slot: paxos.Slot,
+    hash: [32]u8,
+    /// Voters whose vouch counts toward the read quorum. Only distinct
+    /// IDs drawn from this set count; the transfer sender is one of them.
+    voters: [types.log_options.max_members]paxos.NodeId =
         [_]paxos.NodeId{0} ** types.log_options.max_members,
-    sealed_count: u16 = 0,
+    voter_count: u16 = 0,
     acked: [types.log_options.max_members]paxos.NodeId =
         [_]paxos.NodeId{0} ** types.log_options.max_members,
     ack_count: usize = 0,
     needed: usize,
 
-    fn isSealedVoter(self: *const CheckpointProofWaiter, member: paxos.NodeId) bool {
-        for (self.sealed_members[0..self.sealed_count]) |sealed| {
-            if (sealed == member) return true;
+    fn isVoter(self: *const HistoryProbeWaiter, member: paxos.NodeId) bool {
+        for (self.voters[0..self.voter_count]) |voter| {
+            if (voter == member) return true;
         }
         return false;
     }
 
-    fn noteAck(self: *CheckpointProofWaiter, member: paxos.NodeId) void {
-        if (!self.isSealedVoter(member)) return;
+    fn noteAck(self: *HistoryProbeWaiter, member: paxos.NodeId) void {
+        if (!self.isVoter(member)) return;
         for (self.acked[0..self.ack_count]) |seen| {
             if (seen == member) return;
         }
@@ -939,10 +938,10 @@ pub const Server = struct {
     node: *Node,
     options: ServeOptions,
     mutex: std.Io.Mutex = .init,
-    /// Kept separate from `mutex`: checkpoint replies must be recordable
-    /// while the snapshot receiver waits for its voter read quorum.
+    /// Kept separate from `mutex`: history vouches must be recordable
+    /// while the transfer receiver waits for its voter read quorum.
     proof_mutex: std.Io.Mutex = .init,
-    proof_waiter: ?*CheckpointProofWaiter = null,
+    proof_waiter: ?*HistoryProbeWaiter = null,
     next_proof_nonce: u64 = 1,
     /// Set once a decided stop sign replaced this voter: the node stays
     /// permanently sealed and the server stops attempting rollover.
@@ -5040,23 +5039,23 @@ test "payload gate releases envelopes only after storage ack" {
     try std.testing.expectEqual(@as(usize, 1), sender.queue.items.len);
 }
 
-test "checkpoint proof quorum counts distinct sealed voters only" {
-    var waiter = CheckpointProofWaiter{
+test "history probe quorum counts distinct voters only" {
+    var waiter = HistoryProbeWaiter{
         .nonce = 1,
-        .sealed_configuration_id = 7,
-        .digest = [_]u8{9} ** 32,
+        .slot = 7,
+        .hash = [_]u8{9} ** 32,
         .needed = 2,
     };
-    waiter.sealed_members[0] = 1;
-    waiter.sealed_members[1] = 2;
-    waiter.sealed_members[2] = 3;
-    waiter.sealed_count = 3;
+    waiter.voters[0] = 1;
+    waiter.voters[1] = 2;
+    waiter.voters[2] = 3;
+    waiter.voter_count = 3;
 
-    // The proposed next voter never helps satisfy the sealed quorum.
+    // A non-voter never helps satisfy the read quorum.
     waiter.noteAck(4);
     try std.testing.expectEqual(@as(usize, 0), waiter.ack_count);
 
-    // A sealed voter counts exactly once, however often it confirms.
+    // A voter counts exactly once, however often it vouches.
     waiter.noteAck(1);
     waiter.noteAck(1);
     try std.testing.expectEqual(@as(usize, 1), waiter.ack_count);
