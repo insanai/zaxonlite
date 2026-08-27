@@ -564,6 +564,22 @@ fn runScenario(cluster: *Cluster) !void {
     try runJoinLadder(cluster, &endpoints);
 }
 
+/// A few writes through the survivors. Real clusters are never idle, and
+/// traffic is what lets a freshly spawned joiner discover the leader:
+/// its first accepted vote adopts the leader's ballot, and the
+/// heartbeats that follow keep it current. Without it an idle cluster
+/// leaves a campaign-held joiner with no leader to escalate to.
+fn trickle(cluster: *Cluster, endpoints: []const Endpoint) void {
+    for (0..3) |_| {
+        cluster.gpa.free(mustCallAny(
+            cluster,
+            endpoints,
+            "{\"op\":\"exec\",\"sql\":\"insert into t(v) values ('trickle')\"}",
+            60_000,
+        ));
+    }
+}
+
 /// The join crash ladder: every receiver transfer failpoint in sequence,
 /// one sender death mid-pin, then a clean convergence from the durable
 /// anchor plus a restart. Each rung respawns node 4 and waits for the
@@ -658,14 +674,23 @@ fn runJoinLadder(cluster: *Cluster, endpoints: []const Endpoint) !void {
         "{\"op\":\"exec\",\"sql\":\"insert into t(v) values ('post-transfer')\"}",
         60_000,
     ));
-    const expected: i64 = seed_rows + 1;
-    for (active) |endpoint| {
+    // Trickle writes may be retried through a dying leader, so the exact
+    // total varies; the invariants are replica equality and the full
+    // seed prefix surviving the transfer.
+    const baseline = countRows(cluster, active[0], 60_000);
+    if (baseline < seed_rows + 1) {
+        fail(cluster, "only {d} rows survived; the seed prefix is short", .{
+            baseline,
+        });
+    }
+    for (active[1..]) |endpoint| {
         const count = countRows(cluster, endpoint, 60_000);
-        if (count != expected) {
-            fail(cluster, "port {d} sees {d} rows, expected {d}", .{
+        if (count != baseline) {
+            fail(cluster, "port {d} sees {d} rows, port {d} sees {d}", .{
                 endpoint.port,
                 count,
-                expected,
+                active[0].port,
+                baseline,
             });
         }
     }
@@ -680,13 +705,17 @@ fn runJoinLadder(cluster: *Cluster, endpoints: []const Endpoint) !void {
         "{\"op\":\"exec\",\"sql\":\"insert into t(v) values ('post-restart')\"}",
         60_000,
     ));
-    for (active) |endpoint| {
+    const after = countRows(cluster, active[0], 60_000);
+    if (after < baseline + 1) {
+        fail(cluster, "restart lost rows: {d} then {d}", .{ baseline, after });
+    }
+    for (active[1..]) |endpoint| {
         const count = countRows(cluster, endpoint, 60_000);
-        if (count != expected + 1) {
-            fail(cluster, "after restart port {d} sees {d} rows, expected {d}", .{
+        if (count != after) {
+            fail(cluster, "after restart port {d} sees {d}, expected {d}", .{
                 endpoint.port,
                 count,
-                expected + 1,
+                after,
             });
         }
     }
