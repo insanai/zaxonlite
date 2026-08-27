@@ -568,27 +568,15 @@ fn runScenario(cluster: *Cluster) !void {
     try runJoinLadder(cluster, &endpoints);
 }
 
-/// A few writes through the survivors. Real clusters are never idle, and
-/// traffic is what lets a freshly spawned joiner discover the leader:
-/// its first accepted vote adopts the leader's ballot, and the
-/// heartbeats that follow keep it current. Without it an idle cluster
-/// leaves a campaign-held joiner with no leader to escalate to.
-fn trickle(cluster: *Cluster, endpoints: []const Endpoint) void {
-    for (0..3) |_| {
-        cluster.gpa.free(mustCallAny(
-            cluster,
-            endpoints,
-            "{\"op\":\"exec\",\"sql\":\"insert into t(v) values ('trickle')\"}",
-            60_000,
-        ));
-    }
-}
-
-/// The join crash ladder: every receiver transfer failpoint in sequence,
-/// one sender death mid-pin, then a clean convergence from the durable
-/// anchor plus a restart. Each rung respawns node 4 and waits for the
-/// armed failpoint to kill it; the retry after each crash must be
-/// idempotent because the reclaimed prefix leaves no other source.
+/// The join crash ladder: the receiver dies at every stateless-phase
+/// transfer failpoint in sequence, the sender is killed mid-copy on one
+/// rung with another peer completing the send, and the final clean start
+/// must converge from the durable anchor. Every rung runs on an
+/// otherwise idle cluster: the joiner's leaderless recovery probes are
+/// themselves under test. A crash at or after the durable anchor ends
+/// the stateless phase, so `after_transfer_anchor` is the last crashing
+/// rung; `after_transfer_resume` differs from it by in-memory state
+/// only.
 fn runJoinLadder(cluster: *Cluster, endpoints: []const Endpoint) !void {
     const gpa = cluster.gpa;
     const updated_ids = [_]u32{ 1, 2, 4 };
@@ -598,42 +586,39 @@ fn runJoinLadder(cluster: *Cluster, endpoints: []const Endpoint) !void {
         cluster.replacement_port,
     };
 
+    step("receiver dies mid-stream on a transferred chunk");
+    try cluster.spawnNode(3, &updated_ids, &updated_ports, "after_transfer_chunk");
+    cluster.waitNodeExit(3);
+
     step("receiver dies after staging the transferred image");
     try cluster.spawnNode(3, &updated_ids, &updated_ports, "after_transfer_stage");
-    trickle(cluster, endpoints);
     cluster.waitNodeExit(3);
 
     step("receiver dies after the digest check, before the install rename");
     try cluster.spawnNode(3, &updated_ids, &updated_ports, "before_transfer_install");
-    trickle(cluster, endpoints);
     cluster.waitNodeExit(3);
 
-    step("sender dies pinning its image; another voter completes the send");
-    const leader = waitForLeader(cluster, endpoints[0], 30_000);
-    const leader_index: usize = leader - 1;
+    step("receiver dies after the install rename, before the anchor");
+    // No anchor binds the renamed image, so the next start discards it
+    // and transfers again.
+    try cluster.spawnNode(3, &updated_ids, &updated_ports, "after_transfer_install");
+    cluster.waitNodeExit(3);
+
+    step("sender dies mid-copy while pinning; another peer completes the send");
+    // The joiner's recovery probes rotate from the lowest registry peer,
+    // so the first snapshot request always lands on node 1; arm its pin
+    // copy to die on the first chunk. The receiver is armed to die
+    // between the durable anchor and the in-memory resume, which also
+    // ends the stateless phase.
     gpa.free(mustCallAny(
         cluster,
-        endpoints[leader_index .. leader_index + 1],
-        "{\"op\":\"failpoint\",\"name\":\"after_transfer_pin\"}",
+        endpoints[0..1],
+        "{\"op\":\"failpoint\",\"name\":\"during_transfer_pin\"}",
         30_000,
     ));
-    try cluster.spawnNode(3, &updated_ids, &updated_ports, "after_transfer_install");
-    trickle(cluster, endpoints);
-    cluster.waitNodeExit(leader_index);
-    try cluster.spawnNode(
-        leader_index,
-        &updated_ids,
-        &updated_ports,
-        null,
-    );
-    cluster.waitNodeExit(3);
-
-    step("receiver dies after publishing the durable anchor");
-    // The install rename already happened, but no anchor bound the image,
-    // so the previous restart discarded it and transferred again; this
-    // rung crashes after the anchor is durable.
     try cluster.spawnNode(3, &updated_ids, &updated_ports, "after_transfer_anchor");
-    trickle(cluster, endpoints);
+    cluster.waitNodeExit(0);
+    try cluster.spawnNode(0, &updated_ids, &updated_ports, null);
     cluster.waitNodeExit(3);
 
     step("clean start converges from the installed anchor");
@@ -645,7 +630,7 @@ fn runJoinLadder(cluster: *Cluster, endpoints: []const Endpoint) !void {
         receiver,
         "durable_state_slot",
         1,
-        120_000,
+        180_000,
     );
     for (0..2) |survivor| {
         const retained = statusInt(
@@ -658,37 +643,29 @@ fn runJoinLadder(cluster: *Cluster, endpoints: []const Endpoint) !void {
         }
     }
 
-    step("the transferred replica serves the same data and accepts writes");
+    step("the transferred replica matches its peers and accepts writes");
     const active = [_]Endpoint{
         cluster.endpointOf(0),
         cluster.endpointOf(1),
         receiver,
     };
-    const applied = waitStatusAtLeast(
-        cluster,
-        receiver,
-        "applied_slot",
-        anchor_slot,
-        120_000,
-    );
-    _ = applied;
+    _ = waitStatusAtLeast(cluster, receiver, "applied_slot", anchor_slot, 180_000);
     gpa.free(mustCallAny(
         cluster,
         &active,
         "{\"op\":\"exec\",\"sql\":\"insert into t(v) values ('post-transfer')\"}",
         60_000,
     ));
-    // Trickle writes may be retried through a dying leader, so the exact
-    // total varies; the invariants are replica equality and the full
-    // seed prefix surviving the transfer.
     const baseline = countRows(cluster, &active, "linearizable", 60_000);
-    if (baseline < seed_rows + 1) {
-        fail(cluster, "only {d} rows survived; the seed prefix is short", .{
+    if (baseline != seed_rows + 1) {
+        fail(cluster, "{d} rows after transfer, expected {d}", .{
             baseline,
+            seed_rows + 1,
         });
     }
-    for (active) |endpoint| {
-        waitReplicaCount(cluster, endpoint, baseline, 60_000);
+    const reference = waitReplicaMatch(cluster, active[0], baseline, null, 60_000);
+    for (active[1..]) |endpoint| {
+        _ = waitReplicaMatch(cluster, endpoint, baseline, reference, 60_000);
     }
 
     step("the transferred replica survives its own restart");
@@ -702,38 +679,108 @@ fn runJoinLadder(cluster: *Cluster, endpoints: []const Endpoint) !void {
         60_000,
     ));
     const after = countRows(cluster, &active, "linearizable", 60_000);
-    if (after < baseline + 1) {
-        fail(cluster, "restart lost rows: {d} then {d}", .{ baseline, after });
+    if (after != baseline + 1) {
+        fail(cluster, "restart count moved from {d} to {d}", .{ baseline, after });
     }
-    for (active) |endpoint| {
-        waitReplicaCount(cluster, endpoint, after, 60_000);
+    const restarted = waitReplicaMatch(cluster, active[0], after, null, 60_000);
+    for (active[1..]) |endpoint| {
+        _ = waitReplicaMatch(cluster, endpoint, after, restarted, 60_000);
     }
 }
 
-/// Polls one replica's locally served count until it reaches `expected`;
-/// replication lag is tolerated, divergence is not.
-fn waitReplicaCount(
+/// One replica's materialized identity: the row multiset checksum of
+/// table t plus the application chain hash from status. Replicas at the
+/// same data frontier must agree on every field.
+const Fingerprint = struct {
+    rows: i64,
+    id_sum: i64,
+    len_sum: i64,
+    chain: [64]u8,
+};
+
+fn replicaFingerprint(cluster: *Cluster, endpoint: Endpoint) ?Fingerprint {
+    const single = [_]Endpoint{endpoint};
+    const body = rpcTry(cluster, single[0], "{\"op\":\"query\"," ++
+        "\"sql\":\"select count(*), coalesce(sum(id),0), " ++
+        "coalesce(sum(length(v)),0) from t\",\"level\":\"any\"}") orelse
+        return null;
+    defer cluster.gpa.free(body);
+    const parsed = parse(cluster, body);
+    defer parsed.deinit();
+    if (!isOk(&parsed)) return null;
+    const rows = field(&parsed, "rows") orelse return null;
+    if (rows != .array or rows.array.items.len != 1) return null;
+    const cells = rows.array.items[0];
+    if (cells != .array or cells.array.items.len != 3) return null;
+    var print = Fingerprint{
+        .rows = jsonInt(cells.array.items[0]) orelse return null,
+        .id_sum = jsonInt(cells.array.items[1]) orelse return null,
+        .len_sum = jsonInt(cells.array.items[2]) orelse return null,
+        .chain = undefined,
+    };
+    const status = rpcTry(cluster, single[0], "{\"op\":\"status\"}") orelse
+        return null;
+    defer cluster.gpa.free(status);
+    const status_parsed = parse(cluster, status);
+    defer status_parsed.deinit();
+    const chain = fieldString(&status_parsed, "chain") orelse return null;
+    if (chain.len != 64) return null;
+    @memcpy(&print.chain, chain);
+    return print;
+}
+
+fn jsonInt(value: std.json.Value) ?i64 {
+    return switch (value) {
+        .integer => |n| n,
+        .string => |text| std.fmt.parseInt(i64, text, 10) catch null,
+        else => null,
+    };
+}
+
+fn fieldString(parsed: *const Parsed, name: []const u8) ?[]const u8 {
+    const value = field(parsed, name) orelse return null;
+    return switch (value) {
+        .string => |text| text,
+        else => null,
+    };
+}
+
+/// Polls one replica until its locally served fingerprint reaches
+/// `rows` and, when a reference is given, matches it exactly.
+/// Replication lag is tolerated; divergence is not.
+fn waitReplicaMatch(
     cluster: *Cluster,
     endpoint: Endpoint,
-    expected: i64,
+    rows: i64,
+    reference: ?Fingerprint,
     deadline_ms: u64,
-) void {
-    const single = [_]Endpoint{endpoint};
+) Fingerprint {
     var elapsed: u64 = 0;
     while (elapsed <= deadline_ms) {
-        const count = countRows(cluster, &single, "any", 10_000);
-        if (count >= expected) {
-            if (count > expected) {
+        if (replicaFingerprint(cluster, endpoint)) |print| {
+            if (print.rows == rows) {
+                if (reference) |expected| {
+                    if (print.id_sum != expected.id_sum or
+                        print.len_sum != expected.len_sum or
+                        !std.mem.eql(u8, &print.chain, &expected.chain))
+                    {
+                        fail(cluster, "port {d} diverges from its peers", .{
+                            endpoint.port,
+                        });
+                    }
+                }
+                return print;
+            }
+            if (print.rows > rows) {
                 fail(cluster, "port {d} sees {d} rows, expected {d}", .{
                     endpoint.port,
-                    count,
-                    expected,
+                    print.rows,
+                    rows,
                 });
             }
-            return;
         }
         elapsed += 250;
         cluster.io.sleep(.fromMilliseconds(250), .awake) catch {};
     }
-    fail(cluster, "port {d} never reached {d} rows", .{ endpoint.port, expected });
+    fail(cluster, "port {d} never reached {d} rows", .{ endpoint.port, rows });
 }
