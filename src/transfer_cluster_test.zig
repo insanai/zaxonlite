@@ -568,16 +568,15 @@ fn runScenario(cluster: *Cluster) !void {
     try runJoinLadder(cluster, &endpoints);
 }
 
-/// Proves a node's last run died at the armed failpoint and not for
-/// some other reason: `spawnNode` truncates the log, and the failpoint
-/// prints its name before `_exit`, so the line must be present.
-fn expectFailpointHit(cluster: *Cluster, index: usize, name: []const u8) void {
+/// Whether a node's log (truncated at its last spawn) already carries
+/// the crash line the armed failpoint prints before `_exit`.
+fn logHasFailpoint(cluster: *Cluster, index: usize, name: []const u8) bool {
     const body = Io.Dir.cwd().readFileAlloc(
         cluster.io,
         cluster.nodes[index].log_path,
         cluster.gpa,
         .limited(1 << 20),
-    ) catch fail(cluster, "cannot read node {d} log", .{cluster.nodes[index].id});
+    ) catch return false;
     defer cluster.gpa.free(body);
     var line_buffer: [96]u8 = undefined;
     const line = std.fmt.bufPrint(
@@ -585,12 +584,49 @@ fn expectFailpointHit(cluster: *Cluster, index: usize, name: []const u8) void {
         "failpoint '{s}' hit",
         .{name},
     ) catch unreachable;
-    if (std.mem.indexOf(u8, body, line) == null) {
-        fail(cluster, "node {d} exited without hitting {s}", .{
-            cluster.nodes[index].id,
-            name,
-        });
+    return std.mem.indexOf(u8, body, line) != null;
+}
+
+/// Waits, bounded, until `index` dies at exactly the armed failpoint,
+/// then reaps the child. A node that exits for any other reason, or a
+/// failpoint that never fires, fails the scenario with log diagnostics.
+fn waitFailpointExit(
+    cluster: *Cluster,
+    index: usize,
+    name: []const u8,
+    deadline_ms: u64,
+) void {
+    var elapsed: u64 = 0;
+    while (elapsed <= deadline_ms) {
+        if (logHasFailpoint(cluster, index, name)) {
+            cluster.waitNodeExit(index);
+            return;
+        }
+        elapsed += 250;
+        cluster.io.sleep(.fromMilliseconds(250), .awake) catch {};
     }
+    fail(cluster, "node {d} never hit {s}", .{ cluster.nodes[index].id, name });
+}
+
+/// Waits, bounded, for whichever of nodes 0 and 1 dies at `name` first
+/// and returns its index; both must be armed by the caller.
+fn waitEitherFailpoint(
+    cluster: *Cluster,
+    name: []const u8,
+    deadline_ms: u64,
+) usize {
+    var elapsed: u64 = 0;
+    while (elapsed <= deadline_ms) {
+        for (0..2) |index| {
+            if (logHasFailpoint(cluster, index, name)) {
+                cluster.waitNodeExit(index);
+                return index;
+            }
+        }
+        elapsed += 250;
+        cluster.io.sleep(.fromMilliseconds(250), .awake) catch {};
+    }
+    fail(cluster, "no survivor hit {s}", .{name});
 }
 
 /// The join crash ladder: the receiver dies at every stateless-phase
@@ -613,44 +649,47 @@ fn runJoinLadder(cluster: *Cluster, endpoints: []const Endpoint) !void {
 
     step("receiver dies mid-stream on a transferred chunk");
     try cluster.spawnNode(3, &updated_ids, &updated_ports, "after_transfer_chunk");
-    cluster.waitNodeExit(3);
-    expectFailpointHit(cluster, 3, "after_transfer_chunk");
+    waitFailpointExit(cluster, 3, "after_transfer_chunk", 180_000);
 
     step("receiver dies after staging the transferred image");
     try cluster.spawnNode(3, &updated_ids, &updated_ports, "after_transfer_stage");
-    cluster.waitNodeExit(3);
-    expectFailpointHit(cluster, 3, "after_transfer_stage");
+    waitFailpointExit(cluster, 3, "after_transfer_stage", 180_000);
 
     step("receiver dies after the digest check, before the install rename");
     try cluster.spawnNode(3, &updated_ids, &updated_ports, "before_transfer_install");
-    cluster.waitNodeExit(3);
-    expectFailpointHit(cluster, 3, "before_transfer_install");
+    waitFailpointExit(cluster, 3, "before_transfer_install", 180_000);
 
     step("receiver dies after the install rename, before the anchor");
     // No anchor binds the renamed image, so the next start discards it
     // and transfers again.
     try cluster.spawnNode(3, &updated_ids, &updated_ports, "after_transfer_install");
-    cluster.waitNodeExit(3);
-    expectFailpointHit(cluster, 3, "after_transfer_install");
+    waitFailpointExit(cluster, 3, "after_transfer_install", 180_000);
 
     step("sender dies mid-copy while pinning; another peer completes the send");
-    // The joiner's recovery probes rotate from the lowest registry peer,
-    // so the first snapshot request always lands on node 1; arm its pin
-    // copy to die on the first chunk. The receiver is armed to die
-    // between the durable anchor and the in-memory resume, which also
-    // ends the stateless phase.
+    // Connection readiness decides which survivor the joiner's first
+    // probe selects, so both are armed; whichever pins first dies, and
+    // the other is disarmed before the receiver's retry reaches it.
+    // The receiver is armed to die between the durable anchor and the
+    // in-memory resume, which also ends the stateless phase.
+    for (0..2) |index| {
+        gpa.free(mustCallAny(
+            cluster,
+            endpoints[index .. index + 1],
+            "{\"op\":\"failpoint\",\"name\":\"during_transfer_pin\"}",
+            30_000,
+        ));
+    }
+    try cluster.spawnNode(3, &updated_ids, &updated_ports, "after_transfer_anchor");
+    const dead = waitEitherFailpoint(cluster, "during_transfer_pin", 180_000);
+    const other: usize = 1 - dead;
     gpa.free(mustCallAny(
         cluster,
-        endpoints[0..1],
-        "{\"op\":\"failpoint\",\"name\":\"during_transfer_pin\"}",
+        endpoints[other .. other + 1],
+        "{\"op\":\"failpoint\"}",
         30_000,
     ));
-    try cluster.spawnNode(3, &updated_ids, &updated_ports, "after_transfer_anchor");
-    cluster.waitNodeExit(0);
-    expectFailpointHit(cluster, 0, "during_transfer_pin");
-    try cluster.spawnNode(0, &updated_ids, &updated_ports, null);
-    cluster.waitNodeExit(3);
-    expectFailpointHit(cluster, 3, "after_transfer_anchor");
+    try cluster.spawnNode(dead, &updated_ids, &updated_ports, null);
+    waitFailpointExit(cluster, 3, "after_transfer_anchor", 300_000);
 
     step("clean start converges from the installed anchor");
     try cluster.spawnNode(3, &updated_ids, &updated_ports, null);
