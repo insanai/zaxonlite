@@ -271,6 +271,13 @@ pub fn main(init: std.process.Init) !u8 {
             .sub_path = auth_file,
             .data = bench_secret,
         });
+        // The server refuses provider files readable by group or other.
+        try Io.Dir.cwd().setFilePermissions(
+            io,
+            auth_file,
+            @enumFromInt(0o600),
+            .{},
+        );
     }
     if (mode == .tls) {
         try generateIdentity(gpa, io, root, "ca", null, "zaxon-bench-ca");
@@ -351,18 +358,35 @@ pub fn main(init: std.process.Init) !u8 {
     );
 
     // Wait for a leader by creating the schema through the redirecting
-    // cluster call (it retries until a leader answers).
-    var create = client.callClusterWithTransport(
-        gpa,
-        io,
-        &endpoints,
+    // cluster call. One call fails fast while the first election is still
+    // in progress, so retry under a startup deadline.
+    const create_sql =
         "{\"op\":\"exec\",\"sql\":\"create table b(id integer primary key, " ++
-            "k integer, v text)\"}",
-        true,
-        transport,
-    ) catch {
-        std.debug.print("cluster never elected a reachable leader\n", .{});
-        return 1;
+        "k integer, v text)\"}";
+    var create = create: {
+        var waited_ms: u64 = 0;
+        while (true) {
+            const result = client.callClusterWithTransport(
+                gpa,
+                io,
+                &endpoints,
+                create_sql,
+                true,
+                transport,
+            ) catch |err| {
+                if (waited_ms >= 15_000) {
+                    std.debug.print(
+                        "cluster never elected a reachable leader: {t}\n",
+                        .{err},
+                    );
+                    return 1;
+                }
+                waited_ms += 250;
+                io.sleep(.fromMilliseconds(250), .awake) catch {};
+                continue;
+            };
+            break :create result;
+        }
     };
     defer create.deinit(gpa);
     const leader_endpoint = create.endpoint;
