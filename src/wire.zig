@@ -645,34 +645,64 @@ pub const FenceAck = struct {
 
 pub const SnapshotBegin = struct {
     configuration_id: u64,
-    name: [16]u8,
+    anchor_slot: u64,
+    history_hash: [32]u8,
     db_size: u64,
-    manifest: []const u8,
-    proof: []const u8,
+    image_sha256: [32]u8,
+    sqlite_page_size: u32,
+    last_data_slot: u64,
+    last_batch_id: u128,
+    last_chain: [32]u8,
+    registry_digest: [32]u8,
 
-    pub const max_manifest_bytes = 4096;
-    pub const max_proof_bytes = 768;
-    pub const max_encoded_size = 8 + 16 + 8 + 4 + max_manifest_bytes +
-        2 + max_proof_bytes;
+    pub const encoded_size = 8 + 8 + 32 + 8 + 32 + 4 + 8 + 16 + 32 + 32;
 
-    pub fn encode(self: SnapshotBegin, buffer: *[max_encoded_size]u8) []const u8 {
-        std.debug.assert(self.manifest.len <= max_manifest_bytes);
-        std.debug.assert(self.proof.len <= max_proof_bytes);
+    pub fn encode(self: SnapshotBegin, buffer: *[encoded_size]u8) []const u8 {
         var cursor = types.Cursor{ .buffer = buffer };
         cursor.int(u64, self.configuration_id);
-        cursor.bytes(&self.name);
+        cursor.int(u64, self.anchor_slot);
+        cursor.bytes(&self.history_hash);
         cursor.int(u64, self.db_size);
-        cursor.int(u32, @intCast(self.manifest.len));
-        cursor.bytes(self.manifest);
-        cursor.int(u16, @intCast(self.proof.len));
-        cursor.bytes(self.proof);
+        cursor.bytes(&self.image_sha256);
+        cursor.int(u32, self.sqlite_page_size);
+        cursor.int(u64, self.last_data_slot);
+        cursor.int(u128, self.last_batch_id);
+        cursor.bytes(&self.last_chain);
+        cursor.bytes(&self.registry_digest);
         return buffer[0..cursor.offset];
     }
 
-    /// The returned manifest and proof slices alias `body`.
     pub fn decode(body: []const u8) WireError!SnapshotBegin {
+        if (body.len != encoded_size) return error.InvalidFrame;
         var reader = types.ReadCursor{ .buffer = body };
-        const configuration_id = try reader.int(u64);
+        var begin = SnapshotBegin{
+            .configuration_id = try reader.int(u64),
+            .anchor_slot = try reader.int(u64),
+            .history_hash = undefined,
+            .db_size = undefined,
+            .image_sha256 = undefined,
+            .sqlite_page_size = undefined,
+            .last_data_slot = undefined,
+            .last_batch_id = undefined,
+            .last_chain = undefined,
+            .registry_digest = undefined,
+        };
+        @memcpy(&begin.history_hash, try reader.take(32));
+        begin.db_size = try reader.int(u64);
+        @memcpy(&begin.image_sha256, try reader.take(32));
+        begin.sqlite_page_size = try reader.int(u32);
+        begin.last_data_slot = try reader.int(u64);
+        begin.last_batch_id = try reader.int(u128);
+        @memcpy(&begin.last_chain, try reader.take(32));
+        @memcpy(&begin.registry_digest, try reader.take(32));
+        if (begin.anchor_slot == 0 or begin.db_size == 0 or
+            begin.sqlite_page_size == 0)
+        {
+            return error.InvalidFrame;
+        }
+        return begin;
+    }
+};        const configuration_id = try reader.int(u64);
         const name = try reader.take(16);
         const db_size = try reader.int(u64);
         const manifest_len = try reader.int(u32);
@@ -697,38 +727,52 @@ pub const SnapshotBegin = struct {
 /// A receiver asks configured voters whether they retain the same proof for
 /// the sealed epoch. Matching replies are read-quorum evidence about a stop
 /// sign Paxos already chose; they do not constitute a new consensus phase.
-pub const CheckpointProofProbe = struct {
+/// A read-quorum probe that the chosen history through `slot` has hash
+/// `hash` (ZDS 0011). A voter that can vouch echoes the probe back on
+/// the `checkpoint_proof_reply` kind; one that cannot stays silent.
+pub const HistoryProbe = struct {
     nonce: u64,
-    sealed_configuration_id: u64,
-    digest: [32]u8,
+    slot: u64,
+    hash: [32]u8,
 
     pub const encoded_size = 8 + 8 + 32;
 
-    pub fn encode(
-        self: CheckpointProofProbe,
-        buffer: *[encoded_size]u8,
-    ) []const u8 {
+    pub fn encode(self: HistoryProbe, buffer: *[encoded_size]u8) []const u8 {
         std.mem.writeInt(u64, buffer[0..8], self.nonce, .little);
-        std.mem.writeInt(
-            u64,
-            buffer[8..16],
-            self.sealed_configuration_id,
-            .little,
-        );
-        @memcpy(buffer[16..48], &self.digest);
+        std.mem.writeInt(u64, buffer[8..16], self.slot, .little);
+        @memcpy(buffer[16..48], &self.hash);
         return buffer;
     }
 
-    pub fn decode(body: []const u8) WireError!CheckpointProofProbe {
+    pub fn decode(body: []const u8) WireError!HistoryProbe {
         if (body.len != encoded_size) return error.InvalidFrame;
         const nonce = std.mem.readInt(u64, body[0..8], .little);
-        const sealed = std.mem.readInt(u64, body[8..16], .little);
-        if (nonce == 0 or sealed == 0) return error.InvalidFrame;
+        const slot = std.mem.readInt(u64, body[8..16], .little);
+        if (nonce == 0 or slot == 0) return error.InvalidFrame;
         return .{
             .nonce = nonce,
-            .sealed_configuration_id = sealed,
-            .digest = body[16..48].*,
+            .slot = slot,
+            .hash = body[16..48].*,
         };
+    }
+};
+
+/// A lagging peer's request for a full-image transfer, carrying its
+/// applied frontier so the sender can decline when the retained journal
+/// still covers the gap.
+pub const SnapshotRequest = struct {
+    applied_slot: u64,
+
+    pub const encoded_size = 8;
+
+    pub fn encode(self: SnapshotRequest, buffer: *[encoded_size]u8) []const u8 {
+        std.mem.writeInt(u64, buffer[0..8], self.applied_slot, .little);
+        return buffer;
+    }
+
+    pub fn decode(body: []const u8) WireError!SnapshotRequest {
+        if (body.len != encoded_size) return error.InvalidFrame;
+        return .{ .applied_slot = std.mem.readInt(u64, body[0..8], .little) };
     }
 };
 
@@ -1312,32 +1356,36 @@ test "learner heartbeat round trips" {
     );
 }
 
-test "snapshot begin round trips and bounds the manifest" {
+test "transfer begin round trips the anchor manifest" {
     const begin = SnapshotBegin{
         .configuration_id = 6,
-        .name = "0000000000000006".*,
+        .anchor_slot = 90_017,
+        .history_hash = [_]u8{0x11} ** 32,
         .db_size = 8192,
-        .manifest = "format=1\nchain=00\n",
-        .proof = "proof",
+        .image_sha256 = [_]u8{0x22} ** 32,
+        .sqlite_page_size = 4096,
+        .last_data_slot = 90_016,
+        .last_batch_id = 77,
+        .last_chain = [_]u8{0x33} ** 32,
+        .registry_digest = [_]u8{0x44} ** 32,
     };
-    var buffer: [SnapshotBegin.max_encoded_size]u8 = undefined;
-    const encoded = begin.encode(&buffer);
-    const decoded = try SnapshotBegin.decode(encoded);
-    try testing.expectEqual(begin.configuration_id, decoded.configuration_id);
-    try testing.expectEqualStrings(begin.manifest, decoded.manifest);
-    try testing.expectEqualStrings(begin.proof, decoded.proof);
+    var buffer: [SnapshotBegin.encoded_size]u8 = undefined;
+    try testing.expectEqualDeep(
+        begin,
+        try SnapshotBegin.decode(begin.encode(&buffer)),
+    );
 }
 
-test "checkpoint proof probe round trips" {
-    const probe = CheckpointProofProbe{
+test "history probe round trips" {
+    const probe = HistoryProbe{
         .nonce = 19,
-        .sealed_configuration_id = 6,
-        .digest = [_]u8{0xab} ** 32,
+        .slot = 90_017,
+        .hash = [_]u8{0xab} ** 32,
     };
-    var buffer: [CheckpointProofProbe.encoded_size]u8 = undefined;
+    var buffer: [HistoryProbe.encoded_size]u8 = undefined;
     try testing.expectEqualDeep(
         probe,
-        try CheckpointProofProbe.decode(probe.encode(&buffer)),
+        try HistoryProbe.decode(probe.encode(&buffer)),
     );
 }
 
