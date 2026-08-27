@@ -461,6 +461,29 @@ pub fn build(b: *std.Build) void {
     const soak_step = b.step("soak", "Run the sustained mixed-load soak");
     soak_step.dependOn(&run_soak.step);
 
+    // Long-run retention gate: rotation, reclamation, anchored restart.
+    const longrun_writes = b.option(
+        u64,
+        "longrun-writes",
+        "Long-run write count (default 20000)",
+    ) orelse 20_000;
+    const longrun_exe = b.addExecutable(.{
+        .name = "zaxon-longrun",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/longrun_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zaxonlite", .module = zaxonlite }},
+        }),
+    });
+    const run_longrun = b.addRunArtifact(longrun_exe);
+    run_longrun.addArg(b.fmt("{d}", .{longrun_writes}));
+    const longrun_step = b.step(
+        "test-longrun",
+        "Run the long-run retention and anchored-restart gate",
+    );
+    longrun_step.dependOn(&run_longrun.step);
+
     // Benchmarks always build ReleaseFast regardless of -Doptimize. The
     // shared helper guarantees the benchmark SQLite carries exactly the
     // same extension and SIMD flags as the product build.
