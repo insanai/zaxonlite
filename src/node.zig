@@ -1884,6 +1884,7 @@ pub const Node = struct {
             try pin.writePositionalAll(self.io, buffer[0..count], offset);
             offset += count;
         }
+        failpoint.hit("after_transfer_pin");
         return .{
             .node = self,
             .file = pin,
@@ -1914,6 +1915,7 @@ pub const Node = struct {
         if (!std.mem.eql(u8, &image_sha, &begin.image_sha256)) {
             return error.TransferDigestMismatch;
         }
+        failpoint.hit("before_transfer_install");
 
         if (self.db_open) {
             self.db.close();
@@ -1931,6 +1933,7 @@ pub const Node = struct {
         };
         try self.dir.rename(transfer_install_name, self.dir, db_file_name, self.io);
         try durability.syncPathnameTransition(self.io, self.dir, db_file_name);
+        failpoint.hit("after_transfer_install");
 
         self.history_hash = begin.history_hash;
         self.history_hash_at_anchor = begin.history_hash;
@@ -1956,6 +1959,7 @@ pub const Node = struct {
             .last_chain = begin.last_chain,
         });
         self.durable_state_slot = begin.anchor_slot;
+        failpoint.hit("after_transfer_anchor");
 
         // The protocol node resumes at the anchor; everything below it is
         // covered by the installed image, everything above arrives through

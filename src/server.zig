@@ -2845,6 +2845,7 @@ pub const Server = struct {
         const file = install.file orelse return;
         if (install.received != install.db_size) return error.InvalidFrame;
         try durability.syncFile(self.io, file);
+        failpoint.hit("after_transfer_stage");
         file.close(self.io);
         install.file = null;
         const manifest = install.manifest orelse return;
