@@ -144,6 +144,12 @@ pub fn encodeWrite(write: Write, writer: *Cursor) void {
             writer.int(u64, commit.slot);
             encodeEntry(commit.value, writer);
         },
+        .trim_anchor => |anchor| {
+            writer.byte(3);
+            writer.int(u64, anchor.trim_id);
+            writer.int(u64, anchor.chosen_trim_slot);
+            writer.bytes(&anchor.history_hash);
+        },
     }
 }
 
@@ -161,6 +167,15 @@ pub fn decodeWrite(buffer: []const u8) DecodeError!Write {
             .slot = try reader.int(u64),
             .value = try decodeEntry(&reader),
         } },
+        3 => blk: {
+            var anchor = Log.TrimAnchor{
+                .trim_id = try reader.int(u64),
+                .chosen_trim_slot = try reader.int(u64),
+            };
+            const hash = try reader.take(32);
+            @memcpy(&anchor.history_hash, hash);
+            break :blk .{ .trim_anchor = anchor };
+        },
         else => return error.InvalidWriteTag,
     };
     if (reader.offset != buffer.len) return error.TruncatedRecord;
