@@ -1347,13 +1347,7 @@ pub const Server = struct {
         self.mutex.unlock(self.io);
         try self.spawnSenders();
         self.mutex.lockUncancelable(self.io);
-        const activate_result = self.node.activateRollover();
-        if (activate_result) |_| {
-            self.pump();
-        } else |err| {
-            self.mutex.unlock(self.io);
-            return err;
-        }
+        self.pump();
         self.mutex.unlock(self.io);
         failpoint.hit("after_transport_swap");
         std.log.info(
@@ -1526,42 +1520,25 @@ pub const Server = struct {
             try self.node.resyncImage();
         }
 
-        // Complete a decided epoch rollover once everything before the
-        // stop sign is applied.
-        if (!self.retired and self.node.rollover_pending and
-            self.node.log.isReconfigured() != null)
-        {
-            if (self.node.completeClusterRolloverDeferred()) |_| {
-                self.checkpoint_started = false;
-                self.observed_leader_decided = 0;
-                if (!self.transportStaleLocked()) {
-                    self.transport_configuration_id =
-                        self.node.identity.configuration_id;
-                    try self.node.activateRollover();
-                    try self.drainOutbox();
-                }
-            } else |err| switch (err) {
-                error.SnapshotDigestMismatch, error.NotCaughtUp => {
-                    // Fall back to a full snapshot transfer from the leader.
-                    if (self.node.currentLeader()) |leader| {
-                        if (leader != self.node.identity.node_id) {
-                            self.requestSnapshot(leader);
-                        }
-                    }
-                },
-                error.RetiredByReconfiguration => {
-                    // The chosen stop sign replaced this voter. The node
-                    // stays permanently sealed on its final configuration.
-                    self.retired = true;
-                    std.log.warn(
-                        "node {d} was replaced by a decided reconfiguration; " ++
-                            "it stays sealed and cannot rejoin",
-                        .{self.node.identity.node_id},
-                    );
-                },
+        // Periodic durable-state anchoring (ZDS 0011): bounded, dirty-page
+        // work in place of the old epoch rollover.
+        if (!self.retired and self.node.capabilities.materializes) {
+            _ = self.node.maybeCreateStateAnchor() catch |err| switch (err) {
+                error.TransactionOpen, error.WriteInFlight => {},
                 else => return err,
-            }
+            };
         }
+
+        // A decided membership stop waits for the transfer-lease handover
+        // (ZDS 0008 over global slots); nothing else may proceed past it.
+        if (!self.retired and self.node.membership_change_pending) {
+            std.log.warn(
+                "node {d}: decided membership change pending; " ++
+                    "handover not yet wired in this build",
+                .{self.node.identity.node_id},
+            );
+        }
+
         if (self.node.identity.configuration_id != previous_configuration) {
             self.enterConfigurationLocked();
         }
@@ -1570,17 +1547,9 @@ pub const Server = struct {
         if (self.write_waiter) |waiter| {
             if (waiter.outcome == .pending and self.node.applied_slot >= waiter.slot) {
                 waiter.outcome = .conflict;
-                if (self.node.log.read(waiter.slot)) |entry| {
-                    switch (entry) {
-                        .command => |cmd| switch (cmd) {
-                            .transaction_batch => |batch| {
-                                if (batch.batch_id == waiter.batch_id) {
-                                    waiter.outcome = .committed;
-                                }
-                            },
-                            else => {},
-                        },
-                        .stop => {},
+                if (self.node.batchAtSlot(waiter.slot)) |batch_id| {
+                    if (batch_id == waiter.batch_id) {
+                        waiter.outcome = .committed;
                     }
                 }
                 waiter.cond.signal(self.io);
@@ -2281,10 +2250,9 @@ pub const Server = struct {
         const local_configuration = self.node.identity.configuration_id;
         if (frame_configuration < local_configuration) return;
         if (frame_configuration > local_configuration) {
-            // The cluster moved to an epoch we have not completed.
-            if (!self.node.rollover_pending) {
-                self.requestSnapshot(from);
-            }
+            // The cluster moved to a configuration this node has not
+            // completed; recovery rides the transfer-lease state install.
+            self.requestSnapshot(from);
             return;
         }
         if (local_configuration != self.transport_configuration_id) return;
@@ -2493,73 +2461,14 @@ pub const Server = struct {
     }
 
     fn onSnapshotRequest(self: *Server, from: paxos.NodeId) void {
-        const sender = self.senderFor(from) orelse return;
-
-        self.mutex.lockUncancelable(self.io);
-        var handle = self.node.openCurrentSnapshot() catch {
-            self.mutex.unlock(self.io);
-            return;
-        };
-        self.mutex.unlock(self.io);
-        defer handle.close(self.io, self.gpa);
-
-        // Send the decided registry blob ahead of the transfer: a joining
-        // replacement has no predecessor registry to reconstruct from, and
-        // ordering the blob first removes any race with a small snapshot.
-        // The receiver verifies it against its quorum-confirmed proof
-        // digest, so an unneeded or stale blob is harmless.
-        self.mutex.lockUncancelable(self.io);
-        const registry_blob: ?[]u8 = if (self.node.decidedRegistry() != null)
-            self.node.readRegistryBlob(self.gpa, handle.configuration_id) catch null
-        else
-            null;
-        self.mutex.unlock(self.io);
-        if (registry_blob) |blob| {
-            defer self.gpa.free(blob);
-            if (blob.len > 0 and blob.len <= wire.RegistryData.max_blob_bytes) {
-                var body_buffer: [wire.RegistryData.max_encoded_size]u8 = undefined;
-                if ((wire.RegistryData{
-                    .configuration_id = handle.configuration_id,
-                    .blob = blob,
-                }).encode(&body_buffer)) |encoded| {
-                    if (wire.frameAlloc(self.gpa, .registry_data, &.{encoded})) |frame| {
-                        _ = sender.enqueueBackpressure(frame);
-                    } else |_| {}
-                } else |_| {}
-            }
-        }
-
-        const begin = wire.SnapshotBegin{
-            .configuration_id = handle.configuration_id,
-            .name = handle.name,
-            .db_size = handle.db_size,
-            .manifest = handle.manifest,
-            .proof = handle.proof,
-        };
-        var begin_buffer: [wire.SnapshotBegin.max_encoded_size]u8 = undefined;
-        const begin_encoded = begin.encode(&begin_buffer);
-        const begin_frame = wire.frameAlloc(self.gpa, .snapshot_begin, &.{begin_encoded}) catch
-            return;
-        if (!sender.enqueueBackpressure(begin_frame)) return;
-
-        var offset: u64 = 0;
-        const chunk = self.gpa.alloc(u8, snapshot_chunk_bytes) catch return;
-        defer self.gpa.free(chunk);
-        while (offset < handle.db_size) {
-            const read = handle.file.readPositionalAll(self.io, chunk, offset) catch return;
-            if (read == 0) break;
-            var offset_bytes: [8]u8 = undefined;
-            std.mem.writeInt(u64, &offset_bytes, offset, .little);
-            const frame = wire.frameAlloc(
-                self.gpa,
-                .snapshot_chunk,
-                &.{ &offset_bytes, chunk[0..read] },
-            ) catch return;
-            if (!sender.enqueueBackpressure(frame)) return;
-            offset += read;
-        }
-        const end_frame = wire.frameAlloc(self.gpa, .snapshot_end, &.{}) catch return;
-        _ = sender.enqueueBackpressure(end_frame);
+        // Anchor-pinned state transfer replaces the snapshot stream
+        // (ZDS 0011); until it lands a lagging peer is told nothing and
+        // retries, so no half-format transfer can happen.
+        std.log.warn(
+            "node {d}: peer {d} needs state transfer; not yet wired in this build",
+            .{ self.node.identity.node_id, from },
+        );
+        return;
     }
 
     fn onSnapshotBegin(
@@ -2568,87 +2477,15 @@ pub const Server = struct {
         install: *InstallState,
         from: paxos.NodeId,
     ) !void {
-        const begin = try wire.SnapshotBegin.decode(body);
-        install.reset(self.io, self.gpa);
-
-        self.mutex.lockUncancelable(self.io);
-        if (begin.configuration_id <= self.node.identity.configuration_id) {
-            self.mutex.unlock(self.io);
-            return;
-        }
-        if (begin.db_size == 0 or begin.db_size > self.options.max_transfer_bytes) {
-            self.mutex.unlock(self.io);
-            return error.InvalidFrame;
-        }
-        const proof_digest = self.node.validateCheckpointProof(
-            begin.proof,
-            begin.configuration_id,
-            begin.name,
-            begin.manifest,
-        ) catch |err| {
-            self.mutex.unlock(self.io);
-            return err;
-        };
-        self.mutex.unlock(self.io);
-
-        const proof = try checkpoint_proof.decode(begin.proof);
-        try self.confirmCheckpointProof(
-            proof.sealed_configuration_id,
-            proof.sealedMembersSlice(),
-            proof_digest,
-            from,
-        );
-
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        // Another handler may have advanced us while the quorum probe was
-        // in flight. Never let an older transfer replace newer local state.
-        if (begin.configuration_id <= self.node.identity.configuration_id) return;
-        var dir = try self.node.beginSnapshotInstall();
-        errdefer dir.close(self.io);
-        const file = try dir.createFile(self.io, "db", .{ .read = true });
-        install.dir = dir;
-        install.file = file;
-        install.configuration_id = begin.configuration_id;
-        install.db_size = begin.db_size;
-        install.received = 0;
-        install.name = begin.name;
-        install.manifest = try self.gpa.dupe(u8, begin.manifest);
-        errdefer {
-            self.gpa.free(install.manifest.?);
-            install.manifest = null;
-        }
-        install.proof = try self.gpa.dupe(u8, begin.proof);
-
-        // A joining replacement has no predecessor registry to reconstruct
-        // from: ask the transfer source for the decided blob. The reply
-        // arrives interleaved with the snapshot chunks on this connection.
-        if (self.node.decidedRegistry() == null and
-            !std.mem.eql(
-                u8,
-                &proof.next_registry_digest,
-                &checkpoint_proof.no_registry_digest,
-            ))
-        {
-            self.installation = .transferring;
-            if (self.senderFor(from)) |sender| {
-                var request_buffer: [wire.RegistryRequest.encoded_size]u8 = undefined;
-                const encoded = (wire.RegistryRequest{
-                    .configuration_id = begin.configuration_id,
-                }).encode(&request_buffer);
-                const frame = try wire.frameAlloc(
-                    self.gpa,
-                    .registry_request,
-                    &.{encoded},
-                );
-                sender.enqueue(frame);
-            }
-        }
+        _ = self;
+        _ = from;
+        _ = body;
+        _ = install;
+        // The anchor-pinned state transfer replaces the snapshot stream
+        // (ZDS 0011); no half-format install is accepted meanwhile.
+        return error.InvalidFrame;
     }
 
-    /// Serves a joining replacement's decided-registry fetch. The blob is
-    /// self-authenticating downstream: the receiver checks it against the
-    /// digest its quorum-confirmed proof binds.
     fn onRegistryRequest(self: *Server, body: []const u8, from: paxos.NodeId) void {
         const request = wire.RegistryRequest.decode(body) catch return;
         const sender = self.senderFor(from) orelse return;
@@ -2686,143 +2523,17 @@ pub const Server = struct {
     }
 
     fn onSnapshotChunk(self: *Server, body: []const u8, install: *InstallState) !void {
-        const chunk = try wire.SnapshotChunk.decode(body);
-        const file = install.file orelse return;
-        const chunk_end = std.math.add(u64, chunk.offset, chunk.bytes.len) catch
-            return error.InvalidFrame;
-        if (chunk.offset != install.received or
-            chunk.bytes.len == 0 or
-            chunk.bytes.len > snapshot_chunk_bytes or
-            chunk_end > install.db_size)
-        {
-            return error.InvalidFrame;
-        }
-        try file.writePositionalAll(self.io, chunk.bytes, chunk.offset);
-        install.received += chunk.bytes.len;
+        _ = self;
+        _ = body;
+        _ = install;
+        return error.InvalidFrame;
     }
 
     fn onSnapshotEnd(self: *Server, install: *InstallState, from: paxos.NodeId) !void {
-        const file = install.file orelse return;
-        if (install.received != install.db_size) return error.InvalidFrame;
-        try durability.syncFile(self.io, file);
-        file.close(self.io);
-        install.file = null;
-        if (install.dir) |*dir| dir.close(self.io);
-        install.dir = null;
-        const manifest = install.manifest orelse return;
-        const proof = install.proof orelse return;
-        defer {
-            self.gpa.free(manifest);
-            install.manifest = null;
-            self.gpa.free(proof);
-            install.proof = null;
-        }
-        const registry_blob: ?[]const u8 = if (install.registry_blob != null and
-            install.registry_blob_configuration == install.configuration_id)
-            install.registry_blob
-        else
-            null;
-
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        self.snapshot_source = null;
-        if (self.installation == .transferring) self.installation = .verifying;
-        const previous_configuration = self.node.identity.configuration_id;
-        self.node.installSnapshot(
-            install.configuration_id,
-            install.name,
-            manifest,
-            proof,
-            registry_blob,
-        ) catch |err| {
-            std.log.warn("snapshot install failed: {s}", .{@errorName(err)});
-            if (self.installation != .not_applicable) {
-                self.installation = .failed;
-                self.installation_failure = err;
-            }
-            return;
-        };
-        if (self.installation != .not_applicable) {
-            // The image is durable. It becomes active only after the
-            // matching transport generation has been published.
-            self.installation = .installed;
-            self.installation_failure = null;
-        }
-        // The install advances the identity before `pump` runs, so the
-        // pump's own configuration-change detection cannot see it.
-        if (self.node.identity.configuration_id != previous_configuration) {
-            self.enterConfigurationLocked();
-        }
-        self.observed_leader_decided = 0;
-        self.node.requestCatchUp(from) catch {};
-        self.pump();
-    }
-
-    fn confirmCheckpointProof(
-        self: *Server,
-        sealed_configuration_id: u64,
-        sealed_members: []const paxos.NodeId,
-        digest: [32]u8,
-        source: paxos.NodeId,
-    ) !void {
-        if (sealed_members.len == 0) return error.CheckpointProofQuorum;
-
-        self.proof_mutex.lockUncancelable(self.io);
-        if (self.proof_waiter != null) {
-            self.proof_mutex.unlock(self.io);
-            return error.CheckpointProofBusy;
-        }
-        var nonce = self.next_proof_nonce;
-        self.next_proof_nonce +%= 1;
-        if (self.next_proof_nonce == 0) self.next_proof_nonce = 1;
-        if (nonce == 0) nonce = 1;
-        var waiter = CheckpointProofWaiter{
-            .nonce = nonce,
-            .sealed_configuration_id = sealed_configuration_id,
-            .digest = digest,
-            .needed = sealed_members.len / 2 + 1,
-        };
-        @memcpy(waiter.sealed_members[0..sealed_members.len], sealed_members);
-        waiter.sealed_count = @intCast(sealed_members.len);
-        // SnapshotBegin itself is a matching report from its authenticated
-        // source. Count it exactly once when that source is a sealed
-        // voter, then probe the remaining sealed voters independently.
-        waiter.noteAck(source);
-        self.proof_waiter = &waiter;
-        self.proof_mutex.unlock(self.io);
-        defer {
-            self.proof_mutex.lockUncancelable(self.io);
-            if (self.proof_waiter == &waiter) self.proof_waiter = null;
-            self.proof_mutex.unlock(self.io);
-        }
-
-        var probe_buffer: [wire.CheckpointProofProbe.encoded_size]u8 = undefined;
-        const encoded = (wire.CheckpointProofProbe{
-            .nonce = nonce,
-            .sealed_configuration_id = sealed_configuration_id,
-            .digest = digest,
-        }).encode(&probe_buffer);
-        for (self.senders.items) |sender| {
-            if (!waiter.isSealedVoter(sender.peer.id)) continue;
-            const frame = try wire.frameAlloc(
-                self.gpa,
-                .checkpoint_proof_request,
-                &.{encoded},
-            );
-            sender.enqueue(frame);
-        }
-
-        var elapsed_ms: u64 = 0;
-        while (elapsed_ms < 2_000) : (elapsed_ms += 1) {
-            self.proof_mutex.lockUncancelable(self.io);
-            const confirmed = waiter.ack_count >= waiter.needed;
-            self.proof_mutex.unlock(self.io);
-            if (confirmed) return;
-            if (self.isShutdown()) return error.Shutdown;
-            self.io.sleep(.fromMilliseconds(1), .awake) catch
-                return error.CheckpointProofQuorum;
-        }
-        return error.CheckpointProofQuorum;
+        _ = self;
+        _ = install;
+        _ = from;
+        return error.InvalidFrame;
     }
 
     fn onCheckpointProofRequest(
@@ -2830,26 +2541,9 @@ pub const Server = struct {
         body: []const u8,
         from: paxos.NodeId,
     ) void {
-        const probe = wire.CheckpointProofProbe.decode(body) catch return;
-        const sender = self.senderFor(from) orelse return;
-        self.mutex.lockUncancelable(self.io);
-        const local = self.node.currentCheckpointProofDigest(
-            probe.sealed_configuration_id,
-        ) catch {
-            self.mutex.unlock(self.io);
-            return;
-        };
-        self.mutex.unlock(self.io);
-        if (!std.mem.eql(u8, &local, &probe.digest)) return;
-
-        var reply_buffer: [wire.CheckpointProofProbe.encoded_size]u8 = undefined;
-        const encoded = probe.encode(&reply_buffer);
-        const frame = wire.frameAlloc(
-            self.gpa,
-            .checkpoint_proof_reply,
-            &.{encoded},
-        ) catch return;
-        sender.enqueue(frame);
+        _ = self;
+        _ = from;
+        _ = body;
     }
 
     fn onCheckpointProofReply(
@@ -2857,18 +2551,9 @@ pub const Server = struct {
         body: []const u8,
         from: paxos.NodeId,
     ) void {
-        const probe = wire.CheckpointProofProbe.decode(body) catch return;
-        self.proof_mutex.lockUncancelable(self.io);
-        defer self.proof_mutex.unlock(self.io);
-        const waiter = self.proof_waiter orelse return;
-        if (waiter.nonce != probe.nonce or
-            waiter.sealed_configuration_id != probe.sealed_configuration_id or
-            !std.mem.eql(u8, &waiter.digest, &probe.digest))
-        {
-            return;
-        }
-        // noteAck admits only distinct members of the sealed voter set.
-        waiter.noteAck(from);
+        _ = self;
+        _ = from;
+        _ = body;
     }
 
     // ------------------------------------------------------------------
@@ -3103,8 +2788,8 @@ pub const Server = struct {
             return self.opSession(out);
         } else if (std.mem.eql(u8, request.op, "wait")) {
             return self.opWait(request, out);
-        } else if (std.mem.eql(u8, request.op, "snapshot")) {
-            return self.opSnapshot(out);
+        } else if (std.mem.eql(u8, request.op, "anchor")) {
+            return self.opStateAnchor(out);
         } else if (std.mem.eql(u8, request.op, "enable-search-feature")) {
             return self.opEnableSearchFeature(out);
         } else if (std.mem.eql(u8, request.op, "integrity")) {
@@ -3274,7 +2959,9 @@ pub const Server = struct {
     /// `quorum_available` for that fact. Caller holds `mutex`.
     fn membershipPhase(self: *Server) ![]const u8 {
         if (self.retired) return "retired";
-        if (self.node.rollover_pending or self.node.log.isReconfigured() != null) {
+        if (self.node.membership_change_pending or
+            self.node.log.isReconfigured() != null)
+        {
             return "chosen";
         }
         if (try self.node.pendingOperation()) |pending| {
@@ -3506,7 +3193,10 @@ pub const Server = struct {
                 "\"installation_state\":\"{s}\"," ++
                 "\"ballot\":{{\"round\":{d},\"priority\":{d},\"node\":{d}}}," ++
                 "\"decided_slot\":{d},\"applied_slot\":{d}," ++
-                "\"journal_records\":{d},\"epoch_capacity\":{d}," ++
+                "\"durable_state_slot\":{d},\"memory_floor\":{d}," ++
+                "\"chosen_trim_slot\":{d},\"retained_first_slot\":{d}," ++
+                "\"journal_records\":{d},\"journal_segment_count\":{d}," ++
+                "\"journal_bytes\":{d}," ++
                 "\"chain\":\"{s}\",\"page_size\":{d}," ++
                 "\"fts5_enabled\":{}," ++
                 "\"sqlite_vec_version\":\"{s}\"," ++
@@ -3524,7 +3214,10 @@ pub const Server = struct {
                 installation_state,            status.ballot.round,
                 status.ballot.priority,        status.ballot.node,
                 status.decided_slot,           status.applied_slot,
-                status.journal_records,        status.epoch_capacity,
+                status.durable_state_slot,     status.memory_floor,
+                status.chosen_trim_slot,       status.retained_first_slot,
+                status.journal_records,        status.journal_segment_count,
+                status.journal_bytes,
                 &chain_hex,                    status.page_size,
                 status.fts5_enabled,           status.sqlite_vec_version,
                 status.search_feature_version, status.simd_backend,
@@ -3532,12 +3225,7 @@ pub const Server = struct {
             },
         );
         try writeMembershipOperation(out, pending, installation_error);
-        try out.writeAll(",\"snapshot\":");
-        if (status.snapshot) |name| {
-            try out.print("\"{s}\"}}", .{&name});
-        } else {
-            try out.writeAll("null}");
-        }
+        try out.writeAll("}");
     }
 
     fn opMembers(self: *Server, out: *Io.Writer) !void {
@@ -3675,26 +3363,10 @@ pub const Server = struct {
 
         if (!self.node.isLeader()) return error.NotLeader;
 
-        // Roll the epoch before it fills; wait out an in-progress rollover.
-        var start_tick: u64 = self.tick_count;
-        while (self.node.epochNearlyFull() or self.node.rollover_pending or
-            self.node.log.stop_pending)
-        {
-            if (self.node.isLeader() and !self.checkpoint_started and
-                !self.node.rollover_pending and !self.node.log.stop_pending)
-            {
-                try self.node.prepareCheckpoint();
-                self.checkpoint_started = true;
-                self.pump();
-                continue;
-            }
-            // Still pre-execution: expiry here provably ran no SQL.
-            if (self.elapsedMs(start_tick) > op_timeout_ms) {
-                return error.OpTimeoutQueued;
-            }
-            self.rollover_cond.waitUncancelable(self.io, &self.mutex);
-            if (self.failed) return error.Unavailable;
-            if (!self.node.isLeader()) return error.NotLeader;
+        // Slots continue globally (ZDS 0011); only a decided membership
+        // change seals the log. Waiting here would never unseal it.
+        if (self.node.membership_change_pending or self.node.log.stop_pending) {
+            return error.LogSealed;
         }
 
         self.node.ensureWriter() catch return error.Unavailable;
@@ -3733,7 +3405,7 @@ pub const Server = struct {
         };
         self.write_waiter = &waiter;
         self.pump();
-        start_tick = self.tick_count;
+        const start_tick = self.tick_count;
         while (waiter.outcome == .pending) {
             if (self.elapsedMs(start_tick) > op_timeout_ms) {
                 if (self.write_waiter == &waiter) self.write_waiter = null;
@@ -4513,45 +4185,18 @@ pub const Server = struct {
         );
     }
 
-    fn opSnapshot(self: *Server, out: *Io.Writer) !void {
+    fn opStateAnchor(self: *Server, out: *Io.Writer) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.failed) {
             return writeErrorResponse(out, "unavailable", "node failed");
         }
-        if (!self.node.isLeader()) {
-            self.mutex.unlock(self.io);
-            defer self.mutex.lockUncancelable(self.io);
-            return self.writeNotLeader(out);
-        }
-        if (self.node.single) {
-            self.node.snapshot() catch |err| {
-                return writeErrorResponse(out, "internal", @errorName(err));
-            };
-            self.pump();
-            return out.print(
-                "{{\"ok\":true,\"configuration_id\":{d}}}",
-                .{self.node.identity.configuration_id},
-            );
-        }
-        const before = self.node.identity.configuration_id;
-        if (!self.checkpoint_started and !self.node.rollover_pending) {
-            self.node.prepareCheckpoint() catch |err| {
-                return writeErrorResponse(out, "internal", @errorName(err));
-            };
-            self.checkpoint_started = true;
-            self.pump();
-        }
-        const start_tick = self.tick_count;
-        while (self.node.identity.configuration_id == before) {
-            if (self.elapsedMs(start_tick) > op_timeout_ms) {
-                return writeErrorResponse(out, "timeout", "rollover incomplete");
-            }
-            self.rollover_cond.waitUncancelable(self.io, &self.mutex);
-        }
+        self.node.createStateAnchor() catch |err| {
+            return writeErrorResponse(out, "internal", @errorName(err));
+        };
         return out.print(
-            "{{\"ok\":true,\"configuration_id\":{d}}}",
-            .{self.node.identity.configuration_id},
+            "{{\"ok\":true,\"durable_state_slot\":{d}}}",
+            .{self.node.durable_state_slot},
         );
     }
 

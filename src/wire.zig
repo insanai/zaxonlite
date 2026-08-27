@@ -22,17 +22,16 @@ const paxos = @import("paxos");
 const types = @import("types.zig");
 const command = @import("command.zig");
 
-/// Version 8 adds an explicit durable-installation announcement for a
-/// replacement voter. A TCP connection alone never implies readiness.
-/// Version 7 added decided-registry membership: checkpoint proof v2 with
-/// sealed and next voter sets, the next-registry digest, and the voter
-/// replacement operation surface.
-/// Version 6 added the bounded one-time-token/CSR enrollment exchange.
-/// Version 5 added voter quorum confirmation for transferred checkpoint
-/// proofs. Older peers are deliberately rejected:
-/// silently falling back would turn a configuration error into a security
-/// downgrade.
-pub const protocol_version: u16 = 8;
+/// Version 9 is the ZDS 0011 format cut: 64-bit global slots on every
+/// frame, the chunked PromiseRange phase-one reply, bounded range
+/// recovery, and durable-state reports. It shares no frames with v8 and
+/// there is deliberately no bridge.
+/// Version 8 added an explicit durable-installation announcement for a
+/// replacement voter. Version 7 added decided-registry membership;
+/// version 6 the enrollment exchange; version 5 quorum-confirmed proofs.
+/// Older peers are deliberately rejected: silently falling back would
+/// turn a configuration error into a security downgrade.
+pub const protocol_version: u16 = 9;
 
 /// Upper bound for one frame body; larger frames are a protocol error.
 pub const max_frame_bytes: u32 = 64 * 1024 * 1024;
