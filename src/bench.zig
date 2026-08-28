@@ -232,13 +232,7 @@ fn benchWrites(gpa: std.mem.Allocator, io: std.Io, node: *Node, write_count: usi
         _ = try node.exec(sql);
         const exec_done = nowNs(io);
         write_samples[index] = @intCast(exec_done - op_start);
-        var iteration_anchored = false;
-        if ((index + 1) % anchor_every == 0) {
-            try node.createStateAnchor();
-            iteration_anchored = true;
-        } else if (try node.maybeCreateStateAnchor()) {
-            iteration_anchored = true;
-        }
+        const iteration_anchored = try runAnchorDuty(node, index, anchor_every);
         if (iteration_anchored) anchor_events += 1;
         anchored_flags[index] = iteration_anchored;
         const completion = nowNs(io);
@@ -274,6 +268,17 @@ fn benchWrites(gpa: std.mem.Allocator, io: std.Io, node: *Node, write_count: usi
     printLagCheck(anchor_check, write_count);
     printLagCheck(rotation_check, write_count);
     return control_check.available and control_check.r > periodicity_flag;
+}
+
+/// One iteration's anchor duty: the forced cadence guarantees anchor
+/// events at bench scale, and the maybe call keeps the natural cadence
+/// live. Returns whether this iteration carried an anchor.
+fn runAnchorDuty(node: *Node, index: usize, anchor_every: usize) !bool {
+    if ((index + 1) % anchor_every == 0) {
+        try node.createStateAnchor();
+        return true;
+    }
+    return try node.maybeCreateStateAnchor();
 }
 
 /// Prints both latency rows plus the directly timed anchor duty cycle
