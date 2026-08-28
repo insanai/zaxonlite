@@ -95,6 +95,27 @@ fn printLagCheck(check: LagCheck, series_len: usize) void {
     );
 }
 
+/// The inter-completion series must see the forced anchor cadence: a
+/// low correlation there means the instrument is broken, not that the
+/// system is quiet.
+fn printControlCheck(check: LagCheck, series_len: usize) void {
+    if (!check.available) {
+        std.debug.print(
+            "{s}: lag {d} unavailable for {d} samples\n",
+            .{ check.name, check.lag, series_len },
+        );
+        return;
+    }
+    const verdict = if (@abs(check.r) > periodicity_flag)
+        "  (positive control: anchors visible)"
+    else
+        "  ANCHORS INVISIBLE - instrument broken";
+    std.debug.print(
+        "{s}: lag {d} writes r={d:.3}{s}\n",
+        .{ check.name, check.lag, check.r, verdict },
+    );
+}
+
 const Stats = struct {
     p50: u64,
     p95: u64,
@@ -195,13 +216,19 @@ fn benchWrites(gpa: std.mem.Allocator, io: std.Io, node: *Node, write_count: usi
     // Anchors on the natural cadence would need 10,000 slots or 30
     // seconds; the forced interval guarantees at least two anchor
     // events inside the run at any bench scale while the maybe call
-    // keeps the natural cadence live. Anchoring runs between writes,
-    // outside each per-write interval, so only its knock-on effect on
-    // later writes can appear in the series.
+    // keeps the natural cadence live. The periodicity series measures
+    // inter-completion time under the saturated loop -- each sample
+    // closes only after the iteration's anchor and pump duties -- so an
+    // anchor stall lands inside its own sample instead of vanishing
+    // between two write timings. The headline row keeps the bare
+    // per-exec timings.
+    const interval_samples = try gpa.alloc(u64, write_count);
+    defer gpa.free(interval_samples);
     const anchor_every = @max(write_count / 8, 32);
     var anchor_events: usize = 0;
     var sql_buffer: [160]u8 = undefined;
     const write_start = nowNs(io);
+    var last_completion = write_start;
     for (0..write_count) |index| {
         const sql = std.fmt.bufPrintZ(
             &sql_buffer,
@@ -217,10 +244,22 @@ fn benchWrites(gpa: std.mem.Allocator, io: std.Io, node: *Node, write_count: usi
         } else if (try node.maybeCreateStateAnchor()) {
             anchor_events += 1;
         }
+        const completion = nowNs(io);
+        interval_samples[index] = @intCast(completion - last_completion);
+        last_completion = completion;
     }
     const write_elapsed = nowNs(io) - write_start;
     // Both checks read the series in time order, before Stats.compute
     // sorts it into order statistics.
+    // The inter-completion series carries the anchor cost itself: the
+    // forced cadence must register there (positive control). The bare
+    // per-exec series answers the gate question -- whether anchoring
+    // degrades the writes around it.
+    const control_check = lagCheck(
+        "anchor-cost visibility",
+        interval_samples,
+        anchor_every,
+    );
     const anchor_check = lagCheck("anchor-interval", write_samples, anchor_every);
     const rotation_lag = zaxonlite.segment.rotation_records / journal_records_per_write;
     const rotation_check = lagCheck("segment-rotation", write_samples, rotation_lag);
@@ -229,6 +268,7 @@ fn benchWrites(gpa: std.mem.Allocator, io: std.Io, node: *Node, write_count: usi
         "anchor events:     {d} during the write run (forced every {d} writes)\n",
         .{ anchor_events, anchor_every },
     );
+    printControlCheck(control_check, write_count);
     printLagCheck(anchor_check, write_count);
     printLagCheck(rotation_check, write_count);
 }

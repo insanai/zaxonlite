@@ -747,8 +747,8 @@ fn replicaFingerprint(cluster: *Cluster, endpoint: Endpoint) ?Fingerprint {
     // and lengths still changes the digest.
     const body = rpcTry(cluster, single[0], "{\"op\":\"query\"," ++
         "\"sql\":\"select count(*), coalesce(group_concat(" ++
-        "id || ':' || typeof(v) || ':' || hex(v), ','), '') " ++
-        "from (select id, v from t order by id)\"," ++
+        "id || ':' || typeof(v) || ':' || coalesce(hex(v), 'null'), ','), " ++
+        "'') from (select id, v from t order by id)\"," ++
         "\"level\":\"any\"}") orelse
         return null;
     defer cluster.gpa.free(body);
