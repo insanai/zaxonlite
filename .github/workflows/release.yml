@@ -6,7 +6,7 @@
 # and test the installed artifacts before a separate job can publish them.
 #
 # Cut a release by pushing the version declared in build.zig.zon:
-#   git tag v0.2.0 && git push origin v0.2.0
+#   git tag v0.6.0 && git push origin v0.6.0
 # Before tagging, bump `.version` in build.zig.zon and the library version
 # string so `zaxon version` reports the tag.
 #
@@ -416,9 +416,9 @@ jobs:
         with:
           files: release/*
           body: |
-            zaxonlite 0.3.0 introduces `SharedNode` thread-safe concurrent
-            reads and serialized write execution, checked transactions with
-            pre-commit expectations, and batch query support.
+            zaxonlite 0.6.0 introduces lifetime-global Paxos slots, a bounded
+            reusable consensus window, continuous segmented-journal trimming,
+            durable state anchors, and beyond-retention replica transfer.
 
             This release includes self-contained `zaxon` CLI archives and
             CPython 3.12+ Stable ABI wheels for Linux x86-64, macOS, and

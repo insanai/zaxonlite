@@ -93,7 +93,7 @@ typedef struct zaxonlite_value {
     size_t length;
 } zaxonlite_value;
 
-/* Library version string, for example "0.2.0". */
+/* Library version string, for example "0.6.0". */
 const char *zaxonlite_version(void);
 
 /* Opens (or creates) a node data directory. */
