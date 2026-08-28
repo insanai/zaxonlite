@@ -7,6 +7,15 @@
 //! Recovery measures a full `Node.open` (journal replay + offline page
 //! apply + validation) over the retained journal suffix.
 //!
+//! The write run also drives durable state anchors the way a server pump
+//! does (`maybeCreateStateAnchor` after every write), forcing an anchor
+//! at a fixed write interval so at least two anchor events land inside
+//! the run at any bench scale. Afterwards it prints the lag
+//! autocorrelation of the time-ordered per-write latency series at the
+//! anchor-interval lag and at the journal segment-rotation lag, flagging
+//! |r| > 0.2 as suspected periodicity. This is a self-contained printed
+//! check; it emits no results-protocol file.
+//!
 //! Usage: bench [writes] [reads]
 
 const std = @import("std");
@@ -17,6 +26,73 @@ const Node = zaxonlite.Node;
 
 fn nowNs(io: Io) i96 {
     return std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds;
+}
+
+/// Predeclared report-only autocorrelation threshold for periodicity,
+/// matching the paxos-zig bench-gate's flag.
+const periodicity_flag = 0.2;
+
+/// Journal records per replicated write on the single-node path: one
+/// accept and one commit (the long-run retention gate documents the
+/// same two-records-per-write ratio).
+const journal_records_per_write = 2;
+
+/// One lag of the periodicity check over the per-write latency series.
+const LagCheck = struct {
+    name: []const u8,
+    lag: usize,
+    r: f64,
+    available: bool,
+};
+
+/// Computes the check while `samples` is still in time order; a lag of
+/// zero or past half the series is unavailable rather than misleading.
+fn lagCheck(name: []const u8, samples: []const u64, lag: usize) LagCheck {
+    if (lag == 0 or lag >= samples.len / 2) {
+        return .{ .name = name, .lag = lag, .r = 0, .available = false };
+    }
+    return .{
+        .name = name,
+        .lag = lag,
+        .r = autocorrelation(samples, lag),
+        .available = true,
+    };
+}
+
+fn autocorrelation(samples: []const u64, lag: usize) f64 {
+    var mean: f64 = 0;
+    for (samples) |sample| mean += @floatFromInt(sample);
+    mean /= @floatFromInt(samples.len);
+    var denominator: f64 = 0;
+    for (samples) |sample| {
+        const centered = @as(f64, @floatFromInt(sample)) - mean;
+        denominator += centered * centered;
+    }
+    if (denominator == 0) return 0;
+    var numerator: f64 = 0;
+    for (samples[0 .. samples.len - lag], samples[lag..]) |early, late| {
+        numerator += (@as(f64, @floatFromInt(early)) - mean) *
+            (@as(f64, @floatFromInt(late)) - mean);
+    }
+    return numerator / denominator;
+}
+
+fn printLagCheck(check: LagCheck, series_len: usize) void {
+    if (!check.available) {
+        std.debug.print(
+            "{s} autocorrelation: lag {d} unavailable for {d} write samples\n",
+            .{ check.name, check.lag, series_len },
+        );
+        return;
+    }
+    const verdict = if (@abs(check.r) > periodicity_flag)
+        "  PERIODICITY SUSPECTED (|r| > 0.2)"
+    else
+        "";
+    std.debug.print(
+        "{s} autocorrelation: lag {d} writes r={d:.3}{s}\n",
+        .{ check.name, check.lag, check.r, verdict },
+    );
 }
 
 const Stats = struct {
@@ -116,6 +192,14 @@ pub fn main(init: std.process.Init) !u8 {
 fn benchWrites(gpa: std.mem.Allocator, io: std.Io, node: *Node, write_count: usize) !void {
     const write_samples = try gpa.alloc(u64, write_count);
     defer gpa.free(write_samples);
+    // Anchors on the natural cadence would need 10,000 slots or 30
+    // seconds; the forced interval guarantees at least two anchor
+    // events inside the run at any bench scale while the maybe call
+    // keeps the natural cadence live. Anchoring runs between writes,
+    // outside each per-write interval, so only its knock-on effect on
+    // later writes can appear in the series.
+    const anchor_every = @max(write_count / 8, 32);
+    var anchor_events: usize = 0;
     var sql_buffer: [160]u8 = undefined;
     const write_start = nowNs(io);
     for (0..write_count) |index| {
@@ -127,9 +211,26 @@ fn benchWrites(gpa: std.mem.Allocator, io: std.Io, node: *Node, write_count: usi
         const op_start = nowNs(io);
         _ = try node.exec(sql);
         write_samples[index] = @intCast(nowNs(io) - op_start);
+        if ((index + 1) % anchor_every == 0) {
+            try node.createStateAnchor();
+            anchor_events += 1;
+        } else if (try node.maybeCreateStateAnchor()) {
+            anchor_events += 1;
+        }
     }
     const write_elapsed = nowNs(io) - write_start;
+    // Both checks read the series in time order, before Stats.compute
+    // sorts it into order statistics.
+    const anchor_check = lagCheck("anchor-interval", write_samples, anchor_every);
+    const rotation_lag = zaxonlite.segment.rotation_records / journal_records_per_write;
+    const rotation_check = lagCheck("segment-rotation", write_samples, rotation_lag);
     printRow("write", write_count, write_elapsed, Stats.compute(write_samples));
+    std.debug.print(
+        "anchor events:     {d} during the write run (forced every {d} writes)\n",
+        .{ anchor_events, anchor_every },
+    );
+    printLagCheck(anchor_check, write_count);
+    printLagCheck(rotation_check, write_count);
 }
 
 fn benchReads(
