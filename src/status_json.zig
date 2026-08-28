@@ -5,6 +5,8 @@
 const std = @import("std");
 const Io = std.Io;
 const node_mod = @import("node.zig");
+const server = @import("server.zig");
+const writeJsonString = server.writeJsonString;
 
 pub fn writeHead(
     out: *Io.Writer,
@@ -54,4 +56,23 @@ pub fn writeHead(
             status.candidate_hard_limit,
         },
     );
+}
+
+pub fn writeMembershipOperation(
+    out: *Io.Writer,
+    pending: ?node_mod.Node.PendingOperation,
+    installation_error: ?[]const u8,
+) !void {
+    try out.writeAll("\"operation_id\":");
+    if (pending) |operation| {
+        try out.print("{d}", .{operation.operation_id});
+    } else {
+        try out.writeAll("null");
+    }
+    try out.writeAll(",\"installation_error\":");
+    if (installation_error) |message| {
+        try writeJsonString(out, message);
+    } else {
+        try out.writeAll("null");
+    }
 }

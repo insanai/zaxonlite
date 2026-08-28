@@ -3467,7 +3467,7 @@ pub const Server = struct {
                 installation_state,
             },
         );
-        try writeMembershipOperation(out, pending, installation_error);
+        try status_json.writeMembershipOperation(out, pending, installation_error);
         try out.writeAll(",\"nodes\":[");
         for (decided.nodesSlice(), 0..) |*record, index| {
             if (index > 0) try out.writeAll(",");
@@ -3718,7 +3718,7 @@ pub const Server = struct {
             quorum_available,
             installation_state,
         );
-        try writeMembershipOperation(out, pending, installation_error);
+        try status_json.writeMembershipOperation(out, pending, installation_error);
         try out.writeAll("}");
     }
 
@@ -5200,25 +5200,6 @@ fn writeReplacementError(out: *Io.Writer, err: anyerror) !void {
         },
     };
     return writeErrorResponse(out, response.code, response.message);
-}
-
-fn writeMembershipOperation(
-    out: *Io.Writer,
-    pending: ?Node.PendingOperation,
-    installation_error: ?[]const u8,
-) !void {
-    try out.writeAll("\"operation_id\":");
-    if (pending) |operation| {
-        try out.print("{d}", .{operation.operation_id});
-    } else {
-        try out.writeAll("null");
-    }
-    try out.writeAll(",\"installation_error\":");
-    if (installation_error) |message| {
-        try writeJsonString(out, message);
-    } else {
-        try out.writeAll("null");
-    }
 }
 
 fn writeSqlError(out: *Io.Writer, message: []const u8) !void {
