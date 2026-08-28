@@ -112,6 +112,11 @@ jobs:
       - name: Crash matrix
         run: zig build test-crash
 
+      # The write benchmark carries the periodicity instrument and its
+      # positive control; a broken instrument fails this step.
+      - name: Write benchmark instrument
+        run: zig build benchmark
+
       - name: C ABI smoke test
         run: zig build test-cabi
 
