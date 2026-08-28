@@ -296,7 +296,7 @@ fn reportWriteRun(
     anchor_events: usize,
     anchor_every: usize,
 ) !void {
-    const shift_scratch = try gpa.alloc(u64, interval_samples.len);
+    const shift_scratch = try gpa.alloc(u64, anchor_events);
     defer gpa.free(shift_scratch);
     const duty_percent = @as(f64, @floatFromInt(anchor_duty_ns)) * 100.0 /
         @as(f64, @floatFromInt(@max(write_elapsed, 1)));

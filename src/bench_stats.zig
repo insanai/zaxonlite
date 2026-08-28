@@ -7,7 +7,10 @@ const std = @import("std");
 
 /// Biased lag autocorrelation of a time-ordered series: the numerator
 /// sums `n - lag` products against a full-series denominator, so a
-/// perfect period at `lag` yields `(n - lag) / n`, not 1.0. Zero for a
+/// series holding an integer number of aligned, identical periods at
+/// `lag` yields exactly `(n - lag) / n` rather than 1.0 (a partial
+/// final period shifts that ratio, since the omitted tail need not
+/// carry a proportional share of the centered energy). Zero for a
 /// constant series or an out-of-range lag.
 pub fn autocorrelation(samples: []const u64, lag: usize) f64 {
     if (lag == 0 or lag >= samples.len) return 0;
@@ -144,6 +147,26 @@ test "empty and anchorless series report zero shift" {
     const anchored = [_]bool{ false, false };
     const none = pairedAnchorShift(&scratch, &intervals, &anchored);
     try std.testing.expectEqual(@as(u64, 0), none.shift);
+}
+
+test "sixty-five anchors keep an exact, untruncated median" {
+    // Thirty-two large deltas arrive first, then thirty-three small
+    // ones: the full-set median is the small value, while any
+    // truncation to the first sixty-four pairs would report the large
+    // one. This is the boundary a fixed-size delta buffer once broke.
+    var intervals: [130]u64 = undefined;
+    var anchored: [130]bool = undefined;
+    for (0..65) |pair| {
+        intervals[pair * 2] = 100;
+        anchored[pair * 2] = false;
+        intervals[pair * 2 + 1] = if (pair < 32) 1100 else 110;
+        anchored[pair * 2 + 1] = true;
+    }
+    var scratch: [65]u64 = undefined;
+    const result = pairedAnchorShift(&scratch, &intervals, &anchored);
+    try std.testing.expectEqual(@as(usize, 65), result.paired);
+    try std.testing.expectEqual(@as(usize, 0), result.dropped);
+    try std.testing.expectEqual(@as(u64, 10), result.shift);
 }
 
 test "autocorrelation matches the biased estimator on a periodic signal" {
