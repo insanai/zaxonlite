@@ -1,12 +1,14 @@
 //! Pure series statistics behind the write benchmark's periodicity
-//! instrument, split out so the estimators carry deterministic unit
-//! tests: a timing-instrument regression must fail `zig build test`,
-//! not wait for a human to read benchmark output.
+//! instrument, compiled as its own test artifact so an instrument
+//! regression fails `zig build test` deterministically. Imported by the
+//! benchmark alone; deliberately not part of the library surface.
 
 const std = @import("std");
 
-/// Lag autocorrelation of a time-ordered series; zero for a constant
-/// series or an out-of-range lag.
+/// Biased lag autocorrelation of a time-ordered series: the numerator
+/// sums `n - lag` products against a full-series denominator, so a
+/// perfect period at `lag` yields `(n - lag) / n`, not 1.0. Zero for a
+/// constant series or an out-of-range lag.
 pub fn autocorrelation(samples: []const u64, lag: usize) f64 {
     if (lag == 0 or lag >= samples.len) return 0;
     var mean: f64 = 0;
@@ -26,30 +28,49 @@ pub fn autocorrelation(samples: []const u64, lag: usize) f64 {
     return numerator / denominator;
 }
 
-/// Median of the per-anchor paired deltas: each anchor-bearing
-/// iteration minus the nearest preceding iteration that carried no
-/// anchor at all (walking back a bounded distance, so a natural anchor
-/// in the adjacent slot cannot poison the pair). The metric is a
-/// deliberately nonnegative, zero-censored "added cost": each delta
-/// saturates at zero, so a noisy pair where the plain iteration was
-/// slower contributes zero rather than a negative cost.
+/// The paired-shift estimate plus its honesty counters: how many
+/// anchors found a plain partner and how many were dropped for lacking
+/// one within the search window.
+pub const ShiftResult = struct {
+    shift: u64,
+    paired: usize,
+    dropped: usize,
+};
+
+/// Median of the per-anchor paired deltas over every anchor: each
+/// anchor-bearing iteration minus the nearest preceding iteration that
+/// carried no anchor at all (walking back at most eight slots, so a
+/// natural anchor in the adjacent slot cannot poison the pair; an
+/// anchor with no plain partner in that window is counted dropped).
+/// `scratch` must hold at least one slot per anchor, so the median is
+/// exact, never truncated to a prefix of the run. The metric is a
+/// deliberately nonnegative, zero-censored "added cost": a noisy pair
+/// where the plain iteration was slower contributes zero rather than a
+/// negative cost.
 pub fn pairedAnchorShift(
+    scratch: []u64,
     intervals: []const u64,
     anchored: []const bool,
-) u64 {
+) ShiftResult {
     std.debug.assert(intervals.len == anchored.len);
-    var deltas: [64]u64 = undefined;
     var count: usize = 0;
+    var dropped: usize = 0;
     for (anchored, 0..) |is_anchor, index| {
-        if (!is_anchor or index == 0) continue;
-        if (count == deltas.len) break;
-        const pair = pairIndex(anchored, index) orelse continue;
-        deltas[count] = intervals[index] -| intervals[pair];
+        if (!is_anchor) continue;
+        const pair = pairIndex(anchored, index) orelse {
+            dropped += 1;
+            continue;
+        };
+        scratch[count] = intervals[index] -| intervals[pair];
         count += 1;
     }
-    if (count == 0) return 0;
-    std.mem.sort(u64, deltas[0..count], {}, std.sort.asc(u64));
-    return deltas[count / 2];
+    if (count == 0) return .{ .shift = 0, .paired = 0, .dropped = dropped };
+    std.mem.sort(u64, scratch[0..count], {}, std.sort.asc(u64));
+    return .{
+        .shift = scratch[count / 2],
+        .paired = count,
+        .dropped = dropped,
+    };
 }
 
 /// The nearest preceding non-anchored iteration within a short window,
@@ -62,65 +83,78 @@ fn pairIndex(anchored: []const bool, index: usize) ?usize {
     return null;
 }
 
-test "paired shift is the median of adjacent anchor deltas" {
+test "paired shift is the exact median of every anchor delta" {
     const intervals = [_]u64{ 100, 100, 900, 100, 100, 400, 100, 100, 250 };
     const anchored = [_]bool{
         false, false, true, false, false, true, false, false, true,
     };
-    // Deltas: 800, 300, 150; the median is 300.
-    try std.testing.expectEqual(
-        @as(u64, 300),
-        pairedAnchorShift(&intervals, &anchored),
-    );
+    var scratch: [3]u64 = undefined;
+    // Deltas: 800, 300, 150; the median is 300, with no drops.
+    const result = pairedAnchorShift(&scratch, &intervals, &anchored);
+    try std.testing.expectEqual(@as(u64, 300), result.shift);
+    try std.testing.expectEqual(@as(usize, 3), result.paired);
+    try std.testing.expectEqual(@as(usize, 0), result.dropped);
 }
 
 test "a slower plain neighbor censors that pair at zero" {
     const intervals = [_]u64{ 500, 100, 500, 90 };
     const anchored = [_]bool{ false, true, false, true };
+    var scratch: [2]u64 = undefined;
     // Deltas censor to 0 and 0; the metric never goes negative.
-    try std.testing.expectEqual(
-        @as(u64, 0),
-        pairedAnchorShift(&intervals, &anchored),
-    );
+    const result = pairedAnchorShift(&scratch, &intervals, &anchored);
+    try std.testing.expectEqual(@as(u64, 0), result.shift);
 }
 
 test "an even number of anchors takes the upper median" {
     const intervals = [_]u64{ 100, 300, 100, 700 };
     const anchored = [_]bool{ false, true, false, true };
+    var scratch: [2]u64 = undefined;
     // Deltas: 200 and 600; count/2 selects the upper median, 600.
-    try std.testing.expectEqual(
-        @as(u64, 600),
-        pairedAnchorShift(&intervals, &anchored),
-    );
+    const result = pairedAnchorShift(&scratch, &intervals, &anchored);
+    try std.testing.expectEqual(@as(u64, 600), result.shift);
 }
 
 test "a natural anchor in the adjacent slot is skipped when pairing" {
     const intervals = [_]u64{ 100, 800, 900, 100 };
     const anchored = [_]bool{ false, true, true, false };
+    var scratch: [2]u64 = undefined;
     // The second anchor pairs with index 0, not the anchored index 1.
-    try std.testing.expectEqual(
-        @as(u64, 800),
-        pairedAnchorShift(&intervals, &anchored),
-    );
+    const result = pairedAnchorShift(&scratch, &intervals, &anchored);
+    try std.testing.expectEqual(@as(u64, 800), result.shift);
+    try std.testing.expectEqual(@as(usize, 2), result.paired);
+}
+
+test "an anchor with no plain partner in the window is counted dropped" {
+    var intervals: [10]u64 = @splat(100);
+    var anchored: [10]bool = @splat(true);
+    anchored[0] = false;
+    intervals[9] = 700;
+    var scratch: [9]u64 = undefined;
+    // Only anchors within eight slots of index 0 can pair; the rest drop.
+    const result = pairedAnchorShift(&scratch, &intervals, &anchored);
+    try std.testing.expectEqual(@as(usize, 8), result.paired);
+    try std.testing.expectEqual(@as(usize, 1), result.dropped);
 }
 
 test "empty and anchorless series report zero shift" {
-    try std.testing.expectEqual(@as(u64, 0), pairedAnchorShift(&.{}, &.{}));
+    var scratch: [1]u64 = undefined;
+    const empty = pairedAnchorShift(scratch[0..0], &.{}, &.{});
+    try std.testing.expectEqual(@as(u64, 0), empty.shift);
     const intervals = [_]u64{ 100, 200 };
     const anchored = [_]bool{ false, false };
-    try std.testing.expectEqual(
-        @as(u64, 0),
-        pairedAnchorShift(&intervals, &anchored),
-    );
+    const none = pairedAnchorShift(&scratch, &intervals, &anchored);
+    try std.testing.expectEqual(@as(u64, 0), none.shift);
 }
 
-test "autocorrelation sees a periodic signal and ignores a constant one" {
+test "autocorrelation matches the biased estimator on a periodic signal" {
     var series: [64]u64 = undefined;
     for (&series, 0..) |*value, index| {
         value.* = if (index % 8 == 0) 1000 else 100;
     }
-    try std.testing.expect(autocorrelation(&series, 8) > 0.9);
-    try std.testing.expect(autocorrelation(&series, 5) < 0.2);
+    // A perfect lag-8 repetition over 64 samples yields (64 - 8) / 64.
+    const r = autocorrelation(&series, 8);
+    try std.testing.expect(std.math.approxEqAbs(f64, r, 0.875, 0.01));
+    try std.testing.expect(@abs(autocorrelation(&series, 5)) < 0.2);
     const flat = [_]u64{7} ** 16;
     try std.testing.expectEqual(@as(f64, 0), autocorrelation(&flat, 4));
 }

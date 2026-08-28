@@ -235,6 +235,19 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run the zaxonlite test suite");
     test_step.dependOn(&run_unit_tests.step);
 
+    // The benchmark's series estimators live outside the library
+    // surface, so lazy analysis would never reach their tests through
+    // the module artifact; they get their own.
+    const bench_stats_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_stats.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_bench_stats_tests = b.addRunArtifact(bench_stats_tests);
+    test_step.dependOn(&run_bench_stats_tests.step);
+
     // The pure search kernels test as their own module: compiling them
     // without any imports proves the SQLite-free boundary (ZDS 0009).
     const search_tests = b.addTest(.{ .root_module = graph.search });
@@ -615,6 +628,7 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&soak_exe.step);
     check_step.dependOn(&longrun_exe.step);
     check_step.dependOn(&unit_tests.step);
+    check_step.dependOn(&bench_stats_tests.step);
     check_step.dependOn(&search_tests.step);
     check_step.dependOn(&cli_ui_tests.step);
     check_step.dependOn(&cli_unit_tests.step);
