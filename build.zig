@@ -600,6 +600,20 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&cluster_bench_exe.step);
     check_step.dependOn(&bench_exe.step);
     check_step.dependOn(&search_bench_exe.step);
+    // Every test controller compiles under `check`: an integration
+    // harness that only compiles when its suite runs is a harness whose
+    // compile errors ship.
+    check_step.dependOn(&crash_test.step);
+    check_step.dependOn(&cluster_test.step);
+    check_step.dependOn(&replacement_cluster_test.step);
+    check_step.dependOn(&transfer_cluster_test.step);
+    check_step.dependOn(&role_cluster_test.step);
+    check_step.dependOn(&gateway_test.step);
+    check_step.dependOn(&fault_cluster_test.step);
+    check_step.dependOn(&cli_test.step);
+    check_step.dependOn(&fuzz_exe.step);
+    check_step.dependOn(&soak_exe.step);
+    check_step.dependOn(&longrun_exe.step);
 
     // Cross-target compile gate for the pure search kernels: the module
     // has no dependencies, so it must build for every supported vector
