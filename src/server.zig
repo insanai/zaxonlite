@@ -1410,13 +1410,27 @@ pub const Server = struct {
         defer self.mutex.unlock(self.io);
         if (credential_node_id) |id| {
             var count: usize = 0;
-            for (self.active_connections.items) |connection| {
-                if (connection.credential_node_id == id) count += 1;
+            var oldest: ?*TrackedConnection = null;
+            for (self.active_connections.items) |*connection| {
+                if (connection.credential_node_id == id) {
+                    count += 1;
+                    if (oldest == null) oldest = connection;
+                }
             }
             if (self.options.max_connections_per_peer != 0 and
                 count >= self.options.max_connections_per_peer)
             {
-                return error.PeerConnectionLimit;
+                // Newest wins: a fresh reconnect must never lose to its
+                // own not-yet-reaped predecessor, or a crash-restart
+                // cycle churns forever with every new connection
+                // rejected while stale entries hold the slots. Shut the
+                // oldest down; its handler reaps it on the failed read.
+                std.log.info(
+                    "node {d}: evicting oldest connection of peer {d} " ++
+                        "({d} at limit)",
+                    .{ self.node.identity.node_id, id, count },
+                );
+                oldest.?.stream.shutdown(self.io, .both) catch {};
             }
         }
         const now_ms = self.tick_count * self.options.tick_ms;
