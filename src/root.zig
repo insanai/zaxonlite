@@ -23,6 +23,8 @@ pub const history = @import("history.zig");
 pub const applied_anchor = @import("applied_anchor.zig");
 /// Immutable journal v2 segments with sealed trailers (ZDS 0011).
 pub const segment = @import("segment.zig");
+/// Tested series estimators behind the write benchmark instrument.
+pub const bench_stats = @import("bench_stats.zig");
 /// The authoritative retained-segment manifest for journal v2 (ZDS 0011).
 pub const manifest = @import("manifest.zig");
 /// Conservative trim policy and the durable TRIM record (ZDS 0011).
