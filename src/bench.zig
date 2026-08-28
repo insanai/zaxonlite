@@ -317,28 +317,26 @@ fn reportWriteRun(
     );
 }
 
-/// Median inter-completion time of anchor-bearing iterations minus the
-/// median of the plain iterations immediately preceding each anchor:
-/// adjacent sampling keeps warm-up drift out of the comparison.
+/// Median of the per-anchor paired deltas: each anchor-bearing
+/// iteration minus the plain iteration immediately before it
+/// (`index - 1` is always plain, since anchors fire only where
+/// `(index + 1) % anchor_every == 0`). Pairing adjacent iterations
+/// keeps warm-up drift out of the estimate, and the median of paired
+/// deltas is the per-anchor added cost, which a difference of two
+/// medians is not.
 fn anchorShift(intervals: []const u64, anchor_every: usize) u64 {
-    var anchored: [64]u64 = undefined;
-    var anchored_count: usize = 0;
-    var plain: [64]u64 = undefined;
-    var plain_count: usize = 0;
+    var deltas: [64]u64 = undefined;
+    var count: usize = 0;
     for (intervals, 0..) |interval, index| {
         if ((index + 1) % anchor_every != 0) continue;
-        if (anchored_count == anchored.len) break;
-        anchored[anchored_count] = interval;
-        anchored_count += 1;
-        if (index >= 2) {
-            plain[plain_count] = intervals[index - 2];
-            plain_count += 1;
-        }
+        if (index == 0) continue;
+        if (count == deltas.len) break;
+        deltas[count] = interval -| intervals[index - 1];
+        count += 1;
     }
-    if (anchored_count == 0 or plain_count == 0) return 0;
-    std.mem.sort(u64, anchored[0..anchored_count], {}, std.sort.asc(u64));
-    std.mem.sort(u64, plain[0..plain_count], {}, std.sort.asc(u64));
-    return anchored[anchored_count / 2] -| plain[plain_count / 2];
+    if (count == 0) return 0;
+    std.mem.sort(u64, deltas[0..count], {}, std.sort.asc(u64));
+    return deltas[count / 2];
 }
 
 fn benchReads(

@@ -424,6 +424,9 @@ test "the storage ceiling refuses writes instead of deleting history" {
     });
     defer node.close();
     _ = try node.exec("create table t(id integer primary key, v text)");
+    const schema_usage = node.journal.stats().journal_bytes +
+        node.store.retained_bytes;
+    try testing.expect(schema_usage <= cap);
     var refused = false;
     var index: usize = 0;
     while (index < 400) : (index += 1) {
