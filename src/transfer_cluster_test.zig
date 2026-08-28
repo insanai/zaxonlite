@@ -418,7 +418,7 @@ pub fn main(init: std.process.Init) !u8 {
     const gpa = init.gpa;
     const io = init.io;
 
-    var iterator = std.process.Args.Iterator.init(init.minimal.args);
+    var iterator = try std.process.Args.Iterator.initAllocator(init.minimal.args, gpa);
     defer iterator.deinit();
     _ = iterator.next();
     const zaxon = iterator.next() orelse {

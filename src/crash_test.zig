@@ -63,7 +63,7 @@ const cases = [_]Case{
 pub fn main(init: std.process.Init) !u8 {
     const gpa = init.gpa;
     const io = init.io;
-    var arguments = std.process.Args.Iterator.init(init.minimal.args);
+    var arguments = try std.process.Args.Iterator.initAllocator(init.minimal.args, gpa);
     defer arguments.deinit();
     _ = arguments.next();
     const zaxon = arguments.next() orelse {
