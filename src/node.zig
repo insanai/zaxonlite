@@ -2159,7 +2159,7 @@ pub const Node = struct {
         const pending = (try self.pendingOperation()) orelse return;
         if (pending.phase == .proposed) return;
         const stop = self.log.pendingStopSign() orelse return;
-        const parsed = try parseStopMetadata(stop.metadataSlice());
+        const parsed = try registry.parseStopMetadata(stop.metadataSlice());
         const seed = parsed.seed orelse {
             try self.clearPendingOperation();
             return;
@@ -2210,7 +2210,7 @@ pub const Node = struct {
         // the anchor-pinned transfer, never a snapshot generation
         // (ZDS 0011); global slots continue across the transition.
         const next = try decided.successor(request);
-        const metadata = renderStopMetadata(next.digest(), request);
+        const metadata = registry.renderStopMetadata(next.digest(), request);
         var voter_buffer: [types.log_options.max_members]paxos.NodeId = undefined;
         const next_voters = next.voterIds(&voter_buffer);
         _ = try self.log.reconfigure(
@@ -2237,7 +2237,7 @@ pub const Node = struct {
         // handover waits only for the stop itself to be applied.
         if (self.applied_slot < stop_slot) return error.StopNotApplied;
         std.debug.assert(self.applied_slot == stop_slot);
-        const parsed = try parseStopMetadata(stop.metadataSlice());
+        const parsed = try registry.parseStopMetadata(stop.metadataSlice());
 
         if (self.capabilities.votes) {
             var still_member = false;
@@ -3946,95 +3946,6 @@ pub const Node = struct {
         }
     }
 
-    /// The voter-replacement seed carried in zx3 stop metadata: the
-    /// operation id plus the retiring node, the joining node, and its
-    /// endpoint, from which every survivor rebuilds the next registry.
-    const StopSeed = struct {
-        operation_id: u64,
-        old_node_id: paxos.NodeId,
-        new_node_id: paxos.NodeId,
-        endpoint: [registry.max_endpoint_bytes]u8,
-        endpoint_len: u8,
-
-        fn endpointSlice(self: *const StopSeed) []const u8 {
-            return self.endpoint[0..self.endpoint_len];
-        }
-    };
-
-    const StopMetadata = struct {
-        /// Digest of the canonical next decided registry.
-        registry_digest: [32]u8,
-        /// Present only for a decided voter replacement.
-        seed: ?StopSeed,
-    };
-
-    const StopMetadataText = struct {
-        buffer: [types.log_options.max_metadata_bytes]u8,
-        len: usize,
-
-        fn slice(self: *const StopMetadataText) []const u8 {
-            return self.buffer[0..self.len];
-        }
-    };
-
-    /// Renders zx3 stop metadata: the next registry digest plus the
-    /// replacement seed every survivor reconstructs the registry from.
-    fn renderStopMetadata(
-        digest: [32]u8,
-        request: *const registry.ReplacementRequest,
-    ) StopMetadataText {
-        var text = StopMetadataText{ .buffer = undefined, .len = 0 };
-        const digest_hex = std.fmt.bytesToHex(digest, .lower);
-        const rendered = std.fmt.bufPrint(
-            &text.buffer,
-            "zx3 {s} {x:0>16} {x:0>8} {x:0>8} {s}",
-            .{
-                &digest_hex,
-                request.operation_id,
-                request.old_node_id,
-                request.new_node_id,
-                request.new_endpoint,
-            },
-        ) catch unreachable;
-        text.len = rendered.len;
-        return text;
-    }
-
-    fn parseStopMetadata(metadata: []const u8) !StopMetadata {
-        var parts = std.mem.tokenizeScalar(u8, metadata, ' ');
-        const tag = parts.next() orelse return error.CorruptStopSign;
-        if (!std.mem.eql(u8, tag, "zx3")) return error.CorruptStopSign;
-        const registry_hex = parts.next() orelse return error.CorruptStopSign;
-        if (registry_hex.len != 64) return error.CorruptStopSign;
-        var result = StopMetadata{ .registry_digest = undefined, .seed = null };
-        _ = std.fmt.hexToBytes(&result.registry_digest, registry_hex) catch
-            return error.CorruptStopSign;
-        if (parts.next()) |operation_hex| {
-            if (operation_hex.len != 16) return error.CorruptStopSign;
-            const old_hex = parts.next() orelse return error.CorruptStopSign;
-            if (old_hex.len != 8) return error.CorruptStopSign;
-            const new_hex = parts.next() orelse return error.CorruptStopSign;
-            if (new_hex.len != 8) return error.CorruptStopSign;
-            const endpoint = parts.next() orelse return error.CorruptStopSign;
-            registry.validateEndpoint(endpoint) catch
-                return error.CorruptStopSign;
-            var seed = StopSeed{
-                .operation_id = std.fmt.parseInt(u64, operation_hex, 16) catch
-                    return error.CorruptStopSign,
-                .old_node_id = std.fmt.parseInt(paxos.NodeId, old_hex, 16) catch
-                    return error.CorruptStopSign,
-                .new_node_id = std.fmt.parseInt(paxos.NodeId, new_hex, 16) catch
-                    return error.CorruptStopSign,
-                .endpoint = [_]u8{0} ** registry.max_endpoint_bytes,
-                .endpoint_len = @intCast(endpoint.len),
-            };
-            @memcpy(seed.endpoint[0..endpoint.len], endpoint);
-            result.seed = seed;
-        }
-        if (parts.next() != null) return error.CorruptStopSign;
-        return result;
-    }
-
     /// Reconstructs and verifies the decided next registry named by stop
     /// metadata. Deterministic: a same-member rollover is the checkpoint
     /// successor, a replacement applies the metadata seed, and a lagging
@@ -4042,7 +3953,7 @@ pub const Node = struct {
     /// digest bound into the chosen stop sign is the only acceptance test.
     fn reconstructNextRegistry(
         decided: *const registry.Decided,
-        parsed: *const StopMetadata,
+        parsed: *const registry.StopMetadata,
         next_configuration: u64,
     ) !registry.Decided {
         const expected_digest = parsed.registry_digest;

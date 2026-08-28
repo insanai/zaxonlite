@@ -38,6 +38,7 @@ const search_api = @import("search_api.zig");
 const payload_store_mod = @import("payload_store.zig");
 const enrollment = @import("enrollment.zig");
 const failpoint = @import("failpoint.zig");
+const status_json = @import("status_json.zig");
 const roles = @import("roles.zig");
 const diagnostic = @import("diagnostic.zig");
 const durability = @import("durability.zig");
@@ -552,11 +553,18 @@ pub fn serve(
         .retention_slots = options.retention_slots,
         .journal_cap_bytes = options.journal_cap_bytes,
     }) catch |err| {
+        const hint = if (err == error.StateUnavailable)
+            "The image or anchor no longer reaches retained history. " ++
+                "v1 repairs a damaged voter by replacement: enroll a new " ++
+                "node and replace this one (ZDS 0008); the frozen " ++
+                "conservative trim keeps every slot the successor needs."
+        else
+            "Check the role-pinned identity and durable files before retrying.";
         try diagnostic.write(
             err_out,
             "node open failed",
             @errorName(err),
-            "Check the role-pinned identity and durable files before retrying.",
+            hint,
         );
         try err_out.flush();
         return 4;
@@ -3688,45 +3696,13 @@ pub const Server = struct {
         const installation_state = self.installationState();
         const installation_error = self.installationError();
         self.mutex.unlock(self.io);
-        const chain_hex = std.fmt.bytesToHex(status.chain, .lower);
-        try out.print(
-            "{{\"ok\":true,\"node_id\":{d},\"database_id\":\"{x:0>32}\"," ++
-                "\"configuration_id\":{d},\"role\":\"{s}\"," ++
-                "\"node_type\":\"{s}\",\"leader\":{?d}," ++
-                "\"phase\":\"{s}\",\"quorum_available\":{}," ++
-                "\"installation_state\":\"{s}\"," ++
-                "\"ballot\":{{\"round\":{d},\"priority\":{d},\"node\":{d}}}," ++
-                "\"decided_slot\":{d},\"applied_slot\":{d}," ++
-                "\"durable_state_slot\":{d},\"memory_floor\":{d}," ++
-                "\"chosen_trim_slot\":{d},\"retained_first_slot\":{d}," ++
-                "\"journal_records\":{d},\"journal_segment_count\":{d}," ++
-                "\"journal_bytes\":{d}," ++
-                "\"chain\":\"{s}\",\"page_size\":{d}," ++
-                "\"fts5_enabled\":{}," ++
-                "\"sqlite_vec_version\":\"{s}\"," ++
-                "\"search_feature_version\":{d}," ++
-                "\"simd_backend\":\"{s}\"," ++
-                "\"mmap_size\":{d}," ++
-                "\"candidate_hard_limit\":{d}," ++
-                "\"write_gate\":\"fifo-v1\"," ++
-                "\"typed_v1\":true,",
-            .{
-                status.node_id,              status.database_id,
-                status.configuration_id,     status.role,
-                status.node_type,            leader,
-                phase,                       quorum_available,
-                installation_state,          status.ballot.round,
-                status.ballot.priority,      status.ballot.node,
-                status.decided_slot,         status.applied_slot,
-                status.durable_state_slot,   status.memory_floor,
-                status.chosen_trim_slot,     status.retained_first_slot,
-                status.journal_records,      status.journal_segment_count,
-                status.journal_bytes,        &chain_hex,
-                status.page_size,            status.fts5_enabled,
-                status.sqlite_vec_version,   status.search_feature_version,
-                status.simd_backend,         status.mmap_size,
-                status.candidate_hard_limit,
-            },
+        try status_json.writeHead(
+            out,
+            status,
+            leader,
+            phase,
+            quorum_available,
+            installation_state,
         );
         try writeMembershipOperation(out, pending, installation_error);
         try out.writeAll("}");
