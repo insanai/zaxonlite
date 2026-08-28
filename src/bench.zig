@@ -21,6 +21,7 @@
 const std = @import("std");
 const Io = std.Io;
 const zaxonlite = @import("zaxonlite");
+const bench_stats = @import("bench_stats.zig");
 
 const Node = zaxonlite.Node;
 
@@ -54,7 +55,7 @@ fn lagCheck(name: []const u8, samples: []const u64, lag: usize) LagCheck {
     return .{
         .name = name,
         .lag = lag,
-        .r = zaxonlite.bench_stats.autocorrelation(samples, lag),
+        .r = bench_stats.autocorrelation(samples, lag),
         .available = true,
     };
 }
@@ -255,7 +256,8 @@ fn benchWrites(gpa: std.mem.Allocator, io: std.Io, node: *Node, write_count: usi
     const anchor_check = lagCheck("anchor-interval", write_samples, anchor_every);
     const rotation_lag = zaxonlite.segment.rotation_records / journal_records_per_write;
     const rotation_check = lagCheck("segment-rotation", write_samples, rotation_lag);
-    reportWriteRun(
+    try reportWriteRun(
+        gpa,
         interval_samples,
         write_samples,
         anchored_flags,
@@ -285,6 +287,7 @@ fn runAnchorDuty(node: *Node, index: usize, anchor_every: usize) !bool {
 /// and the shift between anchor-bearing and adjacent plain iterations:
 /// the magnitudes the correlation only hints at.
 fn reportWriteRun(
+    gpa: std.mem.Allocator,
     interval_samples: []u64,
     write_samples: []u64,
     anchored_flags: []const bool,
@@ -292,10 +295,13 @@ fn reportWriteRun(
     anchor_duty_ns: u128,
     anchor_events: usize,
     anchor_every: usize,
-) void {
+) !void {
+    const shift_scratch = try gpa.alloc(u64, interval_samples.len);
+    defer gpa.free(shift_scratch);
     const duty_percent = @as(f64, @floatFromInt(anchor_duty_ns)) * 100.0 /
         @as(f64, @floatFromInt(@max(write_elapsed, 1)));
-    const shift = zaxonlite.bench_stats.pairedAnchorShift(
+    const shift = bench_stats.pairedAnchorShift(
+        shift_scratch,
         interval_samples,
         anchored_flags,
     );
@@ -309,8 +315,9 @@ fn reportWriteRun(
     );
     std.debug.print(
         "anchor-iteration shift: median {d} us over the nearest plain " ++
-            "iteration (nonnegative, zero-censored)\n",
-        .{shift / std.time.ns_per_us},
+            "iteration within eight slots (nonnegative, zero-censored; " ++
+            "{d} paired, {d} dropped)\n",
+        .{ shift.shift / std.time.ns_per_us, shift.paired, shift.dropped },
     );
 }
 
