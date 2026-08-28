@@ -33,6 +33,10 @@ pub const LoadError = error{
 pub const PayloadStore = struct {
     io: Io,
     dir: Io.Dir,
+    /// Bytes of retained payload objects, counted once at open and
+    /// maintained across installs and removals; feeds the storage
+    /// budget alongside journal bytes (ZDS 0011).
+    retained_bytes: u64 = 0,
 
     pub fn init(io: Io, parent: Io.Dir) !PayloadStore {
         // Iterate so the long-lived handle is a real descriptor: it is
@@ -44,7 +48,39 @@ pub const PayloadStore = struct {
         errdefer dir.close(io);
         try durability.syncDirectory(parent);
         try durability.syncDirectory(dir);
-        return .{ .io = io, .dir = dir };
+        var self = PayloadStore{ .io = io, .dir = dir };
+        self.retained_bytes = self.measureRetainedBytes();
+        return self;
+    }
+
+    /// Sums every retained object once; open-time only.
+    fn measureRetainedBytes(self: *PayloadStore) u64 {
+        var total: u64 = 0;
+        var shards = self.dir.iterate();
+        while (shards.next(self.io) catch null) |shard| {
+            if (shard.kind != .directory or shard.name.len != 2) continue;
+            var shard_name: [2]u8 = shard.name[0..2].*;
+            var shard_dir = self.dir.openDir(
+                self.io,
+                &shard_name,
+                .{ .iterate = true },
+            ) catch continue;
+            defer shard_dir.close(self.io);
+            var objects = shard_dir.iterate();
+            while (objects.next(self.io) catch null) |object| {
+                if (object.kind != .file) continue;
+                var object_name: [62]u8 = undefined;
+                if (object.name.len != 62) continue;
+                object_name = object.name[0..62].*;
+                const stat = shard_dir.statFile(
+                    self.io,
+                    &object_name,
+                    .{},
+                ) catch continue;
+                total += stat.size;
+            }
+        }
+        return total;
     }
 
     pub fn deinit(self: *PayloadStore) void {
@@ -107,10 +143,19 @@ pub const PayloadStore = struct {
         try atomic.file.writePositionalAll(self.io, bytes, 0);
         try durability.syncFileBeforeBarrier(self.io, atomic.file);
         atomic.link(self.io) catch |err| switch (err) {
-            // Another writer installed identical content first.
-            error.PathAlreadyExists => {},
+            // Another writer installed identical content first; it also
+            // counted the bytes.
+            error.PathAlreadyExists => {
+                try durability.syncChildDirectoryBeforeBarrier(
+                    self.io,
+                    self.dir,
+                    path[0..2],
+                );
+                return;
+            },
             else => return err,
         };
+        self.retained_bytes += bytes.len;
         try durability.syncChildDirectoryBeforeBarrier(self.io, self.dir, path[0..2]);
     }
 
@@ -193,7 +238,9 @@ pub const PayloadStore = struct {
                 _ = std.fmt.hexToBytes(&digest, &hex) catch continue;
                 if (reachable.contains(digest)) continue;
                 var object_name: [62]u8 = object.name[0..62].*;
-                shard_dir.deleteFile(self.io, &object_name) catch {};
+                const stat = shard_dir.statFile(self.io, &object_name, .{}) catch null;
+                shard_dir.deleteFile(self.io, &object_name) catch continue;
+                if (stat) |s| self.retained_bytes -|= s.size;
             }
         }
     }
@@ -202,7 +249,9 @@ pub const PayloadStore = struct {
     pub fn remove(self: *PayloadStore, digest: Hash) !void {
         var path_buffer: [65]u8 = undefined;
         const path = pathOf(&path_buffer, digest);
+        const stat = self.dir.statFile(self.io, path, .{}) catch null;
         try self.dir.deleteFile(self.io, path);
+        if (stat) |s| self.retained_bytes -|= s.size;
     }
 
     fn pathOf(buffer: *[65]u8, digest: Hash) []const u8 {

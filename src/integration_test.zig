@@ -388,6 +388,95 @@ test "idempotent sessions execute a sequence exactly once" {
     }
 }
 
+test "the storage ceiling refuses writes instead of deleting history" {
+    const gpa = testing.allocator;
+    var test_dir = try TestDir.init(gpa);
+    defer test_dir.deinit(gpa);
+    const dir = try test_dir.nodeDir(gpa);
+    defer gpa.free(dir);
+
+    // A cap this small covers journal plus payload bytes within a few
+    // writes; the refusal must be RecoveryRetentionExceeded, never a
+    // deletion of unproven history.
+    const node = try Node.open(gpa, testing.io, .{
+        .directory = dir,
+        .journal_cap_bytes = 16 * 1024,
+    });
+    defer node.close();
+    _ = try node.exec("create table t(id integer primary key, v text)");
+    var refused = false;
+    var index: usize = 0;
+    while (index < 200) : (index += 1) {
+        _ = node.exec("insert into t(v) values ('row')") catch |err| {
+            try testing.expectEqual(error.RecoveryRetentionExceeded, err);
+            refused = true;
+            break;
+        };
+    }
+    try testing.expect(refused);
+    try testing.expect(node.journal.retainedFirstSlot() == 1);
+}
+
+test "the retention horizon keeps recent history below the chosen trim" {
+    const gpa = testing.allocator;
+    var test_dir = try TestDir.init(gpa);
+    defer test_dir.deinit(gpa);
+    const dir = try test_dir.nodeDir(gpa);
+    defer gpa.free(dir);
+
+    const saved_rotation = zaxonlite.segment.rotation_records;
+    zaxonlite.segment.rotation_records = 128;
+    defer zaxonlite.segment.rotation_records = saved_rotation;
+
+    // A horizon wider than all history pins physical reclamation at
+    // genesis even though the chosen trim advances past whole segments.
+    const node = try Node.open(gpa, testing.io, .{
+        .directory = dir,
+        .retention_slots = 1_000_000,
+    });
+    defer node.close();
+    _ = try node.exec("create table t(id integer primary key, v text)");
+    var index: usize = 0;
+    while (index < 300) : (index += 1) {
+        _ = try node.exec("insert into t(v) values ('r')");
+    }
+    try node.createStateAnchor();
+    try node.reclaim();
+    try testing.expect(node.trim_state.through_slot > 0);
+    try testing.expectEqual(@as(u64, 1), node.journal.retainedFirstSlot());
+}
+
+test "the time cadence anchors again after a restart" {
+    const gpa = testing.allocator;
+    var test_dir = try TestDir.init(gpa);
+    defer test_dir.deinit(gpa);
+    const dir = try test_dir.nodeDir(gpa);
+    defer gpa.free(dir);
+
+    {
+        const node = try openNode(dir);
+        defer node.close();
+        _ = try node.exec("create table t(id integer primary key, v text)");
+        _ = try node.exec("insert into t(v) values ('a')");
+        try node.createStateAnchor();
+    }
+
+    const saved_interval = Node.anchor_interval_ns;
+    Node.anchor_interval_ns = 1;
+    defer Node.anchor_interval_ns = saved_interval;
+
+    // The restarted node has an anchor but a zero clock; the first
+    // cadence check starts the clock and must not anchor, the second
+    // sees the elapsed interval and must.
+    const node = try openNode(dir);
+    defer node.close();
+    _ = try node.exec("insert into t(v) values ('b')");
+    const before = node.durable_state_slot;
+    try testing.expect(!try node.maybeCreateStateAnchor());
+    try testing.expect(try node.maybeCreateStateAnchor());
+    try testing.expect(node.durable_state_slot > before);
+}
+
 test "a state anchor bounds recovery and survives image loss" {
     const gpa = testing.allocator;
     var test_dir = try TestDir.init(gpa);

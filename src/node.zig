@@ -104,10 +104,11 @@ pub const OpenOptions = struct {
     /// the chosen trim, so lagging replicas can range-recover without a
     /// transfer. Zero keeps only what the trim requires (ZDS 0011).
     retention_slots: u64 = 0,
-    /// Hard local storage ceiling in journal bytes: at or above it, new
-    /// writes are refused with `RecoveryRetentionExceeded` instead of
-    /// deleting unproven history. Zero disables the ceiling (ZDS 0011).
-    journal_cap_bytes: u64 = 0,
+    /// Hard local storage ceiling over journal plus retained payload
+    /// bytes: at or above it, new writes are refused with
+    /// `RecoveryRetentionExceeded` instead of deleting unproven history.
+    /// Ships at the ZDS 0011 Q2 hard ceiling; zero disables it.
+    journal_cap_bytes: u64 = 64 * 1024 * 1024 * 1024,
 };
 
 pub const SessionError = error{
@@ -153,6 +154,7 @@ pub const Status = struct {
     journal_records: u64,
     journal_segment_count: u64,
     journal_bytes: u64,
+    payload_retained_bytes: u64,
     chain: command.HashBytes,
     history: command.HashBytes,
     page_size: u32,
@@ -1573,6 +1575,7 @@ pub const Node = struct {
             .journal_records = self.journal.next_sequence - 1,
             .journal_segment_count = journal_stats.segment_count,
             .journal_bytes = journal_stats.journal_bytes,
+            .payload_retained_bytes = self.store.retained_bytes,
             .chain = self.last_chain,
             .history = self.history_hash,
             .page_size = self.page_size,
@@ -1654,7 +1657,9 @@ pub const Node = struct {
     /// Slots of execution beyond the durable anchor that trigger a new
     /// anchor (ZDS 0011 Q5).
     pub const anchor_interval_slots: paxos.Slot = 10_000;
-    pub const anchor_interval_ns: i96 = 30 * std.time.ns_per_s;
+    /// Test-overridable so the cadence trigger is verifiable without a
+    /// thirty-second wait; production never changes it.
+    pub var anchor_interval_ns: i96 = 30 * std.time.ns_per_s;
     pub const anchor_wal_bytes: u64 = 64 * 1024 * 1024;
 
     /// Creates a durable state anchor: checkpoints the live WAL into the
@@ -2056,13 +2061,16 @@ pub const Node = struct {
     fn anchorDue(self: *Node) bool {
         if (self.durable_state_slot == 0) return self.applied_slot > 0;
         if (self.applied_slot <= self.durable_state_slot) return false;
-        if (self.applied_slot >= self.durable_state_slot + anchor_interval_slots) {
+        if (self.applied_slot >= self.durable_state_slot +| anchor_interval_slots) {
             return true;
         }
         const now = std.Io.Clock.Timestamp.now(self.io, .awake).raw.nanoseconds;
-        if (self.last_anchor_ns != 0 and
-            now - self.last_anchor_ns >= anchor_interval_ns)
-        {
+        if (self.last_anchor_ns == 0) {
+            // The 30-second clock starts at the first cadence check of
+            // this process, so a restarted node whose anchor predates
+            // the restart still time-anchors.
+            self.last_anchor_ns = now;
+        } else if (now - self.last_anchor_ns >= anchor_interval_ns) {
             return true;
         }
         const wal_stat = self.dir.statFile(self.io, wal_file_name, .{}) catch
@@ -2689,7 +2697,8 @@ pub const Node = struct {
         // unproven history deleted; a safe trim, a state transfer, or
         // an operator capacity change restores service.
         if (self.journal_cap_bytes != 0 and
-            self.journal.stats().journal_bytes >= self.journal_cap_bytes)
+            self.journal.stats().journal_bytes + self.store.retained_bytes >=
+                self.journal_cap_bytes)
         {
             return error.RecoveryRetentionExceeded;
         }

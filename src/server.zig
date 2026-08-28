@@ -265,8 +265,9 @@ pub const ServeOptions = struct {
     mmap_size: u64 = 0,
     /// Retention horizon in slots below the chosen trim (ZDS 0011).
     retention_slots: u64 = 0,
-    /// Hard journal-byte ceiling refusing writes; zero disables.
-    journal_cap_bytes: u64 = 0,
+    /// Hard ceiling over journal plus retained payload bytes,
+    /// refusing writes at the ZDS 0011 Q2 default; zero disables.
+    journal_cap_bytes: u64 = 64 * 1024 * 1024 * 1024,
     /// Honor `failpoint` RPCs (test controllers only).
     enable_failpoints: bool = false,
     tick_ms: u64 = 25,
@@ -1047,6 +1048,10 @@ pub const Server = struct {
         handshake_deadline_ms: u64,
         idle_deadline_ms: u64 = 0,
         credential_node_id: ?paxos.NodeId = null,
+        /// Shut down by newest-wins eviction and awaiting its handler's
+        /// reap; excluded from the live count so concurrent handshakes
+        /// cannot evict one victim twice and overshoot the limit.
+        closing: bool = false,
     };
 
     fn deinit(self: *Server) void {
@@ -1412,7 +1417,7 @@ pub const Server = struct {
             var count: usize = 0;
             var oldest: ?*TrackedConnection = null;
             for (self.active_connections.items) |*connection| {
-                if (connection.credential_node_id == id) {
+                if (connection.credential_node_id == id and !connection.closing) {
                     count += 1;
                     if (oldest == null) oldest = connection;
                 }
@@ -1430,6 +1435,7 @@ pub const Server = struct {
                         "({d} at limit)",
                     .{ self.node.identity.node_id, id, count },
                 );
+                oldest.?.closing = true;
                 oldest.?.stream.shutdown(self.io, .both) catch {};
             }
         }

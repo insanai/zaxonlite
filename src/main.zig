@@ -112,8 +112,9 @@ const usage_text =
     \\                      accepts that operational risk.
     \\  --retention-slots <n>  Keep the most recent n slots of journal
     \\                      history below the chosen trim (default 0).
-    \\  --journal-cap-bytes <n>  Refuse writes at this journal size rather
-    \\                      than delete unproven history (default 0: off).
+    \\  --journal-cap-bytes <n>  Refuse writes once journal plus payload
+    \\                      bytes reach n, rather than delete unproven
+    \\                      history (default 64 GiB; 0 disables).
     \\  --enable-failpoints Honor failpoint RPCs (test controllers only).
     \\  --segment-records <n>  Test-only journal segment size (64..16384);
     \\                      requires --enable-failpoints.
@@ -801,7 +802,8 @@ fn serveCommand(
         .allow_insecure_test_tcp = options.insecure_test_tcp,
         .mmap_size = options.mmap_size orelse 0,
         .retention_slots = options.retention_slots orelse 0,
-        .journal_cap_bytes = options.journal_cap_bytes orelse 0,
+        .journal_cap_bytes = options.journal_cap_bytes orelse
+            64 * 1024 * 1024 * 1024,
     }, err_out);
 }
 
