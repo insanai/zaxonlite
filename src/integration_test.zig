@@ -395,12 +395,17 @@ test "the storage ceiling refuses writes instead of deleting history" {
     const dir = try test_dir.nodeDir(gpa);
     defer gpa.free(dir);
 
-    // A cap this small covers journal plus payload bytes within a few
-    // writes; the refusal must be RecoveryRetentionExceeded, never a
-    // deletion of unproven history.
+    // A test-sized reserve stands in for the proven worst-case write
+    // growth, matching the tiny rows this scenario admits; the refusal
+    // must be RecoveryRetentionExceeded, never a deletion of unproven
+    // history, and admitted usage must never land above the cap.
+    const cap: u64 = 64 * 1024;
+    const saved_reserve = Node.admission_reserve_bytes;
+    Node.admission_reserve_bytes = 4 * 1024;
+    defer Node.admission_reserve_bytes = saved_reserve;
     const node = try Node.open(gpa, testing.io, .{
         .directory = dir,
-        .journal_cap_bytes = 64 * 1024,
+        .journal_cap_bytes = cap,
     });
     defer node.close();
     _ = try node.exec("create table t(id integer primary key, v text)");
@@ -412,8 +417,14 @@ test "the storage ceiling refuses writes instead of deleting history" {
             refused = true;
             break;
         };
+        const usage = node.journal.stats().journal_bytes +
+            node.store.retained_bytes;
+        try testing.expect(usage <= cap);
     }
     try testing.expect(refused);
+    const final_usage = node.journal.stats().journal_bytes +
+        node.store.retained_bytes;
+    try testing.expect(final_usage <= cap);
     try testing.expect(node.journal.retainedFirstSlot() == 1);
 }
 
