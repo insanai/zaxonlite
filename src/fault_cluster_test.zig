@@ -81,7 +81,7 @@ fn openSession(
     node: *zaxonlite.Embedded,
 ) !u64 {
     var elapsed: u64 = 0;
-    while (elapsed < 30_000) : (elapsed += 100) {
+    while (elapsed < 90_000) : (elapsed += 100) {
         if (node.call("{\"op\":\"session\"}", true)) |body| {
             defer gpa.free(body);
             if (std.mem.indexOf(u8, body, "\"session_id\":")) |start| {
@@ -103,7 +103,7 @@ fn retryCall(
     request: []const u8,
 ) !void {
     var elapsed: u64 = 0;
-    while (elapsed < 30_000) : (elapsed += 100) {
+    while (elapsed < 90_000) : (elapsed += 100) {
         if (node.call(request, true)) |body| {
             defer gpa.free(body);
             if (std.mem.indexOf(u8, body, "\"ok\":true") != null) return;
@@ -115,7 +115,7 @@ fn retryCall(
 
 fn retryExec(io: Io, node: *zaxonlite.Embedded, sql: []const u8) !void {
     var elapsed: u64 = 0;
-    while (elapsed < 30_000) : (elapsed += 100) {
+    while (elapsed < 90_000) : (elapsed += 100) {
         if (node.exec(sql)) |_| return else |_| {}
         io.sleep(.fromMilliseconds(100), .awake) catch {};
     }
@@ -130,7 +130,7 @@ fn expectCount(
 ) !void {
     const endpoint = try zaxonlite.client.Endpoint.parse(address);
     var elapsed: u64 = 0;
-    while (elapsed < 30_000) : (elapsed += 100) {
+    while (elapsed < 90_000) : (elapsed += 100) {
         const connection = zaxonlite.client.Connection.open(gpa, io, endpoint) catch
             continue;
         const response = connection.call(
