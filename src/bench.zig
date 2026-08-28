@@ -54,27 +54,9 @@ fn lagCheck(name: []const u8, samples: []const u64, lag: usize) LagCheck {
     return .{
         .name = name,
         .lag = lag,
-        .r = autocorrelation(samples, lag),
+        .r = zaxonlite.bench_stats.autocorrelation(samples, lag),
         .available = true,
     };
-}
-
-fn autocorrelation(samples: []const u64, lag: usize) f64 {
-    var mean: f64 = 0;
-    for (samples) |sample| mean += @floatFromInt(sample);
-    mean /= @floatFromInt(samples.len);
-    var denominator: f64 = 0;
-    for (samples) |sample| {
-        const centered = @as(f64, @floatFromInt(sample)) - mean;
-        denominator += centered * centered;
-    }
-    if (denominator == 0) return 0;
-    var numerator: f64 = 0;
-    for (samples[0 .. samples.len - lag], samples[lag..]) |early, late| {
-        numerator += (@as(f64, @floatFromInt(early)) - mean) *
-            (@as(f64, @floatFromInt(late)) - mean);
-    }
-    return numerator / denominator;
 }
 
 fn printLagCheck(check: LagCheck, series_len: usize) void {
@@ -232,6 +214,8 @@ fn benchWrites(gpa: std.mem.Allocator, io: std.Io, node: *Node, write_count: usi
     // per-exec timings.
     const interval_samples = try gpa.alloc(u64, write_count);
     defer gpa.free(interval_samples);
+    const anchored_flags = try gpa.alloc(bool, write_count);
+    defer gpa.free(anchored_flags);
     const anchor_every = @max(write_count / 8, 32);
     var anchor_events: usize = 0;
     var anchor_duty_ns: u128 = 0;
@@ -248,12 +232,15 @@ fn benchWrites(gpa: std.mem.Allocator, io: std.Io, node: *Node, write_count: usi
         _ = try node.exec(sql);
         const exec_done = nowNs(io);
         write_samples[index] = @intCast(exec_done - op_start);
+        var iteration_anchored = false;
         if ((index + 1) % anchor_every == 0) {
             try node.createStateAnchor();
-            anchor_events += 1;
+            iteration_anchored = true;
         } else if (try node.maybeCreateStateAnchor()) {
-            anchor_events += 1;
+            iteration_anchored = true;
         }
+        if (iteration_anchored) anchor_events += 1;
+        anchored_flags[index] = iteration_anchored;
         const completion = nowNs(io);
         anchor_duty_ns += @intCast(completion - exec_done);
         interval_samples[index] = @intCast(completion - last_completion);
@@ -277,6 +264,7 @@ fn benchWrites(gpa: std.mem.Allocator, io: std.Io, node: *Node, write_count: usi
     reportWriteRun(
         interval_samples,
         write_samples,
+        anchored_flags,
         write_elapsed,
         anchor_duty_ns,
         anchor_events,
@@ -294,6 +282,7 @@ fn benchWrites(gpa: std.mem.Allocator, io: std.Io, node: *Node, write_count: usi
 fn reportWriteRun(
     interval_samples: []u64,
     write_samples: []u64,
+    anchored_flags: []const bool,
     write_elapsed: i96,
     anchor_duty_ns: u128,
     anchor_events: usize,
@@ -301,7 +290,10 @@ fn reportWriteRun(
 ) void {
     const duty_percent = @as(f64, @floatFromInt(anchor_duty_ns)) * 100.0 /
         @as(f64, @floatFromInt(@max(write_elapsed, 1)));
-    const shift = anchorShift(interval_samples, anchor_every);
+    const shift = zaxonlite.bench_stats.pairedAnchorShift(
+        interval_samples,
+        anchored_flags,
+    );
     printRow("write", write_samples.len, write_elapsed, Stats.compute(write_samples));
     const interval_stats = Stats.compute(interval_samples);
     printRow("write+duties", interval_samples.len, write_elapsed, interval_stats);
@@ -311,32 +303,10 @@ fn reportWriteRun(
         .{ anchor_events, anchor_every, duty_percent },
     );
     std.debug.print(
-        "anchor-iteration shift: median {d} us over adjacent plain " ++
-            "iterations\n",
+        "anchor-iteration shift: median {d} us over the nearest plain " ++
+            "iteration (nonnegative, zero-censored)\n",
         .{shift / std.time.ns_per_us},
     );
-}
-
-/// Median of the per-anchor paired deltas: each anchor-bearing
-/// iteration minus the plain iteration immediately before it
-/// (`index - 1` is always plain, since anchors fire only where
-/// `(index + 1) % anchor_every == 0`). Pairing adjacent iterations
-/// keeps warm-up drift out of the estimate, and the median of paired
-/// deltas is the per-anchor added cost, which a difference of two
-/// medians is not.
-fn anchorShift(intervals: []const u64, anchor_every: usize) u64 {
-    var deltas: [64]u64 = undefined;
-    var count: usize = 0;
-    for (intervals, 0..) |interval, index| {
-        if ((index + 1) % anchor_every != 0) continue;
-        if (index == 0) continue;
-        if (count == deltas.len) break;
-        deltas[count] = interval -| intervals[index - 1];
-        count += 1;
-    }
-    if (count == 0) return 0;
-    std.mem.sort(u64, deltas[0..count], {}, std.sort.asc(u64));
-    return deltas[count / 2];
 }
 
 fn benchReads(
