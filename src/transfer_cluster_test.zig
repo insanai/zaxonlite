@@ -574,7 +574,7 @@ fn runScenario(cluster: *Cluster) !void {
         // The retired voter can linger as the advertised leader for a
         // few ticks after the handover; issue the token through a
         // surviving configuration-2 leader, not a fixed node.
-        const issuer_index = waitForSurvivorLeader(cluster, endpoints, 60_000);
+        const issuer_index = waitForSurvivorLeader(cluster, &endpoints, 60_000);
         var endpoint_buffer: [32]u8 = undefined;
         const issuer = std.fmt.bufPrint(
             &endpoint_buffer,

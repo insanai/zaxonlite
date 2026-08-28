@@ -234,6 +234,7 @@ fn benchWrites(gpa: std.mem.Allocator, io: std.Io, node: *Node, write_count: usi
     defer gpa.free(interval_samples);
     const anchor_every = @max(write_count / 8, 32);
     var anchor_events: usize = 0;
+    var anchor_duty_ns: u128 = 0;
     var sql_buffer: [160]u8 = undefined;
     const write_start = nowNs(io);
     var last_completion = write_start;
@@ -245,7 +246,8 @@ fn benchWrites(gpa: std.mem.Allocator, io: std.Io, node: *Node, write_count: usi
         ) catch unreachable;
         const op_start = nowNs(io);
         _ = try node.exec(sql);
-        write_samples[index] = @intCast(nowNs(io) - op_start);
+        const exec_done = nowNs(io);
+        write_samples[index] = @intCast(exec_done - op_start);
         if ((index + 1) % anchor_every == 0) {
             try node.createStateAnchor();
             anchor_events += 1;
@@ -253,6 +255,7 @@ fn benchWrites(gpa: std.mem.Allocator, io: std.Io, node: *Node, write_count: usi
             anchor_events += 1;
         }
         const completion = nowNs(io);
+        anchor_duty_ns += @intCast(completion - exec_done);
         interval_samples[index] = @intCast(completion - last_completion);
         last_completion = completion;
     }
@@ -272,9 +275,10 @@ fn benchWrites(gpa: std.mem.Allocator, io: std.Io, node: *Node, write_count: usi
     const rotation_lag = zaxonlite.segment.rotation_records / journal_records_per_write;
     const rotation_check = lagCheck("segment-rotation", write_samples, rotation_lag);
     reportWriteRun(
-        write_samples,
         interval_samples,
+        write_samples,
         write_elapsed,
+        anchor_duty_ns,
         anchor_events,
         anchor_every,
     );
@@ -284,20 +288,18 @@ fn benchWrites(gpa: std.mem.Allocator, io: std.Io, node: *Node, write_count: usi
     return control_check.available and control_check.r > periodicity_flag;
 }
 
-/// Prints both latency rows plus the anchor duty cycle and the shift
-/// between anchor-bearing and plain iterations: the magnitudes the
-/// correlation only hints at.
+/// Prints both latency rows plus the directly timed anchor duty cycle
+/// and the shift between anchor-bearing and adjacent plain iterations:
+/// the magnitudes the correlation only hints at.
 fn reportWriteRun(
-    write_samples: []u64,
     interval_samples: []u64,
+    write_samples: []u64,
     write_elapsed: i96,
+    anchor_duty_ns: u128,
     anchor_events: usize,
     anchor_every: usize,
 ) void {
-    var exec_total: u128 = 0;
-    for (write_samples) |sample| exec_total += sample;
-    const duties_ns = @as(u128, @intCast(write_elapsed)) -| exec_total;
-    const duty_percent = @as(f64, @floatFromInt(duties_ns)) * 100.0 /
+    const duty_percent = @as(f64, @floatFromInt(anchor_duty_ns)) * 100.0 /
         @as(f64, @floatFromInt(@max(write_elapsed, 1)));
     const shift = anchorShift(interval_samples, anchor_every);
     printRow("write", write_samples.len, write_elapsed, Stats.compute(write_samples));
@@ -305,39 +307,38 @@ fn reportWriteRun(
     printRow("write+duties", interval_samples.len, write_elapsed, interval_stats);
     std.debug.print(
         "anchor events:     {d} during the write run (forced every {d} " ++
-            "writes); anchor+pump duty cycle {d:.1}%\n",
+            "writes); anchor+pump duty cycle {d:.1}% (directly timed)\n",
         .{ anchor_events, anchor_every, duty_percent },
     );
     std.debug.print(
-        "anchor-iteration shift: median {d} us over plain iterations\n",
+        "anchor-iteration shift: median {d} us over adjacent plain " ++
+            "iterations\n",
         .{shift / std.time.ns_per_us},
     );
 }
 
 /// Median inter-completion time of anchor-bearing iterations minus the
-/// median of plain iterations: the direct cost an anchor adds.
+/// median of the plain iterations immediately preceding each anchor:
+/// adjacent sampling keeps warm-up drift out of the comparison.
 fn anchorShift(intervals: []const u64, anchor_every: usize) u64 {
     var anchored: [64]u64 = undefined;
     var anchored_count: usize = 0;
-    var plain_probe: [256]u64 = undefined;
+    var plain: [64]u64 = undefined;
     var plain_count: usize = 0;
     for (intervals, 0..) |interval, index| {
-        if ((index + 1) % anchor_every == 0) {
-            if (anchored_count < anchored.len) {
-                anchored[anchored_count] = interval;
-                anchored_count += 1;
-            }
-        } else if (plain_count < plain_probe.len) {
-            plain_probe[plain_count] = interval;
+        if ((index + 1) % anchor_every != 0) continue;
+        if (anchored_count == anchored.len) break;
+        anchored[anchored_count] = interval;
+        anchored_count += 1;
+        if (index >= 2) {
+            plain[plain_count] = intervals[index - 2];
             plain_count += 1;
         }
     }
     if (anchored_count == 0 or plain_count == 0) return 0;
     std.mem.sort(u64, anchored[0..anchored_count], {}, std.sort.asc(u64));
-    std.mem.sort(u64, plain_probe[0..plain_count], {}, std.sort.asc(u64));
-    const anchored_median = anchored[anchored_count / 2];
-    const plain_median = plain_probe[plain_count / 2];
-    return anchored_median -| plain_median;
+    std.mem.sort(u64, plain[0..plain_count], {}, std.sort.asc(u64));
+    return anchored[anchored_count / 2] -| plain[plain_count / 2];
 }
 
 fn benchReads(
