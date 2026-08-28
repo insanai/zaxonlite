@@ -291,6 +291,29 @@ fn waitForConfiguration(
     });
 }
 
+/// Waits until a surviving voter (node 1 or 2) is the known leader and
+/// returns its node index; the retired voter may be advertised for a
+/// few ticks after the handover.
+fn waitForSurvivorLeader(
+    cluster: *Cluster,
+    endpoints: []const Endpoint,
+    deadline_ms: u64,
+) usize {
+    var elapsed: u64 = 0;
+    while (elapsed <= deadline_ms) {
+        for (endpoints[0..2]) |endpoint| {
+            if (statusInt(cluster, endpoint, "leader")) |leader| {
+                if (leader == 1 or leader == 2) {
+                    return @intCast(leader - 1);
+                }
+            }
+        }
+        elapsed += 250;
+        cluster.io.sleep(.fromMilliseconds(250), .awake) catch {};
+    }
+    fail(cluster, "no surviving voter became leader", .{});
+}
+
 fn waitForLeader(cluster: *Cluster, endpoint: Endpoint, deadline_ms: u64) u32 {
     var elapsed: u64 = 0;
     while (elapsed <= deadline_ms) {
@@ -338,11 +361,13 @@ fn countRows(
 }
 
 fn runProgram(io: Io, argv: []const []const u8) !void {
+    // Inherit stderr so a failing child leaves its diagnostic in the
+    // controller's output instead of vanishing.
     var child = try std.process.spawn(io, .{
         .argv = argv,
         .stdin = .ignore,
         .stdout = .ignore,
-        .stderr = .ignore,
+        .stderr = .inherit,
     });
     const term = try child.wait(io);
     if (term != .exited or term.exited != 0) return error.ProgramFailed;
@@ -546,11 +571,15 @@ fn runScenario(cluster: *Cluster) !void {
     const identity_dir = try std.fmt.allocPrint(gpa, "{s}/n4-id", .{cluster.root});
     defer gpa.free(identity_dir);
     {
+        // The retired voter can linger as the advertised leader for a
+        // few ticks after the handover; issue the token through a
+        // surviving configuration-2 leader, not a fixed node.
+        const issuer_index = waitForSurvivorLeader(cluster, endpoints, 60_000);
         var endpoint_buffer: [32]u8 = undefined;
         const issuer = std.fmt.bufPrint(
             &endpoint_buffer,
             "127.0.0.1:{d}",
-            .{cluster.nodes[0].port},
+            .{cluster.nodes[issuer_index].port},
         ) catch unreachable;
         const admin_cert = try std.fmt.allocPrint(gpa, "{s}/admin.crt", .{cluster.root});
         defer gpa.free(admin_cert);
