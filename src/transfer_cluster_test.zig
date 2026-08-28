@@ -611,27 +611,6 @@ fn waitFailpointExit(
     fail(cluster, "node {d} never hit {s}", .{ cluster.nodes[index].id, name });
 }
 
-/// Waits, bounded, for whichever of nodes 0 and 1 dies at `name` first
-/// and returns its index; both must be armed by the caller.
-fn waitEitherFailpoint(
-    cluster: *Cluster,
-    name: []const u8,
-    deadline_ms: u64,
-) usize {
-    var elapsed: u64 = 0;
-    while (elapsed <= deadline_ms) {
-        for (0..2) |index| {
-            if (logHasFailpoint(cluster, index, name)) {
-                cluster.waitNodeExit(index);
-                return index;
-            }
-        }
-        elapsed += 250;
-        cluster.io.sleep(.fromMilliseconds(250), .awake) catch {};
-    }
-    fail(cluster, "no survivor hit {s}", .{name});
-}
-
 /// The join crash ladder: the receiver dies at every stateless-phase
 /// transfer failpoint in sequence, the sender is killed mid-copy on one
 /// rung with another peer completing the send, and the final clean start
@@ -669,29 +648,20 @@ fn runJoinLadder(cluster: *Cluster, endpoints: []const Endpoint) !void {
     waitFailpointExit(cluster, 3, "after_transfer_install", 420_000);
 
     step("sender dies mid-copy while pinning; another peer completes the send");
-    // Connection readiness decides which survivor the joiner's first
-    // probe selects, so both are armed; whichever pins first dies, and
-    // the other is disarmed before the receiver's retry reaches it.
-    // The receiver is armed to die between the durable anchor and the
-    // in-memory resume, which also ends the stateless phase.
-    for (0..2) |index| {
-        gpa.free(mustCallAny(
-            cluster,
-            endpoints[index .. index + 1],
-            "{\"op\":\"failpoint\",\"name\":\"during_transfer_pin\"}",
-            30_000,
-        ));
-    }
+    // Node 1 restarts with the pin failpoint in its environment, the
+    // same mechanism every receiver rung trusts: it cannot be lost or
+    // disarmed by timing. The joiner's recovery probe retreats until a
+    // snapshot request is actually sent, and the rotation starts at the
+    // lowest registry peer, so the first served request always lands on
+    // node 1; it dies mid-copy, the receiver waits out its source pin,
+    // and node 2 completes the send. The receiver is armed to die
+    // between the durable anchor and the in-memory resume, which also
+    // ends the stateless phase.
+    cluster.killNode(0);
+    try cluster.spawnNode(0, &updated_ids, &updated_ports, "during_transfer_pin");
     try cluster.spawnNode(3, &updated_ids, &updated_ports, "after_transfer_anchor");
-    const dead = waitEitherFailpoint(cluster, "during_transfer_pin", 180_000);
-    const other: usize = 1 - dead;
-    gpa.free(mustCallAny(
-        cluster,
-        endpoints[other .. other + 1],
-        "{\"op\":\"failpoint\"}",
-        30_000,
-    ));
-    try cluster.spawnNode(dead, &updated_ids, &updated_ports, null);
+    waitFailpointExit(cluster, 0, "during_transfer_pin", 180_000);
+    try cluster.spawnNode(0, &updated_ids, &updated_ports, null);
     waitFailpointExit(cluster, 3, "after_transfer_anchor", 300_000);
 
     step("clean start converges from the installed anchor");
