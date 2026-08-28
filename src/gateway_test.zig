@@ -9,7 +9,7 @@ const secret = "gateway-test-secret-at-least-32-bytes";
 pub fn main(init: std.process.Init) !u8 {
     const gpa = init.gpa;
     const io = init.io;
-    var args = std.process.Args.Iterator.init(init.minimal.args);
+    var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, gpa);
     defer args.deinit();
     _ = args.next();
     const zaxon = args.next() orelse return 2;
