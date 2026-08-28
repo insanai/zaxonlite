@@ -106,7 +106,7 @@ fn printControlCheck(check: LagCheck, series_len: usize) void {
         );
         return;
     }
-    const verdict = if (@abs(check.r) > periodicity_flag)
+    const verdict = if (check.r > periodicity_flag)
         "  (positive control: anchors visible)"
     else
         "  ANCHORS INVISIBLE - instrument broken";
@@ -204,13 +204,21 @@ pub fn main(init: std.process.Init) !u8 {
     var node = try Node.open(gpa, io, .{ .directory = root });
     _ = try node.exec("create table b(id integer primary key, k integer, v text)");
 
-    try benchWrites(gpa, io, node, write_count);
+    const control_ok = try benchWrites(gpa, io, node, write_count);
     try benchReads(gpa, io, node, read_count, write_count);
     try benchRecovery(gpa, io, &node, root, write_count);
+    if (!control_ok) {
+        std.debug.print(
+            "FAILED: the anchor positive control did not register; the " ++
+                "periodicity instrument is broken\n",
+            .{},
+        );
+        return 1;
+    }
     return 0;
 }
 
-fn benchWrites(gpa: std.mem.Allocator, io: std.Io, node: *Node, write_count: usize) !void {
+fn benchWrites(gpa: std.mem.Allocator, io: std.Io, node: *Node, write_count: usize) !bool {
     const write_samples = try gpa.alloc(u64, write_count);
     defer gpa.free(write_samples);
     // Anchors on the natural cadence would need 10,000 slots or 30
@@ -252,9 +260,9 @@ fn benchWrites(gpa: std.mem.Allocator, io: std.Io, node: *Node, write_count: usi
     // Both checks read the series in time order, before Stats.compute
     // sorts it into order statistics.
     // The inter-completion series carries the anchor cost itself: the
-    // forced cadence must register there (positive control). The bare
-    // per-exec series answers the gate question -- whether anchoring
-    // degrades the writes around it.
+    // forced cadence must register there with positive correlation
+    // (positive control). The bare per-exec series answers the gate
+    // question -- whether anchoring degrades the writes around it.
     const control_check = lagCheck(
         "anchor-cost visibility",
         interval_samples,
@@ -263,14 +271,73 @@ fn benchWrites(gpa: std.mem.Allocator, io: std.Io, node: *Node, write_count: usi
     const anchor_check = lagCheck("anchor-interval", write_samples, anchor_every);
     const rotation_lag = zaxonlite.segment.rotation_records / journal_records_per_write;
     const rotation_check = lagCheck("segment-rotation", write_samples, rotation_lag);
-    printRow("write", write_count, write_elapsed, Stats.compute(write_samples));
-    std.debug.print(
-        "anchor events:     {d} during the write run (forced every {d} writes)\n",
-        .{ anchor_events, anchor_every },
+    reportWriteRun(
+        write_samples,
+        interval_samples,
+        write_elapsed,
+        anchor_events,
+        anchor_every,
     );
     printControlCheck(control_check, write_count);
     printLagCheck(anchor_check, write_count);
     printLagCheck(rotation_check, write_count);
+    return control_check.available and control_check.r > periodicity_flag;
+}
+
+/// Prints both latency rows plus the anchor duty cycle and the shift
+/// between anchor-bearing and plain iterations: the magnitudes the
+/// correlation only hints at.
+fn reportWriteRun(
+    write_samples: []u64,
+    interval_samples: []u64,
+    write_elapsed: i96,
+    anchor_events: usize,
+    anchor_every: usize,
+) void {
+    var exec_total: u128 = 0;
+    for (write_samples) |sample| exec_total += sample;
+    const duties_ns = @as(u128, @intCast(write_elapsed)) -| exec_total;
+    const duty_percent = @as(f64, @floatFromInt(duties_ns)) * 100.0 /
+        @as(f64, @floatFromInt(@max(write_elapsed, 1)));
+    const shift = anchorShift(interval_samples, anchor_every);
+    printRow("write", write_samples.len, write_elapsed, Stats.compute(write_samples));
+    const interval_stats = Stats.compute(interval_samples);
+    printRow("write+duties", interval_samples.len, write_elapsed, interval_stats);
+    std.debug.print(
+        "anchor events:     {d} during the write run (forced every {d} " ++
+            "writes); anchor+pump duty cycle {d:.1}%\n",
+        .{ anchor_events, anchor_every, duty_percent },
+    );
+    std.debug.print(
+        "anchor-iteration shift: median {d} us over plain iterations\n",
+        .{shift / std.time.ns_per_us},
+    );
+}
+
+/// Median inter-completion time of anchor-bearing iterations minus the
+/// median of plain iterations: the direct cost an anchor adds.
+fn anchorShift(intervals: []const u64, anchor_every: usize) u64 {
+    var anchored: [64]u64 = undefined;
+    var anchored_count: usize = 0;
+    var plain_probe: [256]u64 = undefined;
+    var plain_count: usize = 0;
+    for (intervals, 0..) |interval, index| {
+        if ((index + 1) % anchor_every == 0) {
+            if (anchored_count < anchored.len) {
+                anchored[anchored_count] = interval;
+                anchored_count += 1;
+            }
+        } else if (plain_count < plain_probe.len) {
+            plain_probe[plain_count] = interval;
+            plain_count += 1;
+        }
+    }
+    if (anchored_count == 0 or plain_count == 0) return 0;
+    std.mem.sort(u64, anchored[0..anchored_count], {}, std.sort.asc(u64));
+    std.mem.sort(u64, plain_probe[0..plain_count], {}, std.sort.asc(u64));
+    const anchored_median = anchored[anchored_count / 2];
+    const plain_median = plain_probe[plain_count / 2];
+    return anchored_median -| plain_median;
 }
 
 fn benchReads(
