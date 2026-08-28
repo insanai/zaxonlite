@@ -736,16 +736,20 @@ fn runJoinLadder(cluster: *Cluster, endpoints: []const Endpoint) !void {
 /// same data frontier must agree on every field.
 const Fingerprint = struct {
     rows: i64,
-    id_sum: i64,
-    len_sum: i64,
+    content: [32]u8,
     chain: [64]u8,
 };
 
 fn replicaFingerprint(cluster: *Cluster, endpoint: Endpoint) ?Fingerprint {
     const single = [_]Endpoint{endpoint};
+    // The canonical ordered row encoding: every id with its value type
+    // and exact bytes, so a materialization error that preserves counts
+    // and lengths still changes the digest.
     const body = rpcTry(cluster, single[0], "{\"op\":\"query\"," ++
-        "\"sql\":\"select count(*), coalesce(sum(id),0), " ++
-        "coalesce(sum(length(v)),0) from t\",\"level\":\"any\"}") orelse
+        "\"sql\":\"select count(*), coalesce(group_concat(" ++
+        "id || ':' || typeof(v) || ':' || hex(v), ','), '') " ++
+        "from (select id, v from t order by id)\"," ++
+        "\"level\":\"any\"}") orelse
         return null;
     defer cluster.gpa.free(body);
     const parsed = parse(cluster, body);
@@ -754,13 +758,17 @@ fn replicaFingerprint(cluster: *Cluster, endpoint: Endpoint) ?Fingerprint {
     const rows = field(&parsed, "rows") orelse return null;
     if (rows != .array or rows.array.items.len != 1) return null;
     const cells = rows.array.items[0];
-    if (cells != .array or cells.array.items.len != 3) return null;
+    if (cells != .array or cells.array.items.len != 2) return null;
+    const encoded = switch (cells.array.items[1]) {
+        .string => |text| text,
+        else => return null,
+    };
     var print = Fingerprint{
         .rows = jsonInt(cells.array.items[0]) orelse return null,
-        .id_sum = jsonInt(cells.array.items[1]) orelse return null,
-        .len_sum = jsonInt(cells.array.items[2]) orelse return null,
+        .content = undefined,
         .chain = undefined,
     };
+    std.crypto.hash.sha2.Sha256.hash(encoded, &print.content, .{});
     const status = rpcTry(cluster, single[0], "{\"op\":\"status\"}") orelse
         return null;
     defer cluster.gpa.free(status);
@@ -803,8 +811,7 @@ fn waitReplicaMatch(
         if (replicaFingerprint(cluster, endpoint)) |print| {
             if (print.rows == rows) {
                 if (reference) |expected| {
-                    if (print.id_sum != expected.id_sum or
-                        print.len_sum != expected.len_sum or
+                    if (!std.mem.eql(u8, &print.content, &expected.content) or
                         !std.mem.eql(u8, &print.chain, &expected.chain))
                     {
                         fail(cluster, "port {d} diverges from its peers", .{
