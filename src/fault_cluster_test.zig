@@ -51,26 +51,96 @@ pub fn main(init: std.process.Init) !u8 {
         });
     }
 
-    try retryExec(io, nodes[0].?, "create table f(id integer primary key, v text)");
-    var sql_buffer: [128]u8 = undefined;
+    try retryExec(
+        io,
+        nodes[0].?,
+        "create table if not exists f(id integer primary key, v text)",
+    );
+    // Retried writes must be sessioned: under frame loss an acknowledged
+    // failure is ambiguous, and only the session sequence makes the retry
+    // exactly-once.
+    const session_id = try openSession(gpa, io, nodes[0].?);
+    var request_buffer: [192]u8 = undefined;
     for (0..30) |index| {
-        const sql = std.fmt.bufPrint(
-            &sql_buffer,
-            "insert into f(v) values ('value-{d}')",
-            .{index},
+        const request = std.fmt.bufPrint(
+            &request_buffer,
+            "{{\"op\":\"exec\",\"sql\":\"insert into f(v) values ('value-{d}')\"," ++
+                "\"session\":{d},\"sequence\":{d}}}",
+            .{ index, session_id, index + 1 },
         ) catch unreachable;
-        try retryExec(io, nodes[index % nodes.len].?, sql);
+        try retryCall(gpa, io, nodes[index % nodes.len].?, request);
     }
     for (members) |member| try expectCount(gpa, io, member.address, 30);
     std.debug.print("fault cluster: loss/duplicate/reorder/fragment/slow-sync passed\n", .{});
     return 0;
 }
 
+/// A wall-clock retry deadline: the fault schedule and a loaded host
+/// both stretch attempts, so budgets count real time, and every
+/// unsuccessful attempt sleeps before the next.
+const Deadline = struct {
+    io: Io,
+    end_ns: i96,
+
+    fn start(io: Io, budget_ms: u64) Deadline {
+        const now = std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds;
+        return .{
+            .io = io,
+            .end_ns = now + @as(i96, budget_ms) * std.time.ns_per_ms,
+        };
+    }
+
+    /// Sleeps one poll interval; returns false once the budget is spent.
+    fn tick(self: *const Deadline) bool {
+        self.io.sleep(.fromMilliseconds(100), .awake) catch {};
+        const now = std.Io.Clock.Timestamp.now(self.io, .awake).raw.nanoseconds;
+        return now < self.end_ns;
+    }
+};
+
+fn openSession(
+    gpa: std.mem.Allocator,
+    io: Io,
+    node: *zaxonlite.Embedded,
+) !u64 {
+    const deadline = Deadline.start(io, 90_000);
+    while (true) {
+        if (node.call("{\"op\":\"session\"}", true)) |body| {
+            defer gpa.free(body);
+            if (std.mem.indexOf(u8, body, "\"session_id\":")) |start| {
+                const digits = body[start + 13 ..];
+                const end = std.mem.indexOfAny(u8, digits, ",}") orelse digits.len;
+                return std.fmt.parseInt(u64, digits[0..end], 10) catch
+                    error.InvalidResponse;
+            }
+        } else |_| {}
+        if (!deadline.tick()) break;
+    }
+    return error.ClusterWriteTimeout;
+}
+
+fn retryCall(
+    gpa: std.mem.Allocator,
+    io: Io,
+    node: *zaxonlite.Embedded,
+    request: []const u8,
+) !void {
+    const deadline = Deadline.start(io, 90_000);
+    while (true) {
+        if (node.call(request, true)) |body| {
+            defer gpa.free(body);
+            if (std.mem.indexOf(u8, body, "\"ok\":true") != null) return;
+        } else |_| {}
+        if (!deadline.tick()) break;
+    }
+    return error.ClusterWriteTimeout;
+}
+
 fn retryExec(io: Io, node: *zaxonlite.Embedded, sql: []const u8) !void {
-    var elapsed: u64 = 0;
-    while (elapsed < 30_000) : (elapsed += 100) {
+    const deadline = Deadline.start(io, 90_000);
+    while (true) {
         if (node.exec(sql)) |_| return else |_| {}
-        io.sleep(.fromMilliseconds(100), .awake) catch {};
+        if (!deadline.tick()) break;
     }
     return error.ClusterWriteTimeout;
 }
@@ -82,15 +152,18 @@ fn expectCount(
     expected: usize,
 ) !void {
     const endpoint = try zaxonlite.client.Endpoint.parse(address);
-    var elapsed: u64 = 0;
-    while (elapsed < 30_000) : (elapsed += 100) {
-        const connection = zaxonlite.client.Connection.open(gpa, io, endpoint) catch
+    const deadline = Deadline.start(io, 90_000);
+    while (true) {
+        const connection = zaxonlite.client.Connection.open(gpa, io, endpoint) catch {
+            if (!deadline.tick()) break;
             continue;
+        };
         const response = connection.call(
             "{\"op\":\"query\",\"sql\":\"select count(*) from f\"," ++
                 "\"level\":\"any\"}",
         ) catch {
             connection.close();
+            if (!deadline.tick()) break;
             continue;
         };
         connection.close();
@@ -102,7 +175,7 @@ fn expectCount(
             .{expected},
         ) catch unreachable;
         if (std.mem.indexOf(u8, response, expected_text) != null) return;
-        io.sleep(.fromMilliseconds(100), .awake) catch {};
+        if (!deadline.tick()) break;
     }
     return error.ReplicaCatchUpTimeout;
 }

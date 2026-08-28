@@ -5,14 +5,15 @@
 //! the committed frame count after every commit; the frames between the
 //! previous and new count are read directly from the `-wal` file. Rolled
 //! back transactions never advance the hook count, so their frames are never
-//! captured. Checkpoints happen only at snapshot boundaries, after which
-//! capture restarts at frame zero.
+//! captured. Checkpoints happen only at state-anchor boundaries, after
+//! which capture restarts at frame zero.
 //!
 //! Apply technique: a committed payload is applied offline by writing each
 //! frame's page image at `(page_number - 1) * page_size` and truncating the
 //! database file to the commit frame's page count. Given the same base image
 //! and the same frame bytes this transition is deterministic; it is how a
-//! materialized SQLite image is rebuilt from snapshot plus journal suffix.
+//! materialized SQLite image is rebuilt from the durable anchor plus the
+//! retained journal suffix.
 
 const std = @import("std");
 const Io = std.Io;

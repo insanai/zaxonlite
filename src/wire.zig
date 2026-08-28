@@ -22,17 +22,16 @@ const paxos = @import("paxos");
 const types = @import("types.zig");
 const command = @import("command.zig");
 
-/// Version 8 adds an explicit durable-installation announcement for a
-/// replacement voter. A TCP connection alone never implies readiness.
-/// Version 7 added decided-registry membership: checkpoint proof v2 with
-/// sealed and next voter sets, the next-registry digest, and the voter
-/// replacement operation surface.
-/// Version 6 added the bounded one-time-token/CSR enrollment exchange.
-/// Version 5 added voter quorum confirmation for transferred checkpoint
-/// proofs. Older peers are deliberately rejected:
-/// silently falling back would turn a configuration error into a security
-/// downgrade.
-pub const protocol_version: u16 = 8;
+/// Version 9 is the ZDS 0011 format cut: 64-bit global slots on every
+/// frame, the chunked PromiseRange phase-one reply, bounded range
+/// recovery, and durable-state reports. It shares no frames with v8 and
+/// there is deliberately no bridge.
+/// Version 8 added an explicit durable-installation announcement for a
+/// replacement voter. Version 7 added decided-registry membership;
+/// version 6 the enrollment exchange; version 5 quorum-confirmed proofs.
+/// Older peers are deliberately rejected: silently falling back would
+/// turn a configuration error into a security downgrade.
+pub const protocol_version: u16 = 9;
 
 /// Upper bound for one frame body; larger frames are a protocol error.
 pub const max_frame_bytes: u32 = 64 * 1024 * 1024;
@@ -74,6 +73,9 @@ pub const FrameKind = enum(u8) {
     registry_request = 25,
     registry_data = 26,
     installation_ready = 27,
+    state_report = 28,
+    range_request = 29,
+    range_data = 30,
 };
 
 /// A replacement sends this only after its snapshot and decided registry
@@ -279,11 +281,11 @@ pub const LearnerHeartbeat = struct {
     configuration_id: u64,
     decided_through: paxos.Slot,
 
-    pub const encoded_size = 8 + 4;
+    pub const encoded_size = 8 + 8;
 
     pub fn encode(self: LearnerHeartbeat, buffer: *[encoded_size]u8) []const u8 {
         std.mem.writeInt(u64, buffer[0..8], self.configuration_id, .little);
-        std.mem.writeInt(u32, buffer[8..12], self.decided_through, .little);
+        std.mem.writeInt(u64, buffer[8..16], self.decided_through, .little);
         return buffer;
     }
 
@@ -293,7 +295,7 @@ pub const LearnerHeartbeat = struct {
         if (configuration_id == 0) return error.InvalidFrame;
         return .{
             .configuration_id = configuration_id,
-            .decided_through = std.mem.readInt(u32, body[8..12], .little),
+            .decided_through = std.mem.readInt(u64, body[8..16], .little),
         };
     }
 };
@@ -306,7 +308,7 @@ pub const LearnerCommit = struct {
     pub fn encode(self: LearnerCommit, buffer: *[encoded_max]u8) []const u8 {
         var cursor = types.Cursor{ .buffer = buffer };
         cursor.int(u64, self.configuration_id);
-        cursor.int(u32, self.slot);
+        cursor.int(u64, self.slot);
         types.encodeEntry(self.entry, &cursor);
         return buffer[0..cursor.offset];
     }
@@ -314,7 +316,7 @@ pub const LearnerCommit = struct {
     pub fn decode(body: []const u8) WireError!LearnerCommit {
         var reader = types.ReadCursor{ .buffer = body };
         const configuration_id = try reader.int(u64);
-        const slot = try reader.int(u32);
+        const slot = try reader.int(u64);
         const entry = try types.decodeEntry(&reader);
         if (configuration_id == 0 or slot == 0 or reader.offset != body.len) {
             return error.InvalidFrame;
@@ -326,7 +328,7 @@ pub const LearnerCommit = struct {
         };
     }
 
-    pub const encoded_max = 8 + 4 + types.max_entry_size;
+    pub const encoded_max = 8 + 8 + types.max_entry_size;
 };
 
 pub const BackupBegin = struct {
@@ -403,7 +405,7 @@ pub const Hello = struct {
 const MessageTag = enum(u8) {
     prepare = 0,
     promise = 1,
-    promise_done = 2,
+    promise_range = 2,
     accept = 3,
     accepted = 4,
     commit = 5,
@@ -423,55 +425,89 @@ pub fn encodeEnvelope(
         .prepare => |m| {
             cursor.byte(@intFromEnum(MessageTag.prepare));
             types.encodeBallot(m.ballot, &cursor);
-            cursor.int(u32, m.decided_through);
+            cursor.int(u64, m.first);
         },
         .promise => |m| {
             cursor.byte(@intFromEnum(MessageTag.promise));
             types.encodeBallot(m.ballot, &cursor);
-            cursor.int(u32, m.slot);
+            cursor.int(u64, m.slot);
             types.encodeBallot(m.accepted.ballot, &cursor);
             types.encodeEntry(m.accepted.value, &cursor);
         },
-        .promise_done => |m| {
-            cursor.byte(@intFromEnum(MessageTag.promise_done));
+        .promise_range => |m| {
+            cursor.byte(@intFromEnum(MessageTag.promise_range));
             types.encodeBallot(m.ballot, &cursor);
+            cursor.int(u64, m.anchor.trim_id);
+            cursor.int(u64, m.anchor.chosen_trim_slot);
+            cursor.bytes(&m.anchor.history_hash);
+            cursor.int(u64, m.chosen_through);
+            cursor.int(u64, m.first);
+            cursor.int(u64, m.last);
             cursor.int(u32, m.accepted_count);
-            cursor.int(u32, m.decided_through);
+            cursor.byte(@intFromBool(m.more));
         },
         .accept => |m| {
             cursor.byte(@intFromEnum(MessageTag.accept));
             types.encodeBallot(m.ballot, &cursor);
-            cursor.int(u32, m.slot);
+            cursor.int(u64, m.slot);
             types.encodeEntry(m.value, &cursor);
         },
         .accepted => |m| {
             cursor.byte(@intFromEnum(MessageTag.accepted));
             types.encodeBallot(m.ballot, &cursor);
-            cursor.int(u32, m.slot);
-            cursor.int(u32, m.decided_through);
+            cursor.int(u64, m.slot);
+            cursor.int(u64, m.decided_through);
         },
         .commit => |m| {
             cursor.byte(@intFromEnum(MessageTag.commit));
-            cursor.int(u32, m.slot);
+            cursor.int(u64, m.slot);
             types.encodeEntry(m.value, &cursor);
         },
         .learn => |m| {
             cursor.byte(@intFromEnum(MessageTag.learn));
-            cursor.int(u32, m.from_slot);
+            cursor.int(u64, m.from_slot);
+            cursor.int(u32, m.count);
         },
         .nack => |m| {
             cursor.byte(@intFromEnum(MessageTag.nack));
             types.encodeBallot(m.rejected, &cursor);
             types.encodeBallot(m.promised, &cursor);
-            cursor.int(u32, m.decided_through);
+            cursor.int(u64, m.decided_through);
         },
         .heartbeat => |m| {
             cursor.byte(@intFromEnum(MessageTag.heartbeat));
             types.encodeBallot(m.ballot, &cursor);
-            cursor.int(u32, m.decided_through);
+            cursor.int(u64, m.decided_through);
         },
     }
     return buffer[0..cursor.offset];
+}
+
+fn decodePromiseRange(reader: *types.ReadCursor) WireError!types.Log.Message {
+    var message = types.Log.Message{ .promise_range = .{
+        .ballot = try types.decodeBallot(reader),
+        .anchor = .{
+            .trim_id = try reader.int(u64),
+            .chosen_trim_slot = try reader.int(u64),
+            .history_hash = undefined,
+        },
+        .chosen_through = 0,
+        .first = 0,
+        .last = 0,
+        .accepted_count = 0,
+        .more = false,
+    } };
+    const range = &message.promise_range;
+    const hash = try reader.take(32);
+    @memcpy(&range.anchor.history_hash, hash);
+    range.chosen_through = try reader.int(u64);
+    range.first = try reader.int(u64);
+    range.last = try reader.int(u64);
+    range.accepted_count = try reader.int(u32);
+    const more_raw = try reader.byte();
+    if (more_raw > 1) return error.InvalidFrame;
+    range.more = more_raw == 1;
+    return message;
 }
 
 pub fn decodeEnvelope(body: []const u8) WireError!types.Log.Envelope {
@@ -484,46 +520,43 @@ pub fn decodeEnvelope(body: []const u8) WireError!types.Log.Envelope {
     const message: types.Log.Message = switch (tag) {
         .prepare => .{ .prepare = .{
             .ballot = try types.decodeBallot(&reader),
-            .decided_through = try reader.int(u32),
+            .first = try reader.int(u64),
         } },
         .promise => .{ .promise = .{
             .ballot = try types.decodeBallot(&reader),
-            .slot = try reader.int(u32),
+            .slot = try reader.int(u64),
             .accepted = .{
                 .ballot = try types.decodeBallot(&reader),
                 .value = try types.decodeEntry(&reader),
             },
         } },
-        .promise_done => .{ .promise_done = .{
-            .ballot = try types.decodeBallot(&reader),
-            .accepted_count = try reader.int(u32),
-            .decided_through = try reader.int(u32),
-        } },
+        .promise_range => try decodePromiseRange(&reader),
         .accept => .{ .accept = .{
             .ballot = try types.decodeBallot(&reader),
-            .slot = try reader.int(u32),
+            .slot = try reader.int(u64),
             .value = try types.decodeEntry(&reader),
         } },
         .accepted => .{ .accepted = .{
             .ballot = try types.decodeBallot(&reader),
-            .slot = try reader.int(u32),
-            .decided_through = try reader.int(u32),
+            .slot = try reader.int(u64),
+            .decided_through = try reader.int(u64),
         } },
         .commit => .{ .commit = .{
-            .slot = try reader.int(u32),
+            .slot = try reader.int(u64),
             .value = try types.decodeEntry(&reader),
         } },
         .learn => .{ .learn = .{
-            .from_slot = try reader.int(u32),
+            .from_slot = try reader.int(u64),
+            .count = try reader.int(u32),
         } },
         .nack => .{ .nack = .{
             .rejected = try types.decodeBallot(&reader),
             .promised = try types.decodeBallot(&reader),
-            .decided_through = try reader.int(u32),
+            .decided_through = try reader.int(u64),
         } },
         .heartbeat => .{ .heartbeat = .{
             .ballot = try types.decodeBallot(&reader),
-            .decided_through = try reader.int(u32),
+            .decided_through = try reader.int(u64),
         } },
     };
     if (reader.offset != body.len) return error.InvalidFrame;
@@ -558,13 +591,13 @@ pub const FenceRequest = struct {
     fence_id: u64,
     fence_slot: paxos.Slot,
 
-    pub const encoded_size = types.ballot_size + 8 + 4;
+    pub const encoded_size = types.ballot_size + 8 + 8;
 
     pub fn encode(self: FenceRequest, buffer: *[encoded_size]u8) []const u8 {
         var cursor = types.Cursor{ .buffer = buffer };
         types.encodeBallot(self.ballot, &cursor);
         cursor.int(u64, self.fence_id);
-        cursor.int(u32, self.fence_slot);
+        cursor.int(u64, self.fence_slot);
         return buffer[0..cursor.offset];
     }
 
@@ -574,7 +607,7 @@ pub const FenceRequest = struct {
         return .{
             .ballot = try types.decodeBallot(&reader),
             .fence_id = try reader.int(u64),
-            .fence_slot = try reader.int(u32),
+            .fence_slot = try reader.int(u64),
         };
     }
 };
@@ -614,90 +647,111 @@ pub const FenceAck = struct {
 
 pub const SnapshotBegin = struct {
     configuration_id: u64,
-    name: [16]u8,
+    anchor_slot: u64,
+    history_hash: [32]u8,
     db_size: u64,
-    manifest: []const u8,
-    proof: []const u8,
+    image_sha256: [32]u8,
+    sqlite_page_size: u32,
+    last_data_slot: u64,
+    last_batch_id: u128,
+    last_chain: [32]u8,
+    registry_digest: [32]u8,
 
-    pub const max_manifest_bytes = 4096;
-    pub const max_proof_bytes = 768;
-    pub const max_encoded_size = 8 + 16 + 8 + 4 + max_manifest_bytes +
-        2 + max_proof_bytes;
+    pub const encoded_size = 8 + 8 + 32 + 8 + 32 + 4 + 8 + 16 + 32 + 32;
 
-    pub fn encode(self: SnapshotBegin, buffer: *[max_encoded_size]u8) []const u8 {
-        std.debug.assert(self.manifest.len <= max_manifest_bytes);
-        std.debug.assert(self.proof.len <= max_proof_bytes);
+    pub fn encode(self: SnapshotBegin, buffer: *[encoded_size]u8) []const u8 {
         var cursor = types.Cursor{ .buffer = buffer };
         cursor.int(u64, self.configuration_id);
-        cursor.bytes(&self.name);
+        cursor.int(u64, self.anchor_slot);
+        cursor.bytes(&self.history_hash);
         cursor.int(u64, self.db_size);
-        cursor.int(u32, @intCast(self.manifest.len));
-        cursor.bytes(self.manifest);
-        cursor.int(u16, @intCast(self.proof.len));
-        cursor.bytes(self.proof);
+        cursor.bytes(&self.image_sha256);
+        cursor.int(u32, self.sqlite_page_size);
+        cursor.int(u64, self.last_data_slot);
+        cursor.int(u128, self.last_batch_id);
+        cursor.bytes(&self.last_chain);
+        cursor.bytes(&self.registry_digest);
         return buffer[0..cursor.offset];
     }
 
-    /// The returned manifest and proof slices alias `body`.
     pub fn decode(body: []const u8) WireError!SnapshotBegin {
+        if (body.len != encoded_size) return error.InvalidFrame;
         var reader = types.ReadCursor{ .buffer = body };
-        const configuration_id = try reader.int(u64);
-        const name = try reader.take(16);
-        const db_size = try reader.int(u64);
-        const manifest_len = try reader.int(u32);
-        if (manifest_len > max_manifest_bytes) return error.InvalidFrame;
-        const manifest = try reader.take(manifest_len);
-        const proof_len = try reader.int(u16);
-        if (proof_len == 0 or proof_len > max_proof_bytes) {
+        var begin = SnapshotBegin{
+            .configuration_id = try reader.int(u64),
+            .anchor_slot = try reader.int(u64),
+            .history_hash = undefined,
+            .db_size = undefined,
+            .image_sha256 = undefined,
+            .sqlite_page_size = undefined,
+            .last_data_slot = undefined,
+            .last_batch_id = undefined,
+            .last_chain = undefined,
+            .registry_digest = undefined,
+        };
+        @memcpy(&begin.history_hash, try reader.take(32));
+        begin.db_size = try reader.int(u64);
+        @memcpy(&begin.image_sha256, try reader.take(32));
+        begin.sqlite_page_size = try reader.int(u32);
+        begin.last_data_slot = try reader.int(u64);
+        begin.last_batch_id = try reader.int(u128);
+        @memcpy(&begin.last_chain, try reader.take(32));
+        @memcpy(&begin.registry_digest, try reader.take(32));
+        if (begin.anchor_slot == 0 or begin.db_size == 0 or
+            begin.sqlite_page_size == 0)
+        {
             return error.InvalidFrame;
         }
-        const proof = try reader.take(proof_len);
-        if (reader.offset != body.len) return error.InvalidFrame;
+        return begin;
+    }
+};
+
+/// A read-quorum probe that the chosen history through `slot` has hash
+/// `hash` (ZDS 0011). A voter that can vouch echoes the probe back on
+/// the `checkpoint_proof_reply` kind; one that cannot stays silent.
+pub const HistoryProbe = struct {
+    nonce: u64,
+    slot: u64,
+    hash: [32]u8,
+
+    pub const encoded_size = 8 + 8 + 32;
+
+    pub fn encode(self: HistoryProbe, buffer: *[encoded_size]u8) []const u8 {
+        std.mem.writeInt(u64, buffer[0..8], self.nonce, .little);
+        std.mem.writeInt(u64, buffer[8..16], self.slot, .little);
+        @memcpy(buffer[16..48], &self.hash);
+        return buffer;
+    }
+
+    pub fn decode(body: []const u8) WireError!HistoryProbe {
+        if (body.len != encoded_size) return error.InvalidFrame;
+        const nonce = std.mem.readInt(u64, body[0..8], .little);
+        const slot = std.mem.readInt(u64, body[8..16], .little);
+        if (nonce == 0 or slot == 0) return error.InvalidFrame;
         return .{
-            .configuration_id = configuration_id,
-            .name = name[0..16].*,
-            .db_size = db_size,
-            .manifest = manifest,
-            .proof = proof,
+            .nonce = nonce,
+            .slot = slot,
+            .hash = body[16..48].*,
         };
     }
 };
 
-/// A receiver asks configured voters whether they retain the same proof for
-/// the sealed epoch. Matching replies are read-quorum evidence about a stop
-/// sign Paxos already chose; they do not constitute a new consensus phase.
-pub const CheckpointProofProbe = struct {
-    nonce: u64,
-    sealed_configuration_id: u64,
-    digest: [32]u8,
+/// A lagging peer's request for a full-image transfer, carrying its
+/// applied frontier so the sender can decline when the retained journal
+/// still covers the gap.
+pub const SnapshotRequest = struct {
+    applied_slot: u64,
 
-    pub const encoded_size = 8 + 8 + 32;
+    pub const encoded_size = 8;
 
-    pub fn encode(
-        self: CheckpointProofProbe,
-        buffer: *[encoded_size]u8,
-    ) []const u8 {
-        std.mem.writeInt(u64, buffer[0..8], self.nonce, .little);
-        std.mem.writeInt(
-            u64,
-            buffer[8..16],
-            self.sealed_configuration_id,
-            .little,
-        );
-        @memcpy(buffer[16..48], &self.digest);
+    pub fn encode(self: SnapshotRequest, buffer: *[encoded_size]u8) []const u8 {
+        std.mem.writeInt(u64, buffer[0..8], self.applied_slot, .little);
         return buffer;
     }
 
-    pub fn decode(body: []const u8) WireError!CheckpointProofProbe {
+    pub fn decode(body: []const u8) WireError!SnapshotRequest {
         if (body.len != encoded_size) return error.InvalidFrame;
-        const nonce = std.mem.readInt(u64, body[0..8], .little);
-        const sealed = std.mem.readInt(u64, body[8..16], .little);
-        if (nonce == 0 or sealed == 0) return error.InvalidFrame;
-        return .{
-            .nonce = nonce,
-            .sealed_configuration_id = sealed,
-            .digest = body[16..48].*,
-        };
+        return .{ .applied_slot = std.mem.readInt(u64, body[0..8], .little) };
     }
 };
 
@@ -712,6 +766,219 @@ pub const SnapshotChunk = struct {
             .bytes = body[8..],
         };
     }
+};
+
+// ----------------------------------------------------------------------
+// Progress frontiers and bounded range recovery (ZDS 0011)
+// ----------------------------------------------------------------------
+
+/// One replica's progress report. Data replicas send it after each
+/// durable state-anchor publish and on the regular tick; the sender's
+/// identity comes from the authenticated connection. `durable_state_slot`
+/// is the only field that may authorize trimming; `executed_slot` and the
+/// rest exist for lag monitoring and status.
+pub const StateReport = struct {
+    configuration_id: u64,
+    durable_state_slot: u64,
+    history_hash: [32]u8,
+    executed_slot: u64,
+    persisted_slot: u64,
+    local_delete_floor: u64,
+    retained_first_slot: u64,
+
+    pub const encoded_size = 8 * 6 + 32;
+
+    pub fn encode(self: StateReport, buffer: *[encoded_size]u8) []const u8 {
+        var cursor = types.Cursor{ .buffer = buffer };
+        cursor.int(u64, self.configuration_id);
+        cursor.int(u64, self.durable_state_slot);
+        cursor.bytes(&self.history_hash);
+        cursor.int(u64, self.executed_slot);
+        cursor.int(u64, self.persisted_slot);
+        cursor.int(u64, self.local_delete_floor);
+        cursor.int(u64, self.retained_first_slot);
+        return buffer[0..cursor.offset];
+    }
+
+    pub fn decode(body: []const u8) WireError!StateReport {
+        if (body.len != encoded_size) return error.InvalidFrame;
+        var reader = types.ReadCursor{ .buffer = body };
+        var report = StateReport{
+            .configuration_id = reader.int(u64) catch return error.InvalidFrame,
+            .durable_state_slot = reader.int(u64) catch return error.InvalidFrame,
+            .history_hash = undefined,
+            .executed_slot = undefined,
+            .persisted_slot = undefined,
+            .local_delete_floor = undefined,
+            .retained_first_slot = undefined,
+        };
+        const hash = reader.take(32) catch return error.InvalidFrame;
+        @memcpy(&report.history_hash, hash);
+        report.executed_slot = reader.int(u64) catch return error.InvalidFrame;
+        report.persisted_slot = reader.int(u64) catch return error.InvalidFrame;
+        report.local_delete_floor = reader.int(u64) catch return error.InvalidFrame;
+        report.retained_first_slot = reader.int(u64) catch return error.InvalidFrame;
+        if (report.configuration_id == 0) return error.InvalidFrame;
+        if (report.durable_state_slot > report.executed_slot) return error.InvalidFrame;
+        return report;
+    }
+};
+
+/// Upper bound on records in one range exchange; matches the bounded
+/// recovery chunk the core drives.
+pub const max_range_records: usize = 256;
+
+/// Asks a peer for chosen journal evidence beginning at `first_slot`.
+pub const RangeRequest = struct {
+    configuration_id: u64,
+    first_slot: u64,
+    count: u32,
+    /// How many further chunks the requester is ready to receive without
+    /// another request; pipelining credit, not an obligation.
+    credit: u8,
+
+    pub const encoded_size = 8 + 8 + 4 + 1;
+
+    pub fn encode(self: RangeRequest, buffer: *[encoded_size]u8) []const u8 {
+        var cursor = types.Cursor{ .buffer = buffer };
+        cursor.int(u64, self.configuration_id);
+        cursor.int(u64, self.first_slot);
+        cursor.int(u32, self.count);
+        cursor.byte(self.credit);
+        return buffer[0..cursor.offset];
+    }
+
+    pub fn decode(body: []const u8) WireError!RangeRequest {
+        if (body.len != encoded_size) return error.InvalidFrame;
+        var reader = types.ReadCursor{ .buffer = body };
+        const request = RangeRequest{
+            .configuration_id = reader.int(u64) catch return error.InvalidFrame,
+            .first_slot = reader.int(u64) catch return error.InvalidFrame,
+            .count = reader.int(u32) catch return error.InvalidFrame,
+            .credit = reader.byte() catch return error.InvalidFrame,
+        };
+        if (request.configuration_id == 0 or request.first_slot == 0) {
+            return error.InvalidFrame;
+        }
+        if (request.count == 0 or request.count > max_range_records) {
+            return error.InvalidFrame;
+        }
+        return request;
+    }
+};
+
+/// Chosen journal evidence for a bounded slot range. Records are framed
+/// inside the body as `slot u64, kind u8, len u16, bytes`; `more` tells
+/// the requester another chunk follows under its credit.
+pub const RangeData = struct {
+    configuration_id: u64,
+    first_slot: u64,
+    more: bool,
+    record_count: u16,
+    records: []const u8,
+
+    /// A chosen entry, encoded with `types.encodeEntry`.
+    pub const record_kind_chosen: u8 = 0;
+
+    const record_overhead: usize = 8 + 1 + 2;
+
+    pub const max_encoded_size = 8 + 8 + 1 + 2 +
+        max_range_records * (record_overhead + types.max_entry_size);
+
+    pub const Record = struct {
+        slot: u64,
+        kind: u8,
+        entry_bytes: []const u8,
+    };
+
+    /// Appends records into a caller-owned buffer, then finishes into the
+    /// encoded frame body.
+    pub const Encoder = struct {
+        cursor: types.Cursor,
+        count: u16,
+
+        pub fn add(self: *Encoder, slot: u64, kind: u8, entry_bytes: []const u8) void {
+            std.debug.assert(self.count < max_range_records);
+            std.debug.assert(entry_bytes.len <= types.max_entry_size);
+            std.debug.assert(slot != 0);
+            self.cursor.int(u64, slot);
+            self.cursor.byte(kind);
+            self.cursor.int(u16, @intCast(entry_bytes.len));
+            self.cursor.bytes(entry_bytes);
+            self.count += 1;
+        }
+
+        pub fn finish(self: *Encoder, more: bool) []const u8 {
+            const buffer = self.cursor.buffer;
+            std.mem.writeInt(u16, buffer[17..][0..2], self.count, .little);
+            buffer[16] = @intFromBool(more);
+            return buffer[0..self.cursor.offset];
+        }
+    };
+
+    pub fn encoder(
+        buffer: []u8,
+        configuration_id: u64,
+        first_slot: u64,
+    ) Encoder {
+        std.debug.assert(buffer.len >= max_encoded_size);
+        var cursor = types.Cursor{ .buffer = buffer };
+        cursor.int(u64, configuration_id);
+        cursor.int(u64, first_slot);
+        cursor.byte(0);
+        cursor.int(u16, 0);
+        return .{ .cursor = cursor, .count = 0 };
+    }
+
+    pub fn decode(body: []const u8) WireError!RangeData {
+        var reader = types.ReadCursor{ .buffer = body };
+        const configuration_id = reader.int(u64) catch return error.InvalidFrame;
+        const first_slot = reader.int(u64) catch return error.InvalidFrame;
+        const more_raw = reader.byte() catch return error.InvalidFrame;
+        const record_count = reader.int(u16) catch return error.InvalidFrame;
+        if (configuration_id == 0 or first_slot == 0 or more_raw > 1) {
+            return error.InvalidFrame;
+        }
+        if (record_count > max_range_records) return error.InvalidFrame;
+        const data = RangeData{
+            .configuration_id = configuration_id,
+            .first_slot = first_slot,
+            .more = more_raw == 1,
+            .record_count = record_count,
+            .records = body[reader.offset..],
+        };
+        // Every record must parse and the region must end exactly.
+        var it = data.iterator();
+        var seen: u16 = 0;
+        while (try it.next()) |_| seen += 1;
+        if (seen != record_count) return error.InvalidFrame;
+        return data;
+    }
+
+    pub fn iterator(self: *const RangeData) Iterator {
+        return .{ .reader = .{ .buffer = self.records }, .remaining = self.record_count };
+    }
+
+    pub const Iterator = struct {
+        reader: types.ReadCursor,
+        remaining: u16,
+
+        pub fn next(self: *Iterator) WireError!?Record {
+            if (self.remaining == 0) {
+                if (self.reader.offset != self.reader.buffer.len) {
+                    return error.InvalidFrame;
+                }
+                return null;
+            }
+            self.remaining -= 1;
+            const slot = self.reader.int(u64) catch return error.InvalidFrame;
+            const kind = self.reader.byte() catch return error.InvalidFrame;
+            const len = self.reader.int(u16) catch return error.InvalidFrame;
+            if (slot == 0 or len > types.max_entry_size) return error.InvalidFrame;
+            const bytes = self.reader.take(len) catch return error.InvalidFrame;
+            return .{ .slot = slot, .kind = kind, .entry_bytes = bytes };
+        }
+    };
 };
 
 // ----------------------------------------------------------------------
@@ -834,21 +1101,29 @@ test "every envelope kind round trips" {
     };
     const entry = types.Entry{ .command = .{ .transaction_batch = batch } };
     const cases = [_]types.Log.Message{
-        .{ .prepare = .{ .ballot = ballot, .decided_through = 7 } },
+        .{ .prepare = .{ .ballot = ballot, .first = 8 } },
         .{ .promise = .{
             .ballot = ballot,
             .slot = 2,
             .accepted = .{ .ballot = ballot, .value = entry },
         } },
-        .{ .promise_done = .{
+        .{ .promise_range = .{
             .ballot = ballot,
+            .anchor = .{
+                .trim_id = 2,
+                .chosen_trim_slot = 6,
+                .history_hash = [_]u8{9} ** 32,
+            },
+            .chosen_through = 7,
+            .first = 8,
+            .last = 71,
             .accepted_count = 3,
-            .decided_through = 1,
+            .more = true,
         } },
         .{ .accept = .{ .ballot = ballot, .slot = 9, .value = entry } },
         .{ .accepted = .{ .ballot = ballot, .slot = 9, .decided_through = 8 } },
         .{ .commit = .{ .slot = 9, .value = entry } },
-        .{ .learn = .{ .from_slot = 3 } },
+        .{ .learn = .{ .from_slot = 3, .count = 64 } },
         .{ .nack = .{
             .rejected = ballot,
             .promised = ballot,
@@ -922,7 +1197,7 @@ test "decode rejects malformed envelopes" {
     const envelope = types.Log.Envelope{
         .from = 1,
         .to = 2,
-        .message = .{ .learn = .{ .from_slot = 3 } },
+        .message = .{ .learn = .{ .from_slot = 3, .count = 64 } },
     };
     const encoded = encodeEnvelope(envelope, &buffer);
     // Trailing garbage is rejected.
@@ -934,10 +1209,75 @@ test "decode rejects malformed envelopes" {
         decodeEnvelope(extended[0 .. encoded.len + 1]),
     );
     // An unknown message tag is rejected.
-    var bad_tag: [16]u8 = undefined;
+    var bad_tag: [max_envelope_size]u8 = undefined;
     @memcpy(bad_tag[0..encoded.len], encoded);
     bad_tag[8] = 0xff;
     try testing.expectError(error.InvalidFrame, decodeEnvelope(bad_tag[0..encoded.len]));
+}
+
+test "state report round trips and rejects an impossible frontier" {
+    const report = StateReport{
+        .configuration_id = 3,
+        .durable_state_slot = 90,
+        .history_hash = [_]u8{7} ** 32,
+        .executed_slot = 95,
+        .persisted_slot = 99,
+        .local_delete_floor = 80,
+        .retained_first_slot = 81,
+    };
+    var buffer: [StateReport.encoded_size]u8 = undefined;
+    try testing.expectEqualDeep(report, try StateReport.decode(report.encode(&buffer)));
+
+    // A durable-state claim past the executed image is never accepted.
+    var impossible = report;
+    impossible.durable_state_slot = 96;
+    _ = impossible.encode(&buffer);
+    try testing.expectError(error.InvalidFrame, StateReport.decode(&buffer));
+}
+
+test "range frames round trip and bound their records" {
+    const request = RangeRequest{
+        .configuration_id = 3,
+        .first_slot = 500,
+        .count = 128,
+        .credit = 4,
+    };
+    var request_buffer: [RangeRequest.encoded_size]u8 = undefined;
+    try testing.expectEqualDeep(
+        request,
+        try RangeRequest.decode(request.encode(&request_buffer)),
+    );
+    var oversized = request;
+    oversized.count = max_range_records + 1;
+    _ = oversized.encode(&request_buffer);
+    try testing.expectError(error.InvalidFrame, RangeRequest.decode(&request_buffer));
+
+    var entry_bytes: [types.max_entry_size]u8 = undefined;
+    var cursor = types.Cursor{ .buffer = &entry_bytes };
+    types.encodeEntry(.{ .command = .noop }, &cursor);
+    const encoded_entry = entry_bytes[0..cursor.offset];
+
+    var body: [RangeData.max_encoded_size]u8 = undefined;
+    var encoder = RangeData.encoder(&body, 3, 500);
+    encoder.add(500, RangeData.record_kind_chosen, encoded_entry);
+    encoder.add(501, RangeData.record_kind_chosen, encoded_entry);
+    const encoded = encoder.finish(true);
+
+    const data = try RangeData.decode(encoded);
+    try testing.expectEqual(@as(u16, 2), data.record_count);
+    try testing.expect(data.more);
+    var it = data.iterator();
+    const first = (try it.next()).?;
+    try testing.expectEqual(@as(u64, 500), first.slot);
+    try testing.expectEqualSlices(u8, encoded_entry, first.entry_bytes);
+    try testing.expectEqual(@as(u64, 501), (try it.next()).?.slot);
+    try testing.expectEqual(@as(?RangeData.Record, null), try it.next());
+
+    // Truncating the record region is rejected at decode.
+    try testing.expectError(
+        error.InvalidFrame,
+        RangeData.decode(encoded[0 .. encoded.len - 1]),
+    );
 }
 
 test "fence frames round trip" {
@@ -995,32 +1335,36 @@ test "learner heartbeat round trips" {
     );
 }
 
-test "snapshot begin round trips and bounds the manifest" {
+test "transfer begin round trips the anchor manifest" {
     const begin = SnapshotBegin{
         .configuration_id = 6,
-        .name = "0000000000000006".*,
+        .anchor_slot = 90_017,
+        .history_hash = [_]u8{0x11} ** 32,
         .db_size = 8192,
-        .manifest = "format=1\nchain=00\n",
-        .proof = "proof",
+        .image_sha256 = [_]u8{0x22} ** 32,
+        .sqlite_page_size = 4096,
+        .last_data_slot = 90_016,
+        .last_batch_id = 77,
+        .last_chain = [_]u8{0x33} ** 32,
+        .registry_digest = [_]u8{0x44} ** 32,
     };
-    var buffer: [SnapshotBegin.max_encoded_size]u8 = undefined;
-    const encoded = begin.encode(&buffer);
-    const decoded = try SnapshotBegin.decode(encoded);
-    try testing.expectEqual(begin.configuration_id, decoded.configuration_id);
-    try testing.expectEqualStrings(begin.manifest, decoded.manifest);
-    try testing.expectEqualStrings(begin.proof, decoded.proof);
+    var buffer: [SnapshotBegin.encoded_size]u8 = undefined;
+    try testing.expectEqualDeep(
+        begin,
+        try SnapshotBegin.decode(begin.encode(&buffer)),
+    );
 }
 
-test "checkpoint proof probe round trips" {
-    const probe = CheckpointProofProbe{
+test "history probe round trips" {
+    const probe = HistoryProbe{
         .nonce = 19,
-        .sealed_configuration_id = 6,
-        .digest = [_]u8{0xab} ** 32,
+        .slot = 90_017,
+        .hash = [_]u8{0xab} ** 32,
     };
-    var buffer: [CheckpointProofProbe.encoded_size]u8 = undefined;
+    var buffer: [HistoryProbe.encoded_size]u8 = undefined;
     try testing.expectEqualDeep(
         probe,
-        try CheckpointProofProbe.decode(probe.encode(&buffer)),
+        try HistoryProbe.decode(probe.encode(&buffer)),
     );
 }
 

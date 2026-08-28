@@ -93,7 +93,7 @@ typedef struct zaxonlite_value {
     size_t length;
 } zaxonlite_value;
 
-/* Library version string, for example "0.2.0". */
+/* Library version string, for example "0.6.0". */
 const char *zaxonlite_version(void);
 
 /* Opens (or creates) a node data directory. */
@@ -341,8 +341,8 @@ int zaxonlite_query_prepared_json(zaxonlite *handle, const char *sql,
 /* Releases a buffer returned by zaxonlite_query_json. */
 void zaxonlite_free(char *pointer);
 
-/* Takes an online snapshot and seals the current journal epoch. */
-int zaxonlite_snapshot(zaxonlite *handle);
+/* Publishes a durable state anchor for fast recovery (ZDS 0011). */
+int zaxonlite_state_anchor(zaxonlite *handle);
 
 /* Streams a consistent logical backup to `path`. */
 int zaxonlite_backup(zaxonlite *handle, const char *path);

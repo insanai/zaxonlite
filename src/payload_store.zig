@@ -11,8 +11,10 @@
 //! drive-cache barrier. The host's next journal sync — which precedes
 //! every vote, recovered-value message, and client acknowledgement — is
 //! the single barrier that makes installed payloads power-loss durable
-//! (see `durability.zig`). Epoch installs likewise barrier before the
-//! CURRENT pointer moves. So every counted vote and every acknowledged
+//! (see `durability.zig`). Anchor publication likewise barriers before
+//! the alternate APPLIED record is adopted (the old CURRENT pointer name
+//! survives only as a legacy-artifact tripwire). So every counted vote
+//! and every acknowledged
 //! write still implies durable payload bytes at its consumer, at one
 //! full flush per commit point instead of three.
 
@@ -31,6 +33,10 @@ pub const LoadError = error{
 pub const PayloadStore = struct {
     io: Io,
     dir: Io.Dir,
+    /// Bytes of retained payload objects, counted once at open and
+    /// maintained across installs and removals; feeds the storage
+    /// budget alongside journal bytes (ZDS 0011).
+    retained_bytes: u64 = 0,
 
     pub fn init(io: Io, parent: Io.Dir) !PayloadStore {
         // Iterate so the long-lived handle is a real descriptor: it is
@@ -42,7 +48,41 @@ pub const PayloadStore = struct {
         errdefer dir.close(io);
         try durability.syncDirectory(parent);
         try durability.syncDirectory(dir);
-        return .{ .io = io, .dir = dir };
+        var self = PayloadStore{ .io = io, .dir = dir };
+        self.retained_bytes = try self.measureRetainedBytes();
+        return self;
+    }
+
+    /// Sums every retained object once at open. Fails closed: capacity
+    /// enforcement built on an undercount would be a lie, so an
+    /// unreadable shard or object is an open error, not a zero.
+    fn measureRetainedBytes(self: *PayloadStore) !u64 {
+        var total: u64 = 0;
+        var shards = self.dir.iterate();
+        while (try shards.next(self.io)) |shard| {
+            if (shard.kind != .directory or shard.name.len != 2) continue;
+            var shard_name: [2]u8 = shard.name[0..2].*;
+            var shard_dir = try self.dir.openDir(
+                self.io,
+                &shard_name,
+                .{ .iterate = true },
+            );
+            defer shard_dir.close(self.io);
+            var objects = shard_dir.iterate();
+            while (try objects.next(self.io)) |object| {
+                if (object.kind != .file) continue;
+                var object_name: [62]u8 = undefined;
+                if (object.name.len != 62) continue;
+                object_name = object.name[0..62].*;
+                const stat = try shard_dir.statFile(
+                    self.io,
+                    &object_name,
+                    .{},
+                );
+                total +|= stat.size;
+            }
+        }
+        return total;
     }
 
     pub fn deinit(self: *PayloadStore) void {
@@ -105,10 +145,19 @@ pub const PayloadStore = struct {
         try atomic.file.writePositionalAll(self.io, bytes, 0);
         try durability.syncFileBeforeBarrier(self.io, atomic.file);
         atomic.link(self.io) catch |err| switch (err) {
-            // Another writer installed identical content first.
-            error.PathAlreadyExists => {},
+            // Another writer installed identical content first; it also
+            // counted the bytes.
+            error.PathAlreadyExists => {
+                try durability.syncChildDirectoryBeforeBarrier(
+                    self.io,
+                    self.dir,
+                    path[0..2],
+                );
+                return;
+            },
             else => return err,
         };
+        self.retained_bytes +|= bytes.len;
         try durability.syncChildDirectoryBeforeBarrier(self.io, self.dir, path[0..2]);
     }
 
@@ -163,11 +212,48 @@ pub const PayloadStore = struct {
         return bytes;
     }
 
+    /// Deletes every stored object absent from `reachable`. The caller
+    /// owns the reachability proof (a streamed scan of every retained
+    /// journal record); a crash mid-sweep leaks objects but never removes
+    /// a reachable one.
+    pub fn sweepUnreachable(
+        self: *PayloadStore,
+        reachable: *const std.AutoHashMap(Hash, void),
+    ) !void {
+        var shards = self.dir.iterate();
+        while (shards.next(self.io) catch null) |shard| {
+            if (shard.kind != .directory or shard.name.len != 2) continue;
+            var shard_name: [2]u8 = shard.name[0..2].*;
+            var shard_dir = self.dir.openDir(
+                self.io,
+                &shard_name,
+                .{ .iterate = true },
+            ) catch continue;
+            defer shard_dir.close(self.io);
+            var objects = shard_dir.iterate();
+            while (objects.next(self.io) catch null) |object| {
+                if (object.kind != .file or object.name.len != 62) continue;
+                var hex: [64]u8 = undefined;
+                @memcpy(hex[0..2], &shard_name);
+                @memcpy(hex[2..], object.name[0..62]);
+                var digest: Hash = undefined;
+                _ = std.fmt.hexToBytes(&digest, &hex) catch continue;
+                if (reachable.contains(digest)) continue;
+                var object_name: [62]u8 = object.name[0..62].*;
+                const stat = shard_dir.statFile(self.io, &object_name, .{}) catch null;
+                shard_dir.deleteFile(self.io, &object_name) catch continue;
+                if (stat) |s| self.retained_bytes -|= s.size;
+            }
+        }
+    }
+
     /// Removes one payload object. The caller owns the reachability proof.
     pub fn remove(self: *PayloadStore, digest: Hash) !void {
         var path_buffer: [65]u8 = undefined;
         const path = pathOf(&path_buffer, digest);
+        const stat = self.dir.statFile(self.io, path, .{}) catch null;
         try self.dir.deleteFile(self.io, path);
+        if (stat) |s| self.retained_bytes -|= s.size;
     }
 
     fn pathOf(buffer: *[65]u8, digest: Hash) []const u8 {
@@ -239,4 +325,28 @@ test "payload store detects corruption and missing objects" {
         error.PayloadMissing,
         store.load(testing.allocator, absent),
     );
+}
+
+test "retained bytes track installs, duplicates, removal, and reopening" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+
+    var store = try PayloadStore.init(io, tmp.dir);
+    const first = try store.put("twelve bytes");
+    try std.testing.expectEqual(@as(u64, 12), store.retained_bytes);
+    // An idempotent re-install of identical content counts once.
+    _ = try store.put("twelve bytes");
+    try std.testing.expectEqual(@as(u64, 12), store.retained_bytes);
+    _ = try store.put("four");
+    try std.testing.expectEqual(@as(u64, 16), store.retained_bytes);
+
+    try store.remove(first);
+    try std.testing.expectEqual(@as(u64, 4), store.retained_bytes);
+    store.deinit();
+
+    // A reopen recounts what the directory actually holds.
+    var reopened = try PayloadStore.init(io, tmp.dir);
+    defer reopened.deinit();
+    try std.testing.expectEqual(@as(u64, 4), reopened.retained_bytes);
 }

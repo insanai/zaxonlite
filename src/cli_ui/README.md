@@ -48,7 +48,7 @@ zig build test
 ## Getting it
 
 ```sh
-zig fetch --save https://github.com/insanai/zaxon-cli-ui/archive/refs/tags/v0.2.0.tar.gz
+zig fetch --save https://github.com/insanai/zaxon-cli-ui/archive/refs/tags/v0.6.0.tar.gz
 ```
 
 Then in your `build.zig`:

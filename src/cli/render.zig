@@ -37,33 +37,35 @@ pub fn printStatus(node: *zaxonlite.Node, json: bool, out: *std.Io.Writer) !void
 
 fn printStatusJson(status: zaxonlite.node.Status, out: *std.Io.Writer) !void {
     const chain_hex = std.fmt.bytesToHex(status.chain, .lower);
+    const history_hex = std.fmt.bytesToHex(status.history, .lower);
     try out.print(
         "{{\"node_id\":{d},\"database_id\":\"{x:0>32}\"," ++
             "\"configuration_id\":{d},\"role\":\"{s}\"," ++
             "\"node_type\":\"{s}\",\"leader\":{?d}," ++
             "\"decided_slot\":{d},\"applied_slot\":{d}," ++
-            "\"journal_records\":{d},\"epoch_capacity\":{d}," ++
-            "\"chain\":\"{s}\",\"page_size\":{d}," ++
+            "\"durable_state_slot\":{d},\"memory_floor\":{d}," ++
+            "\"chosen_trim_slot\":{d},\"retained_first_slot\":{d}," ++
+            "\"journal_records\":{d},\"journal_segment_count\":{d}," ++
+            "\"journal_bytes\":{d}," ++
+            "\"chain\":\"{s}\",\"history\":\"{s}\",\"page_size\":{d}," ++
             "\"fts5_enabled\":{},\"sqlite_vec_version\":\"{s}\"," ++
             "\"search_feature_version\":{d},\"simd_backend\":\"{s}\"," ++
-            "\"mmap_size\":{d},\"candidate_hard_limit\":{d},\"snapshot\":",
+            "\"mmap_size\":{d},\"candidate_hard_limit\":{d}}}\n",
         .{
             status.node_id,                status.database_id,
             status.configuration_id,       status.role,
             status.node_type,              status.leader,
             status.decided_slot,           status.applied_slot,
-            status.journal_records,        status.epoch_capacity,
-            &chain_hex,                    status.page_size,
+            status.durable_state_slot,     status.memory_floor,
+            status.chosen_trim_slot,       status.retained_first_slot,
+            status.journal_records,        status.journal_segment_count,
+            status.journal_bytes,          &chain_hex,
+            &history_hex,                  status.page_size,
             status.fts5_enabled,           status.sqlite_vec_version,
             status.search_feature_version, status.simd_backend,
             status.mmap_size,              status.candidate_hard_limit,
         },
     );
-    if (status.snapshot) |name| {
-        try out.print("\"{s}\"}}\n", .{&name});
-    } else {
-        try out.writeAll("null}\n");
-    }
 }
 
 fn printStatusPlain(status: zaxonlite.node.Status, out: *std.Io.Writer) !void {
@@ -76,8 +78,13 @@ fn printStatusPlain(status: zaxonlite.node.Status, out: *std.Io.Writer) !void {
         \\node type:        {s}
         \\decided slot:     {d}
         \\applied slot:     {d}
+        \\durable slot:     {d}
+        \\memory floor:     {d}
+        \\trimmed through:  {d}
+        \\retained first:   {d}
         \\journal records:  {d}
-        \\epoch capacity:   {d}
+        \\journal segments: {d}
+        \\journal bytes:    {d}
         \\chain:            {s}
         \\page size:        {d}
         \\fts5:             {s}
@@ -86,7 +93,6 @@ fn printStatusPlain(status: zaxonlite.node.Status, out: *std.Io.Writer) !void {
         \\simd backend:     {s}
         \\mmap size:        {d}
         \\candidate limit:  {d}
-        \\snapshot:         {s}
         \\
     , .{
         status.node_id,
@@ -96,8 +102,13 @@ fn printStatusPlain(status: zaxonlite.node.Status, out: *std.Io.Writer) !void {
         status.node_type,
         status.decided_slot,
         status.applied_slot,
+        status.durable_state_slot,
+        status.memory_floor,
+        status.chosen_trim_slot,
+        status.retained_first_slot,
         status.journal_records,
-        status.epoch_capacity,
+        status.journal_segment_count,
+        status.journal_bytes,
         &chain_hex,
         status.page_size,
         if (status.fts5_enabled) "enabled" else "missing",
@@ -106,7 +117,6 @@ fn printStatusPlain(status: zaxonlite.node.Status, out: *std.Io.Writer) !void {
         status.simd_backend,
         status.mmap_size,
         status.candidate_hard_limit,
-        if (status.snapshot) |name| &name else "(none)",
     });
 }
 
@@ -332,11 +342,6 @@ fn renderRemoteSuccess(
             jsonInt(object.get("applied_slot")) orelse 0,
             jsonInt(object.get("leader")),
         });
-    } else if (std.mem.eql(u8, command, "snapshot")) {
-        try out.print(
-            "snapshot installed; now at configuration {d}\n",
-            .{jsonInt(object.get("configuration_id")) orelse 0},
-        );
     } else if (std.mem.eql(u8, command, "integrity-check")) {
         try out.writeAll("integrity: pass\n");
     } else if (std.mem.eql(u8, command, "expire-sessions")) {

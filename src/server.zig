@@ -27,6 +27,7 @@ const paxos = @import("paxos");
 
 const command = @import("command.zig");
 const types = @import("types.zig");
+const trim = @import("trim.zig");
 const wire = @import("wire.zig");
 const transport_auth = @import("transport_auth.zig");
 const tls = @import("tls.zig");
@@ -35,9 +36,9 @@ const sqlite = @import("sqlite.zig");
 const prepared = @import("prepared.zig");
 const search_api = @import("search_api.zig");
 const payload_store_mod = @import("payload_store.zig");
-const checkpoint_proof = @import("checkpoint_proof.zig");
 const enrollment = @import("enrollment.zig");
 const failpoint = @import("failpoint.zig");
+const status_json = @import("status_json.zig");
 const roles = @import("roles.zig");
 const diagnostic = @import("diagnostic.zig");
 const durability = @import("durability.zig");
@@ -262,6 +263,11 @@ pub const ServeOptions = struct {
     /// disables mmap; nonzero is an explicit operator opt-in bounded at
     /// 1 GiB (ZDS 0009).
     mmap_size: u64 = 0,
+    /// Retention horizon in slots below the chosen trim (ZDS 0011).
+    retention_slots: u64 = 0,
+    /// Hard ceiling over journal plus retained payload bytes,
+    /// refusing writes at the ZDS 0011 Q2 default; zero disables.
+    journal_cap_bytes: u64 = 64 * 1024 * 1024 * 1024,
     /// Honor `failpoint` RPCs (test controllers only).
     enable_failpoints: bool = false,
     tick_ms: u64 = 25,
@@ -545,12 +551,21 @@ pub fn serve(
         .registry_nodes = registry_nodes,
         .test_storage_delay_ms = options.test_faults.storage_delay_ms,
         .mmap_size = options.mmap_size,
+        .retention_slots = options.retention_slots,
+        .journal_cap_bytes = options.journal_cap_bytes,
     }) catch |err| {
+        const hint = if (err == error.StateUnavailable)
+            "The image or anchor no longer reaches retained history. " ++
+                "v1 repairs a damaged voter by replacement: enroll a new " ++
+                "node and replace this one (ZDS 0008); the frozen " ++
+                "conservative trim keeps every slot the successor needs."
+        else
+            "Check the role-pinned identity and durable files before retrying.";
         try diagnostic.write(
             err_out,
             "node open failed",
             @errorName(err),
-            "Check the role-pinned identity and durable files before retrying.",
+            hint,
         );
         try err_out.flush();
         return 4;
@@ -886,30 +901,29 @@ const FenceWaiter = struct {
     }
 };
 
-const CheckpointProofWaiter = struct {
+const HistoryProbeWaiter = struct {
     nonce: u64,
-    sealed_configuration_id: u64,
-    digest: [32]u8,
-    /// Voters of the sealed configuration, from the proof itself. Only
-    /// distinct IDs drawn from this set count toward the quorum; the
-    /// proposed next voter never does.
-    sealed_members: [types.log_options.max_members]paxos.NodeId =
+    slot: paxos.Slot,
+    hash: [32]u8,
+    /// Voters whose vouch counts toward the read quorum. Only distinct
+    /// IDs drawn from this set count; the transfer sender is one of them.
+    voters: [types.log_options.max_members]paxos.NodeId =
         [_]paxos.NodeId{0} ** types.log_options.max_members,
-    sealed_count: u16 = 0,
+    voter_count: u16 = 0,
     acked: [types.log_options.max_members]paxos.NodeId =
         [_]paxos.NodeId{0} ** types.log_options.max_members,
     ack_count: usize = 0,
     needed: usize,
 
-    fn isSealedVoter(self: *const CheckpointProofWaiter, member: paxos.NodeId) bool {
-        for (self.sealed_members[0..self.sealed_count]) |sealed| {
-            if (sealed == member) return true;
+    fn isVoter(self: *const HistoryProbeWaiter, member: paxos.NodeId) bool {
+        for (self.voters[0..self.voter_count]) |voter| {
+            if (voter == member) return true;
         }
         return false;
     }
 
-    fn noteAck(self: *CheckpointProofWaiter, member: paxos.NodeId) void {
-        if (!self.isSealedVoter(member)) return;
+    fn noteAck(self: *HistoryProbeWaiter, member: paxos.NodeId) void {
+        if (!self.isVoter(member)) return;
         for (self.acked[0..self.ack_count]) |seen| {
             if (seen == member) return;
         }
@@ -938,10 +952,10 @@ pub const Server = struct {
     node: *Node,
     options: ServeOptions,
     mutex: std.Io.Mutex = .init,
-    /// Kept separate from `mutex`: checkpoint replies must be recordable
-    /// while the snapshot receiver waits for its voter read quorum.
+    /// Kept separate from `mutex`: history vouches must be recordable
+    /// while the transfer receiver waits for its voter read quorum.
     proof_mutex: std.Io.Mutex = .init,
-    proof_waiter: ?*CheckpointProofWaiter = null,
+    proof_waiter: ?*HistoryProbeWaiter = null,
     next_proof_nonce: u64 = 1,
     /// Set once a decided stop sign replaced this voter: the node stays
     /// permanently sealed and the server stops attempting rollover.
@@ -996,7 +1010,16 @@ pub const Server = struct {
     learner_last_contact_tick: ?u64 = null,
     last_learner_heartbeat_tick: ?u64 = null,
     snapshot_source: ?paxos.NodeId = null,
+    /// Rotating cursor over registry peers for leaderless joiner
+    /// recovery probes.
+    recovery_probe: usize = 0,
     snapshot_requested_tick: u64 = 0,
+    catch_up_last_decided: paxos.Slot = 0,
+    catch_up_stalled: u32 = 0,
+    /// Latest per-peer progress reports for trim coordination (ZDS 0011).
+    frontiers: [types.log_options.max_members]?trim.Frontier =
+        [_]?trim.Frontier{null} ** types.log_options.max_members,
+    last_reported_durable: paxos.Slot = 0,
     tick_count: u64 = 0,
     failed: bool = false,
     shutdown_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -1025,6 +1048,10 @@ pub const Server = struct {
         handshake_deadline_ms: u64,
         idle_deadline_ms: u64 = 0,
         credential_node_id: ?paxos.NodeId = null,
+        /// Shut down by newest-wins eviction and awaiting its handler's
+        /// reap; excluded from the live count so concurrent handshakes
+        /// cannot evict one victim twice and overshoot the limit.
+        closing: bool = false,
     };
 
     fn deinit(self: *Server) void {
@@ -1347,13 +1374,7 @@ pub const Server = struct {
         self.mutex.unlock(self.io);
         try self.spawnSenders();
         self.mutex.lockUncancelable(self.io);
-        const activate_result = self.node.activateRollover();
-        if (activate_result) |_| {
-            self.pump();
-        } else |err| {
-            self.mutex.unlock(self.io);
-            return err;
-        }
+        self.pump();
         self.mutex.unlock(self.io);
         failpoint.hit("after_transport_swap");
         std.log.info(
@@ -1394,13 +1415,28 @@ pub const Server = struct {
         defer self.mutex.unlock(self.io);
         if (credential_node_id) |id| {
             var count: usize = 0;
-            for (self.active_connections.items) |connection| {
-                if (connection.credential_node_id == id) count += 1;
+            var oldest: ?*TrackedConnection = null;
+            for (self.active_connections.items) |*connection| {
+                if (connection.credential_node_id == id and !connection.closing) {
+                    count += 1;
+                    if (oldest == null) oldest = connection;
+                }
             }
             if (self.options.max_connections_per_peer != 0 and
                 count >= self.options.max_connections_per_peer)
             {
-                return error.PeerConnectionLimit;
+                // Newest wins: a fresh reconnect must never lose to its
+                // own not-yet-reaped predecessor, or a crash-restart
+                // cycle churns forever with every new connection
+                // rejected while stale entries hold the slots. Shut the
+                // oldest down; its handler reaps it on the failed read.
+                std.log.info(
+                    "node {d}: evicting oldest connection of peer {d} " ++
+                        "({d} at limit)",
+                    .{ self.node.identity.node_id, id, count },
+                );
+                oldest.?.closing = true;
+                oldest.?.stream.shutdown(self.io, .both) catch {};
             }
         }
         const now_ms = self.tick_count * self.options.tick_ms;
@@ -1526,42 +1562,57 @@ pub const Server = struct {
             try self.node.resyncImage();
         }
 
-        // Complete a decided epoch rollover once everything before the
-        // stop sign is applied.
-        if (!self.retired and self.node.rollover_pending and
-            self.node.log.isReconfigured() != null)
-        {
-            if (self.node.completeClusterRolloverDeferred()) |_| {
-                self.checkpoint_started = false;
-                self.observed_leader_decided = 0;
-                if (!self.transportStaleLocked()) {
-                    self.transport_configuration_id =
-                        self.node.identity.configuration_id;
-                    try self.node.activateRollover();
-                    try self.drainOutbox();
-                }
-            } else |err| switch (err) {
-                error.SnapshotDigestMismatch, error.NotCaughtUp => {
-                    // Fall back to a full snapshot transfer from the leader.
-                    if (self.node.currentLeader()) |leader| {
-                        if (leader != self.node.identity.node_id) {
-                            self.requestSnapshot(leader);
-                        }
-                    }
-                },
-                error.RetiredByReconfiguration => {
-                    // The chosen stop sign replaced this voter. The node
-                    // stays permanently sealed on its final configuration.
-                    self.retired = true;
-                    std.log.warn(
-                        "node {d} was replaced by a decided reconfiguration; " ++
-                            "it stays sealed and cannot rejoin",
-                        .{self.node.identity.node_id},
-                    );
-                },
+        // Periodic durable-state anchoring (ZDS 0011): bounded, dirty-page
+        // work in place of the old epoch rollover.
+        if (!self.retired and self.node.capabilities.materializes) {
+            _ = self.node.maybeCreateStateAnchor() catch |err| switch (err) {
+                error.TransactionOpen, error.WriteInFlight => {},
                 else => return err,
-            }
+            };
         }
+
+        // Broadcast a fresh progress report when the durable frontier
+        // moved; peers use only authenticated reports for trimming.
+        if (!self.retired and
+            self.node.durable_state_slot > self.last_reported_durable)
+        {
+            self.broadcastStateReport();
+        }
+
+        // The leader proposes a conservative trim when every data replica
+        // has reported and the minimum durable frontier advanced. The
+        // candidate only moves on anchor publishes, so this is naturally
+        // cadence-limited (ZDS 0011).
+        if (!self.retired and self.node.isLeader()) {
+            self.maybeProposeTrim() catch |err| {
+                std.log.warn("trim proposal failed: {t}", .{err});
+            };
+        }
+
+        // Physical reclamation below the adopted trim, off the commit path.
+        if (!self.retired) {
+            self.node.reclaim() catch |err| {
+                std.log.warn("reclamation failed: {t}", .{err});
+            };
+        }
+
+        // A decided membership stop completes here: the survivor installs
+        // the next registry and continues on the same global slot line; a
+        // removed voter retires on its final configuration (ZDS 0008).
+        if (!self.retired and self.node.membership_change_pending) {
+            self.node.completeMembershipChange() catch |err| switch (err) {
+                error.RetiredByReconfiguration => {
+                    self.retired = true;
+                    self.failEverything();
+                },
+                error.StopNotApplied => {},
+                else => std.log.warn(
+                    "membership completion failed: {s}",
+                    .{@errorName(err)},
+                ),
+            };
+        }
+
         if (self.node.identity.configuration_id != previous_configuration) {
             self.enterConfigurationLocked();
         }
@@ -1570,17 +1621,9 @@ pub const Server = struct {
         if (self.write_waiter) |waiter| {
             if (waiter.outcome == .pending and self.node.applied_slot >= waiter.slot) {
                 waiter.outcome = .conflict;
-                if (self.node.log.read(waiter.slot)) |entry| {
-                    switch (entry) {
-                        .command => |cmd| switch (cmd) {
-                            .transaction_batch => |batch| {
-                                if (batch.batch_id == waiter.batch_id) {
-                                    waiter.outcome = .committed;
-                                }
-                            },
-                            else => {},
-                        },
-                        .stop => {},
+                if (self.node.batchAtSlot(waiter.slot)) |batch_id| {
+                    if (batch_id == waiter.batch_id) {
+                        waiter.outcome = .committed;
                     }
                 }
                 waiter.cond.signal(self.io);
@@ -1780,17 +1823,149 @@ pub const Server = struct {
         };
     }
 
+    /// Sends this node's progress report to every peer. Caller holds the
+    /// mutex (pump context).
+    fn broadcastStateReport(self: *Server) void {
+        const local = self.node.frontier();
+        self.last_reported_durable = local.durable_state_slot;
+        self.recordFrontier(local);
+        const report = wire.StateReport{
+            .configuration_id = local.configuration_id,
+            .durable_state_slot = local.durable_state_slot,
+            .history_hash = local.history_hash,
+            .executed_slot = local.executed_slot,
+            .persisted_slot = local.persisted_slot,
+            .local_delete_floor = local.local_delete_floor,
+            .retained_first_slot = self.node.journal.retainedFirstSlot(),
+        };
+        var buffer: [wire.StateReport.encoded_size]u8 = undefined;
+        const encoded = report.encode(&buffer);
+        for (self.node.memberIds()) |member| {
+            if (member == self.node.identity.node_id) continue;
+            const sender = self.senderFor(member) orelse continue;
+            const frame = wire.frameAlloc(self.gpa, .state_report, &.{encoded}) catch
+                continue;
+            sender.enqueue(frame);
+        }
+    }
+
+    fn recordFrontier(self: *Server, frontier: trim.Frontier) void {
+        for (&self.frontiers) |*slot| {
+            if (slot.*) |held| {
+                if (held.node_id == frontier.node_id) {
+                    slot.* = frontier;
+                    return;
+                }
+            }
+        }
+        for (&self.frontiers) |*slot| {
+            if (slot.* == null) {
+                slot.* = frontier;
+                return;
+            }
+        }
+    }
+
+    fn onStateReport(self: *Server, body: []const u8, from: paxos.NodeId) void {
+        const report = wire.StateReport.decode(body) catch return;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.recordFrontier(.{
+            .node_id = from,
+            .configuration_id = report.configuration_id,
+            .durable_state_slot = report.durable_state_slot,
+            .history_hash = report.history_hash,
+            .executed_slot = report.executed_slot,
+            .persisted_slot = report.persisted_slot,
+            .local_delete_floor = report.local_delete_floor,
+        });
+    }
+
+    /// The v1 conservative trim: propose the minimum durable frontier of
+    /// every data replica once it passes the chosen trim. Frozen while a
+    /// membership change is pending or any data replica is silent.
+    fn maybeProposeTrim(self: *Server) !void {
+        if (self.node.membership_change_pending or
+            self.node.log.stop_pending) return;
+        self.recordFrontier(self.node.frontier());
+        var data_buffer: [types.log_options.max_members]paxos.NodeId = undefined;
+        const data = self.dataReplicaIds(&data_buffer);
+        if (data.len == 0) return;
+        const candidate = (try trim.candidate(
+            &self.frontiers,
+            data,
+            self.node.identity.configuration_id,
+        )) orelse return;
+        if (candidate.through_slot <= self.node.trim_state.through_slot) return;
+        try self.node.proposeTrim(candidate);
+    }
+
+    /// The current data replicas: every voter the decided registry maps
+    /// to a materializing role, or every voter on flag-based clusters.
+    fn dataReplicaIds(
+        self: *Server,
+        buffer: *[types.log_options.max_members]paxos.NodeId,
+    ) []const paxos.NodeId {
+        var count: usize = 0;
+        for (self.node.memberIds()) |member| {
+            if (self.node.decidedRegistry()) |decided| {
+                if (decided.findNode(member)) |record| {
+                    if (!record.role.capabilities().materializes) continue;
+                }
+            }
+            buffer[count] = member;
+            count += 1;
+        }
+        return buffer[0..count];
+    }
+
+    /// Undoes the last rotation advance so the same peer is probed
+    /// again; used when the probe could not actually be sent.
+    fn retreatRecoveryProbe(self: *Server) void {
+        const count = self.node.member_count;
+        if (count == 0) return;
+        self.recovery_probe = (self.recovery_probe + count - 1) % count;
+    }
+
+    /// The next registry peer to probe for joiner recovery, rotating so
+    /// a dead or unhelpful peer never wedges the join.
+    fn nextRecoveryPeer(self: *Server) ?paxos.NodeId {
+        const members = self.node.members[0..self.node.member_count];
+        if (members.len <= 1) return null;
+        var index: usize = 0;
+        while (index < members.len) : (index += 1) {
+            const pick = members[(self.recovery_probe + index) % members.len];
+            if (pick == self.node.identity.node_id) continue;
+            self.recovery_probe = (self.recovery_probe + index + 1) % members.len;
+            return pick;
+        }
+        return null;
+    }
+
     fn requestSnapshot(self: *Server, from: paxos.NodeId) void {
+        _ = self.requestSnapshotSent(from);
+    }
+
+    /// Like `requestSnapshot`, but reports whether a request actually
+    /// went out: a peer whose sender connection is not up yet must not
+    /// consume a recovery probe.
+    fn requestSnapshotSent(self: *Server, from: paxos.NodeId) bool {
         if (self.snapshot_source != null and
             self.tick_count < self.snapshot_requested_tick + 400)
         {
-            return;
+            return true;
         }
-        const sender = self.senderFor(from) orelse return;
+        const sender = self.senderFor(from) orelse return false;
         self.snapshot_source = from;
         self.snapshot_requested_tick = self.tick_count;
-        const frame = wire.frameAlloc(self.gpa, .snapshot_request, &.{}) catch return;
+        var body: [wire.SnapshotRequest.encoded_size]u8 = undefined;
+        const encoded = (wire.SnapshotRequest{
+            .applied_slot = self.node.applied_slot,
+        }).encode(&body);
+        const frame = wire.frameAlloc(self.gpa, .snapshot_request, &.{encoded}) catch
+            return false;
         sender.enqueue(frame);
+        return true;
     }
 
     // ------------------------------------------------------------------
@@ -1828,13 +2003,58 @@ pub const Server = struct {
                 self.wakeWaiters();
                 self.closeExpiredConnections();
 
+                // A joining replacement fetches the decided registry it
+                // was enrolled against before it can participate.
+                if (self.tick_count % 20 == 0 and
+                    self.node.join_descriptor != null)
+                {
+                    self.requestJoinRegistry();
+                }
+                self.node.releaseCampaignHold();
+
+                // A stateless joiner cannot learn the leader from
+                // heartbeats: they are ignored above its zero promise
+                // until a first accepted vote arrives, and an idle
+                // cluster sends no accepts. Recovery must not wait for
+                // an application write, so the joiner probes the decided
+                // registry's peers directly; the sender side arbitrates
+                // between range recovery and an image transfer.
+                if (self.tick_count % 20 == 10 and
+                    self.node.join_campaign_hold and
+                    self.node.join_descriptor == null)
+                {
+                    if (self.nextRecoveryPeer()) |peer| {
+                        self.node.requestCatchUp(peer) catch {};
+                        if (!self.requestSnapshotSent(peer)) {
+                            // The peer's sender is not connected yet;
+                            // retry the same peer on the next probe
+                            // instead of burning the rotation slot.
+                            self.retreatRecoveryProbe();
+                        }
+                        self.pump();
+                    }
+                }
+
                 // A member that observes a further-ahead leader asks for
-                // the decided suffix it is missing.
+                // the decided suffix it is missing. When repeated range
+                // recovery makes no progress the gap sits below cluster
+                // retention, and only a full-image transfer closes it.
                 if (self.tick_count % 20 == 0 and !self.node.isLeader()) {
                     if (self.node.currentLeader()) |leader| {
                         if (leader != self.node.identity.node_id and
                             self.observed_leader_decided > self.node.log.decidedThrough())
                         {
+                            const decided = self.node.log.decidedThrough();
+                            if (decided > self.catch_up_last_decided) {
+                                self.catch_up_last_decided = decided;
+                                self.catch_up_stalled = 0;
+                            } else {
+                                self.catch_up_stalled += 1;
+                            }
+                            if (self.catch_up_stalled >= 10) {
+                                self.catch_up_stalled = 0;
+                                self.requestSnapshot(leader);
+                            }
                             self.node.requestCatchUp(leader) catch {};
                             self.pump();
                         }
@@ -2222,7 +2442,7 @@ pub const Server = struct {
                 .payload_request => self.onPayloadRequest(body, hello.node_id),
                 .fence_request => self.onFenceRequest(body, hello.node_id),
                 .fence_ack => self.onFenceAck(body, hello.node_id),
-                .snapshot_request => self.onSnapshotRequest(hello.node_id),
+                .snapshot_request => self.onSnapshotRequest(body, hello.node_id),
                 .snapshot_begin => try self.onSnapshotBegin(
                     body,
                     &install,
@@ -2243,6 +2463,7 @@ pub const Server = struct {
                     body,
                     hello.node_id,
                 ),
+                .state_report => self.onStateReport(body, hello.node_id),
                 .registry_request => self.onRegistryRequest(body, hello.node_id),
                 .registry_data => try self.onRegistryData(body, &install),
                 .installation_ready => try self.onInstallationReady(body, hello.node_id),
@@ -2281,10 +2502,9 @@ pub const Server = struct {
         const local_configuration = self.node.identity.configuration_id;
         if (frame_configuration < local_configuration) return;
         if (frame_configuration > local_configuration) {
-            // The cluster moved to an epoch we have not completed.
-            if (!self.node.rollover_pending) {
-                self.requestSnapshot(from);
-            }
+            // The cluster moved to a configuration this node has not
+            // completed; recovery rides the transfer-lease state install.
+            self.requestSnapshot(from);
             return;
         }
         if (local_configuration != self.transport_configuration_id) return;
@@ -2492,34 +2712,53 @@ pub const Server = struct {
         self.pump();
     }
 
-    fn onSnapshotRequest(self: *Server, from: paxos.NodeId) void {
+    fn onSnapshotRequest(self: *Server, body: []const u8, from: paxos.NodeId) void {
+        const request = wire.SnapshotRequest.decode(body) catch return;
         const sender = self.senderFor(from) orelse return;
 
+        // Serve a full-image transfer only when the retained journal can
+        // no longer cover the peer's gap; otherwise range recovery over
+        // ordinary commit envelopes is cheaper and does the same job.
         self.mutex.lockUncancelable(self.io);
-        var handle = self.node.openCurrentSnapshot() catch {
+        if (!self.node.capabilities.materializes or
+            self.node.journal.retainedFirstSlot() <= request.applied_slot + 1)
+        {
             self.mutex.unlock(self.io);
+            std.log.info(
+                "node {d}: declining transfer for peer {d}; range recovery covers it",
+                .{ self.node.identity.node_id, from },
+            );
+            return;
+        }
+        std.log.info(
+            "node {d}: pinning transfer image for peer {d}",
+            .{ self.node.identity.node_id, from },
+        );
+        var pin = self.node.pinTransferImage() catch |err| {
+            self.mutex.unlock(self.io);
+            std.log.warn("transfer pin failed: {s}", .{@errorName(err)});
             return;
         };
-        self.mutex.unlock(self.io);
-        defer handle.close(self.io, self.gpa);
-
-        // Send the decided registry blob ahead of the transfer: a joining
-        // replacement has no predecessor registry to reconstruct from, and
-        // ordering the blob first removes any race with a small snapshot.
-        // The receiver verifies it against its quorum-confirmed proof
-        // digest, so an unneeded or stale blob is harmless.
-        self.mutex.lockUncancelable(self.io);
-        const registry_blob: ?[]u8 = if (self.node.decidedRegistry() != null)
-            self.node.readRegistryBlob(self.gpa, handle.configuration_id) catch null
+        const registry_digest: [32]u8 = if (self.node.decidedRegistry()) |decided|
+            decided.digest()
+        else
+            [_]u8{0} ** 32;
+        const registry_blob: ?[]u8 = if (self.node.decidedRegistry()) |decided|
+            self.node.readRegistryBlob(self.gpa, decided.configuration_id) catch null
         else
             null;
         self.mutex.unlock(self.io);
+        defer pin.close();
+
+        // The decided registry blob goes ahead of the image: a joining
+        // replacement needs it first, and a receiver that already holds
+        // it verifies and ignores the duplicate.
         if (registry_blob) |blob| {
             defer self.gpa.free(blob);
             if (blob.len > 0 and blob.len <= wire.RegistryData.max_blob_bytes) {
                 var body_buffer: [wire.RegistryData.max_encoded_size]u8 = undefined;
                 if ((wire.RegistryData{
-                    .configuration_id = handle.configuration_id,
+                    .configuration_id = pin.anchor.configuration_id,
                     .blob = blob,
                 }).encode(&body_buffer)) |encoded| {
                     if (wire.frameAlloc(self.gpa, .registry_data, &.{encoded})) |frame| {
@@ -2530,23 +2769,32 @@ pub const Server = struct {
         }
 
         const begin = wire.SnapshotBegin{
-            .configuration_id = handle.configuration_id,
-            .name = handle.name,
-            .db_size = handle.db_size,
-            .manifest = handle.manifest,
-            .proof = handle.proof,
+            .configuration_id = pin.anchor.configuration_id,
+            .anchor_slot = pin.anchor.global_slot,
+            .history_hash = pin.anchor.history_hash,
+            .db_size = pin.size,
+            .image_sha256 = pin.sha256,
+            .sqlite_page_size = pin.anchor.sqlite_page_size,
+            .last_data_slot = pin.anchor.last_data_slot,
+            .last_batch_id = pin.anchor.last_batch_id,
+            .last_chain = pin.anchor.last_chain,
+            .registry_digest = registry_digest,
         };
-        var begin_buffer: [wire.SnapshotBegin.max_encoded_size]u8 = undefined;
+        var begin_buffer: [wire.SnapshotBegin.encoded_size]u8 = undefined;
         const begin_encoded = begin.encode(&begin_buffer);
-        const begin_frame = wire.frameAlloc(self.gpa, .snapshot_begin, &.{begin_encoded}) catch
-            return;
+        const begin_frame = wire.frameAlloc(
+            self.gpa,
+            .snapshot_begin,
+            &.{begin_encoded},
+        ) catch return;
         if (!sender.enqueueBackpressure(begin_frame)) return;
 
         var offset: u64 = 0;
         const chunk = self.gpa.alloc(u8, snapshot_chunk_bytes) catch return;
         defer self.gpa.free(chunk);
-        while (offset < handle.db_size) {
-            const read = handle.file.readPositionalAll(self.io, chunk, offset) catch return;
+        while (offset < pin.size) {
+            const read = pin.file.readPositionalAll(self.io, chunk, offset) catch
+                return;
             if (read == 0) break;
             var offset_bytes: [8]u8 = undefined;
             std.mem.writeInt(u64, &offset_bytes, offset, .little);
@@ -2572,83 +2820,37 @@ pub const Server = struct {
         install.reset(self.io, self.gpa);
 
         self.mutex.lockUncancelable(self.io);
-        if (begin.configuration_id <= self.node.identity.configuration_id) {
-            self.mutex.unlock(self.io);
-            return;
-        }
-        if (begin.db_size == 0 or begin.db_size > self.options.max_transfer_bytes) {
-            self.mutex.unlock(self.io);
-            return error.InvalidFrame;
-        }
-        const proof_digest = self.node.validateCheckpointProof(
-            begin.proof,
-            begin.configuration_id,
-            begin.name,
-            begin.manifest,
-        ) catch |err| {
-            self.mutex.unlock(self.io);
-            return err;
-        };
+        const stale = begin.configuration_id != self.node.identity.configuration_id or
+            begin.anchor_slot <= self.node.applied_slot;
+        const oversized = begin.db_size > self.options.max_transfer_bytes;
         self.mutex.unlock(self.io);
+        if (stale) return;
+        if (oversized) return error.InvalidFrame;
 
-        const proof = try checkpoint_proof.decode(begin.proof);
-        try self.confirmCheckpointProof(
-            proof.sealed_configuration_id,
-            proof.sealedMembersSlice(),
-            proof_digest,
-            from,
-        );
+        // Never trust a single sender for base state: a read quorum of
+        // the current voters must vouch the anchor's history binding
+        // before any image byte is staged (ZDS 0011).
+        try self.confirmHistoryQuorum(begin.anchor_slot, begin.history_hash, from);
 
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        // Another handler may have advanced us while the quorum probe was
-        // in flight. Never let an older transfer replace newer local state.
-        if (begin.configuration_id <= self.node.identity.configuration_id) return;
-        var dir = try self.node.beginSnapshotInstall();
-        errdefer dir.close(self.io);
-        const file = try dir.createFile(self.io, "db", .{ .read = true });
-        install.dir = dir;
+        if (begin.anchor_slot <= self.node.applied_slot) return;
+        self.node.dir.deleteFile(self.io, node_mod.transfer_install_name) catch {};
+        const file = try self.node.dir.createFile(
+            self.io,
+            node_mod.transfer_install_name,
+            .{ .read = true },
+        );
         install.file = file;
         install.configuration_id = begin.configuration_id;
         install.db_size = begin.db_size;
         install.received = 0;
-        install.name = begin.name;
-        install.manifest = try self.gpa.dupe(u8, begin.manifest);
-        errdefer {
-            self.gpa.free(install.manifest.?);
-            install.manifest = null;
-        }
-        install.proof = try self.gpa.dupe(u8, begin.proof);
-
-        // A joining replacement has no predecessor registry to reconstruct
-        // from: ask the transfer source for the decided blob. The reply
-        // arrives interleaved with the snapshot chunks on this connection.
-        if (self.node.decidedRegistry() == null and
-            !std.mem.eql(
-                u8,
-                &proof.next_registry_digest,
-                &checkpoint_proof.no_registry_digest,
-            ))
-        {
+        install.manifest = try self.gpa.dupe(u8, body);
+        if (self.installation == .not_applicable or self.installation == .failed) {
             self.installation = .transferring;
-            if (self.senderFor(from)) |sender| {
-                var request_buffer: [wire.RegistryRequest.encoded_size]u8 = undefined;
-                const encoded = (wire.RegistryRequest{
-                    .configuration_id = begin.configuration_id,
-                }).encode(&request_buffer);
-                const frame = try wire.frameAlloc(
-                    self.gpa,
-                    .registry_request,
-                    &.{encoded},
-                );
-                sender.enqueue(frame);
-            }
         }
     }
 
-    /// Serves a joining replacement's decided-registry fetch. The blob is
-    /// self-authenticating downstream: the receiver checks it against the
-    /// digest its quorum-confirmed proof binds.
     fn onRegistryRequest(self: *Server, body: []const u8, from: paxos.NodeId) void {
         const request = wire.RegistryRequest.decode(body) catch return;
         const sender = self.senderFor(from) orelse return;
@@ -2680,9 +2882,47 @@ pub const Server = struct {
     ) !void {
         const data = wire.RegistryData.decode(body) catch
             return error.InvalidFrame;
+        {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            if (self.node.join_descriptor != null) {
+                // A joining replacement adopts the registry it enrolled
+                // against, then joins its configuration at slot zero and
+                // catches up through the retained journal (ZDS 0011).
+                self.node.installFetchedRegistry(data.blob) catch |err| {
+                    std.log.warn(
+                        "fetched registry rejected: {s}",
+                        .{@errorName(err)},
+                    );
+                    return;
+                };
+                self.enterConfigurationLocked();
+                self.pump();
+                return;
+            }
+        }
         if (install.registry_blob) |old| self.gpa.free(old);
         install.registry_blob = try self.gpa.dupe(u8, data.blob);
         install.registry_blob_configuration = data.configuration_id;
+    }
+
+    /// Asks every connected peer for the decided registry blob named by
+    /// this node's join descriptor.
+    fn requestJoinRegistry(self: *Server) void {
+        const join = self.node.join_descriptor orelse return;
+        var request_buffer: [wire.RegistryRequest.encoded_size]u8 = undefined;
+        const encoded = (wire.RegistryRequest{
+            .configuration_id = join.configuration_id,
+        }).encode(&request_buffer);
+        for (self.senders.items) |sender| {
+            if (!sender.isConnected()) continue;
+            const frame = wire.frameAlloc(
+                self.gpa,
+                .registry_request,
+                &.{encoded},
+            ) catch return;
+            sender.enqueue(frame);
+        }
     }
 
     fn onSnapshotChunk(self: *Server, body: []const u8, install: *InstallState) !void {
@@ -2699,43 +2939,29 @@ pub const Server = struct {
         }
         try file.writePositionalAll(self.io, chunk.bytes, chunk.offset);
         install.received += chunk.bytes.len;
+        failpoint.hit("after_transfer_chunk");
     }
 
     fn onSnapshotEnd(self: *Server, install: *InstallState, from: paxos.NodeId) !void {
         const file = install.file orelse return;
         if (install.received != install.db_size) return error.InvalidFrame;
         try durability.syncFile(self.io, file);
+        failpoint.hit("after_transfer_stage");
         file.close(self.io);
         install.file = null;
-        if (install.dir) |*dir| dir.close(self.io);
-        install.dir = null;
         const manifest = install.manifest orelse return;
-        const proof = install.proof orelse return;
         defer {
             self.gpa.free(manifest);
             install.manifest = null;
-            self.gpa.free(proof);
-            install.proof = null;
         }
-        const registry_blob: ?[]const u8 = if (install.registry_blob != null and
-            install.registry_blob_configuration == install.configuration_id)
-            install.registry_blob
-        else
-            null;
+        const begin = try wire.SnapshotBegin.decode(manifest);
 
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         self.snapshot_source = null;
         if (self.installation == .transferring) self.installation = .verifying;
-        const previous_configuration = self.node.identity.configuration_id;
-        self.node.installSnapshot(
-            install.configuration_id,
-            install.name,
-            manifest,
-            proof,
-            registry_blob,
-        ) catch |err| {
-            std.log.warn("snapshot install failed: {s}", .{@errorName(err)});
+        self.node.installTransferredState(begin) catch |err| {
+            std.log.warn("state install failed: {s}", .{@errorName(err)});
             if (self.installation != .not_applicable) {
                 self.installation = .failed;
                 self.installation_failure = err;
@@ -2743,50 +2969,87 @@ pub const Server = struct {
             return;
         };
         if (self.installation != .not_applicable) {
-            // The image is durable. It becomes active only after the
-            // matching transport generation has been published.
             self.installation = .installed;
             self.installation_failure = null;
-        }
-        // The install advances the identity before `pump` runs, so the
-        // pump's own configuration-change detection cannot see it.
-        if (self.node.identity.configuration_id != previous_configuration) {
-            self.enterConfigurationLocked();
         }
         self.observed_leader_decided = 0;
         self.node.requestCatchUp(from) catch {};
         self.pump();
     }
 
-    fn confirmCheckpointProof(
+    fn onCheckpointProofRequest(
         self: *Server,
-        sealed_configuration_id: u64,
-        sealed_members: []const paxos.NodeId,
-        digest: [32]u8,
+        body: []const u8,
+        from: paxos.NodeId,
+    ) void {
+        const probe = wire.HistoryProbe.decode(body) catch return;
+        const sender = self.senderFor(from) orelse return;
+        self.mutex.lockUncancelable(self.io);
+        const local = self.node.historyHashAt(probe.slot);
+        self.mutex.unlock(self.io);
+        const hash = local orelse return;
+        if (!std.mem.eql(u8, &hash, &probe.hash)) return;
+
+        var reply_buffer: [wire.HistoryProbe.encoded_size]u8 = undefined;
+        const encoded = probe.encode(&reply_buffer);
+        const frame = wire.frameAlloc(
+            self.gpa,
+            .checkpoint_proof_reply,
+            &.{encoded},
+        ) catch return;
+        sender.enqueue(frame);
+    }
+
+    fn onCheckpointProofReply(
+        self: *Server,
+        body: []const u8,
+        from: paxos.NodeId,
+    ) void {
+        const vouch = wire.HistoryProbe.decode(body) catch return;
+        self.proof_mutex.lockUncancelable(self.io);
+        defer self.proof_mutex.unlock(self.io);
+        const waiter = self.proof_waiter orelse return;
+        if (waiter.nonce != vouch.nonce or waiter.slot != vouch.slot or
+            !std.mem.eql(u8, &waiter.hash, &vouch.hash))
+        {
+            return;
+        }
+        waiter.noteAck(from);
+    }
+
+    /// Blocks until a read quorum of the current voters vouches that the
+    /// chosen history through `slot` has hash `hash`. The transfer sender
+    /// counts as the first vouch; the local node vouches for itself when
+    /// it can.
+    fn confirmHistoryQuorum(
+        self: *Server,
+        slot: paxos.Slot,
+        hash: [32]u8,
         source: paxos.NodeId,
     ) !void {
-        if (sealed_members.len == 0) return error.CheckpointProofQuorum;
+        self.mutex.lockUncancelable(self.io);
+        const members = self.node.memberIds();
+        var waiter = HistoryProbeWaiter{
+            .nonce = 0,
+            .slot = slot,
+            .hash = hash,
+            .needed = members.len / 2 + 1,
+        };
+        @memcpy(waiter.voters[0..members.len], members);
+        waiter.voter_count = @intCast(members.len);
+        self.mutex.unlock(self.io);
+        if (waiter.voter_count == 0) return error.HistoryQuorum;
 
         self.proof_mutex.lockUncancelable(self.io);
         if (self.proof_waiter != null) {
             self.proof_mutex.unlock(self.io);
-            return error.CheckpointProofBusy;
+            return error.HistoryProbeBusy;
         }
         var nonce = self.next_proof_nonce;
         self.next_proof_nonce +%= 1;
         if (self.next_proof_nonce == 0) self.next_proof_nonce = 1;
         if (nonce == 0) nonce = 1;
-        var waiter = CheckpointProofWaiter{
-            .nonce = nonce,
-            .sealed_configuration_id = sealed_configuration_id,
-            .digest = digest,
-            .needed = sealed_members.len / 2 + 1,
-        };
-        @memcpy(waiter.sealed_members[0..sealed_members.len], sealed_members);
-        waiter.sealed_count = @intCast(sealed_members.len);
-        // SnapshotBegin itself is a matching report from its authenticated
-        // source. Count it exactly once when that source is a sealed
-        // voter, then probe the remaining sealed voters independently.
+        waiter.nonce = nonce;
         waiter.noteAck(source);
         self.proof_waiter = &waiter;
         self.proof_mutex.unlock(self.io);
@@ -2796,14 +3059,14 @@ pub const Server = struct {
             self.proof_mutex.unlock(self.io);
         }
 
-        var probe_buffer: [wire.CheckpointProofProbe.encoded_size]u8 = undefined;
-        const encoded = (wire.CheckpointProofProbe{
+        var probe_buffer: [wire.HistoryProbe.encoded_size]u8 = undefined;
+        const encoded = (wire.HistoryProbe{
             .nonce = nonce,
-            .sealed_configuration_id = sealed_configuration_id,
-            .digest = digest,
+            .slot = slot,
+            .hash = hash,
         }).encode(&probe_buffer);
         for (self.senders.items) |sender| {
-            if (!waiter.isSealedVoter(sender.peer.id)) continue;
+            if (!waiter.isVoter(sender.peer.id)) continue;
             const frame = try wire.frameAlloc(
                 self.gpa,
                 .checkpoint_proof_request,
@@ -2820,55 +3083,9 @@ pub const Server = struct {
             if (confirmed) return;
             if (self.isShutdown()) return error.Shutdown;
             self.io.sleep(.fromMilliseconds(1), .awake) catch
-                return error.CheckpointProofQuorum;
+                return error.HistoryQuorum;
         }
-        return error.CheckpointProofQuorum;
-    }
-
-    fn onCheckpointProofRequest(
-        self: *Server,
-        body: []const u8,
-        from: paxos.NodeId,
-    ) void {
-        const probe = wire.CheckpointProofProbe.decode(body) catch return;
-        const sender = self.senderFor(from) orelse return;
-        self.mutex.lockUncancelable(self.io);
-        const local = self.node.currentCheckpointProofDigest(
-            probe.sealed_configuration_id,
-        ) catch {
-            self.mutex.unlock(self.io);
-            return;
-        };
-        self.mutex.unlock(self.io);
-        if (!std.mem.eql(u8, &local, &probe.digest)) return;
-
-        var reply_buffer: [wire.CheckpointProofProbe.encoded_size]u8 = undefined;
-        const encoded = probe.encode(&reply_buffer);
-        const frame = wire.frameAlloc(
-            self.gpa,
-            .checkpoint_proof_reply,
-            &.{encoded},
-        ) catch return;
-        sender.enqueue(frame);
-    }
-
-    fn onCheckpointProofReply(
-        self: *Server,
-        body: []const u8,
-        from: paxos.NodeId,
-    ) void {
-        const probe = wire.CheckpointProofProbe.decode(body) catch return;
-        self.proof_mutex.lockUncancelable(self.io);
-        defer self.proof_mutex.unlock(self.io);
-        const waiter = self.proof_waiter orelse return;
-        if (waiter.nonce != probe.nonce or
-            waiter.sealed_configuration_id != probe.sealed_configuration_id or
-            !std.mem.eql(u8, &waiter.digest, &probe.digest))
-        {
-            return;
-        }
-        // noteAck admits only distinct members of the sealed voter set.
-        waiter.noteAck(from);
+        return error.HistoryQuorum;
     }
 
     // ------------------------------------------------------------------
@@ -3103,8 +3320,8 @@ pub const Server = struct {
             return self.opSession(out);
         } else if (std.mem.eql(u8, request.op, "wait")) {
             return self.opWait(request, out);
-        } else if (std.mem.eql(u8, request.op, "snapshot")) {
-            return self.opSnapshot(out);
+        } else if (std.mem.eql(u8, request.op, "anchor")) {
+            return self.opStateAnchor(out);
         } else if (std.mem.eql(u8, request.op, "enable-search-feature")) {
             return self.opEnableSearchFeature(out);
         } else if (std.mem.eql(u8, request.op, "integrity")) {
@@ -3256,7 +3473,7 @@ pub const Server = struct {
                 installation_state,
             },
         );
-        try writeMembershipOperation(out, pending, installation_error);
+        try status_json.writeMembershipOperation(out, pending, installation_error);
         try out.writeAll(",\"nodes\":[");
         for (decided.nodesSlice(), 0..) |*record, index| {
             if (index > 0) try out.writeAll(",");
@@ -3274,7 +3491,9 @@ pub const Server = struct {
     /// `quorum_available` for that fact. Caller holds `mutex`.
     fn membershipPhase(self: *Server) ![]const u8 {
         if (self.retired) return "retired";
-        if (self.node.rollover_pending or self.node.log.isReconfigured() != null) {
+        if (self.node.membership_change_pending or
+            self.node.log.isReconfigured() != null)
+        {
             return "chosen";
         }
         if (try self.node.pendingOperation()) |pending| {
@@ -3497,47 +3716,16 @@ pub const Server = struct {
         const installation_state = self.installationState();
         const installation_error = self.installationError();
         self.mutex.unlock(self.io);
-        const chain_hex = std.fmt.bytesToHex(status.chain, .lower);
-        try out.print(
-            "{{\"ok\":true,\"node_id\":{d},\"database_id\":\"{x:0>32}\"," ++
-                "\"configuration_id\":{d},\"role\":\"{s}\"," ++
-                "\"node_type\":\"{s}\",\"leader\":{?d}," ++
-                "\"phase\":\"{s}\",\"quorum_available\":{}," ++
-                "\"installation_state\":\"{s}\"," ++
-                "\"ballot\":{{\"round\":{d},\"priority\":{d},\"node\":{d}}}," ++
-                "\"decided_slot\":{d},\"applied_slot\":{d}," ++
-                "\"journal_records\":{d},\"epoch_capacity\":{d}," ++
-                "\"chain\":\"{s}\",\"page_size\":{d}," ++
-                "\"fts5_enabled\":{}," ++
-                "\"sqlite_vec_version\":\"{s}\"," ++
-                "\"search_feature_version\":{d}," ++
-                "\"simd_backend\":\"{s}\"," ++
-                "\"mmap_size\":{d}," ++
-                "\"candidate_hard_limit\":{d}," ++
-                "\"write_gate\":\"fifo-v1\"," ++
-                "\"typed_v1\":true,",
-            .{
-                status.node_id,                status.database_id,
-                status.configuration_id,       status.role,
-                status.node_type,              leader,
-                phase,                         quorum_available,
-                installation_state,            status.ballot.round,
-                status.ballot.priority,        status.ballot.node,
-                status.decided_slot,           status.applied_slot,
-                status.journal_records,        status.epoch_capacity,
-                &chain_hex,                    status.page_size,
-                status.fts5_enabled,           status.sqlite_vec_version,
-                status.search_feature_version, status.simd_backend,
-                status.mmap_size,              status.candidate_hard_limit,
-            },
+        try status_json.writeHead(
+            out,
+            status,
+            leader,
+            phase,
+            quorum_available,
+            installation_state,
         );
-        try writeMembershipOperation(out, pending, installation_error);
-        try out.writeAll(",\"snapshot\":");
-        if (status.snapshot) |name| {
-            try out.print("\"{s}\"}}", .{&name});
-        } else {
-            try out.writeAll("null}");
-        }
+        try status_json.writeMembershipOperation(out, pending, installation_error);
+        try out.writeAll("}");
     }
 
     fn opMembers(self: *Server, out: *Io.Writer) !void {
@@ -3675,26 +3863,10 @@ pub const Server = struct {
 
         if (!self.node.isLeader()) return error.NotLeader;
 
-        // Roll the epoch before it fills; wait out an in-progress rollover.
-        var start_tick: u64 = self.tick_count;
-        while (self.node.epochNearlyFull() or self.node.rollover_pending or
-            self.node.log.stop_pending)
-        {
-            if (self.node.isLeader() and !self.checkpoint_started and
-                !self.node.rollover_pending and !self.node.log.stop_pending)
-            {
-                try self.node.prepareCheckpoint();
-                self.checkpoint_started = true;
-                self.pump();
-                continue;
-            }
-            // Still pre-execution: expiry here provably ran no SQL.
-            if (self.elapsedMs(start_tick) > op_timeout_ms) {
-                return error.OpTimeoutQueued;
-            }
-            self.rollover_cond.waitUncancelable(self.io, &self.mutex);
-            if (self.failed) return error.Unavailable;
-            if (!self.node.isLeader()) return error.NotLeader;
+        // Slots continue globally (ZDS 0011); only a decided membership
+        // change seals the log. Waiting here would never unseal it.
+        if (self.node.membership_change_pending or self.node.log.stop_pending) {
+            return error.LogSealed;
         }
 
         self.node.ensureWriter() catch return error.Unavailable;
@@ -3733,7 +3905,7 @@ pub const Server = struct {
         };
         self.write_waiter = &waiter;
         self.pump();
-        start_tick = self.tick_count;
+        const start_tick = self.tick_count;
         while (waiter.outcome == .pending) {
             if (self.elapsedMs(start_tick) > op_timeout_ms) {
                 if (self.write_waiter == &waiter) self.write_waiter = null;
@@ -4080,7 +4252,11 @@ pub const Server = struct {
             error.UnknownSession, error.SequenceGap, error.ResultExpired => {
                 try writeErrorResponse(out, "session", @errorName(err));
             },
-            error.LogSealed => try writeErrorResponse(out, "retry", "epoch rolling over"),
+            error.LogSealed => try writeErrorResponse(
+                out,
+                "retry",
+                "membership change in progress",
+            ),
             error.TransactionTooLarge => try writeErrorResponse(
                 out,
                 "too_large",
@@ -4090,6 +4266,11 @@ pub const Server = struct {
                 out,
                 "unavailable",
                 "durable storage failed; node stopped",
+            ),
+            error.RecoveryRetentionExceeded => try writeErrorResponse(
+                out,
+                "unavailable",
+                "journal storage ceiling reached; awaiting trim or capacity",
             ),
             else => try writeErrorResponse(out, "internal", @errorName(err)),
         }
@@ -4513,45 +4694,18 @@ pub const Server = struct {
         );
     }
 
-    fn opSnapshot(self: *Server, out: *Io.Writer) !void {
+    fn opStateAnchor(self: *Server, out: *Io.Writer) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.failed) {
             return writeErrorResponse(out, "unavailable", "node failed");
         }
-        if (!self.node.isLeader()) {
-            self.mutex.unlock(self.io);
-            defer self.mutex.lockUncancelable(self.io);
-            return self.writeNotLeader(out);
-        }
-        if (self.node.single) {
-            self.node.snapshot() catch |err| {
-                return writeErrorResponse(out, "internal", @errorName(err));
-            };
-            self.pump();
-            return out.print(
-                "{{\"ok\":true,\"configuration_id\":{d}}}",
-                .{self.node.identity.configuration_id},
-            );
-        }
-        const before = self.node.identity.configuration_id;
-        if (!self.checkpoint_started and !self.node.rollover_pending) {
-            self.node.prepareCheckpoint() catch |err| {
-                return writeErrorResponse(out, "internal", @errorName(err));
-            };
-            self.checkpoint_started = true;
-            self.pump();
-        }
-        const start_tick = self.tick_count;
-        while (self.node.identity.configuration_id == before) {
-            if (self.elapsedMs(start_tick) > op_timeout_ms) {
-                return writeErrorResponse(out, "timeout", "rollover incomplete");
-            }
-            self.rollover_cond.waitUncancelable(self.io, &self.mutex);
-        }
+        self.node.createStateAnchor() catch |err| {
+            return writeErrorResponse(out, "internal", @errorName(err));
+        };
         return out.print(
-            "{{\"ok\":true,\"configuration_id\":{d}}}",
-            .{self.node.identity.configuration_id},
+            "{{\"ok\":true,\"durable_state_slot\":{d}}}",
+            .{self.node.durable_state_slot},
         );
     }
 
@@ -5054,25 +5208,6 @@ fn writeReplacementError(out: *Io.Writer, err: anyerror) !void {
     return writeErrorResponse(out, response.code, response.message);
 }
 
-fn writeMembershipOperation(
-    out: *Io.Writer,
-    pending: ?Node.PendingOperation,
-    installation_error: ?[]const u8,
-) !void {
-    try out.writeAll("\"operation_id\":");
-    if (pending) |operation| {
-        try out.print("{d}", .{operation.operation_id});
-    } else {
-        try out.writeAll("null");
-    }
-    try out.writeAll(",\"installation_error\":");
-    if (installation_error) |message| {
-        try writeJsonString(out, message);
-    } else {
-        try out.writeAll("null");
-    }
-}
-
 fn writeSqlError(out: *Io.Writer, message: []const u8) !void {
     try out.writeAll("{\"ok\":false,\"error\":\"sql\",\"message\":");
     try writeJsonString(out, message);
@@ -5215,23 +5350,23 @@ test "payload gate releases envelopes only after storage ack" {
     try std.testing.expectEqual(@as(usize, 1), sender.queue.items.len);
 }
 
-test "checkpoint proof quorum counts distinct sealed voters only" {
-    var waiter = CheckpointProofWaiter{
+test "history probe quorum counts distinct voters only" {
+    var waiter = HistoryProbeWaiter{
         .nonce = 1,
-        .sealed_configuration_id = 7,
-        .digest = [_]u8{9} ** 32,
+        .slot = 7,
+        .hash = [_]u8{9} ** 32,
         .needed = 2,
     };
-    waiter.sealed_members[0] = 1;
-    waiter.sealed_members[1] = 2;
-    waiter.sealed_members[2] = 3;
-    waiter.sealed_count = 3;
+    waiter.voters[0] = 1;
+    waiter.voters[1] = 2;
+    waiter.voters[2] = 3;
+    waiter.voter_count = 3;
 
-    // The proposed next voter never helps satisfy the sealed quorum.
+    // A non-voter never helps satisfy the read quorum.
     waiter.noteAck(4);
     try std.testing.expectEqual(@as(usize, 0), waiter.ack_count);
 
-    // A sealed voter counts exactly once, however often it confirms.
+    // A voter counts exactly once, however often it vouches.
     waiter.noteAck(1);
     waiter.noteAck(1);
     try std.testing.expectEqual(@as(usize, 1), waiter.ack_count);

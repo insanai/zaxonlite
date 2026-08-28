@@ -3,13 +3,13 @@
 //!
 //! The Paxos journal plus content-addressed payload store are the
 //! authoritative durable state. The SQLite database image is a materialized
-//! state machine rebuildable from a snapshot plus the committed journal
-//! suffix.
+//! state machine rebuildable from the durable state anchor plus the
+//! retained journal suffix.
 
 const std = @import("std");
 
 /// Human-readable library version.
-pub const version = "0.3.0";
+pub const version = "0.6.0";
 
 /// Fixed-size replicated command descriptor and its canonical wire codec.
 pub const command = @import("command.zig");
@@ -17,6 +17,16 @@ pub const command = @import("command.zig");
 pub const Command = command.Command;
 /// The one concrete ReplicatedLog instantiation and its entry/write encodings.
 pub const types = @import("types.zig");
+/// The global ordered-history anchor over every chosen entry (ZDS 0011).
+pub const history = @import("history.zig");
+/// Alternating durable applied-state anchors for SQLite recovery (ZDS 0011).
+pub const applied_anchor = @import("applied_anchor.zig");
+/// Immutable journal v2 segments with sealed trailers (ZDS 0011).
+pub const segment = @import("segment.zig");
+/// The authoritative retained-segment manifest for journal v2 (ZDS 0011).
+pub const manifest = @import("manifest.zig");
+/// Conservative trim policy and the durable TRIM record (ZDS 0011).
+pub const trim = @import("trim.zig");
 /// Framed, checksummed, append-only protocol journal: the authoritative state.
 pub const journal = @import("journal.zig");
 /// Content-addressed, immutable transaction payload store (SHA-256 named).
@@ -25,7 +35,6 @@ pub const payload_store = @import("payload_store.zig");
 pub const PayloadStore = payload_store.PayloadStore;
 /// Canonical evidence that a transferable checkpoint is tied to the stop
 /// sign already chosen by Paxos; receivers confirm its digest with a quorum.
-pub const checkpoint_proof = @import("checkpoint_proof.zig");
 /// SQLite WAL frame capture and deterministic page-level apply.
 pub const wal = @import("wal.zig");
 /// Narrow SQLite C API bindings; the only module that touches the C header.
@@ -123,9 +132,13 @@ pub const EmbeddedOpenOptions = embedded.OpenOptions;
 test {
     _ = @import("command.zig");
     _ = @import("types.zig");
+    _ = @import("history.zig");
+    _ = @import("applied_anchor.zig");
+    _ = @import("segment.zig");
+    _ = @import("manifest.zig");
+    _ = @import("trim.zig");
     _ = @import("journal.zig");
     _ = @import("payload_store.zig");
-    _ = @import("checkpoint_proof.zig");
     _ = @import("sqlite.zig");
     _ = @import("guard.zig");
     _ = @import("prepared.zig");
@@ -149,6 +162,6 @@ test {
 }
 
 test "sqlite is linked and recent" {
-    try std.testing.expectEqualStrings("0.3.0", version);
+    try std.testing.expectEqualStrings("0.6.0", version);
     try std.testing.expect(sqlite.libversionNumber() >= 3050000);
 }

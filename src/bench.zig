@@ -5,18 +5,98 @@
 //! execute + WAL frame capture + payload store fsync + journal append +
 //! journal fsync + commit accounting. Reads run over the live connection.
 //! Recovery measures a full `Node.open` (journal replay + offline page
-//! apply + validation) over the committed epoch suffix.
+//! apply + validation) over the retained journal suffix.
+//!
+//! The write run also drives durable state anchors the way a server pump
+//! does (`maybeCreateStateAnchor` after every write), forcing an anchor
+//! at a fixed write interval so at least two anchor events land inside
+//! the run at any bench scale. Afterwards it prints the lag
+//! autocorrelation of the time-ordered per-write latency series at the
+//! anchor-interval lag and at the journal segment-rotation lag, flagging
+//! |r| > 0.2 as suspected periodicity. This is a self-contained printed
+//! check; it emits no results-protocol file.
 //!
 //! Usage: bench [writes] [reads]
 
 const std = @import("std");
 const Io = std.Io;
 const zaxonlite = @import("zaxonlite");
+const bench_stats = @import("bench_stats.zig");
 
 const Node = zaxonlite.Node;
 
 fn nowNs(io: Io) i96 {
     return std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds;
+}
+
+/// Predeclared report-only autocorrelation threshold for periodicity,
+/// matching the paxos-zig bench-gate's flag.
+const periodicity_flag = 0.2;
+
+/// Journal records per replicated write on the single-node path: one
+/// accept and one commit (the long-run retention gate documents the
+/// same two-records-per-write ratio).
+const journal_records_per_write = 2;
+
+/// One lag of the periodicity check over the per-write latency series.
+const LagCheck = struct {
+    name: []const u8,
+    lag: usize,
+    r: f64,
+    available: bool,
+};
+
+/// Computes the check while `samples` is still in time order; a lag of
+/// zero or past half the series is unavailable rather than misleading.
+fn lagCheck(name: []const u8, samples: []const u64, lag: usize) LagCheck {
+    if (lag == 0 or lag >= samples.len / 2) {
+        return .{ .name = name, .lag = lag, .r = 0, .available = false };
+    }
+    return .{
+        .name = name,
+        .lag = lag,
+        .r = bench_stats.autocorrelation(samples, lag),
+        .available = true,
+    };
+}
+
+fn printLagCheck(check: LagCheck, series_len: usize) void {
+    if (!check.available) {
+        std.debug.print(
+            "{s} autocorrelation: lag {d} unavailable for {d} write samples\n",
+            .{ check.name, check.lag, series_len },
+        );
+        return;
+    }
+    const verdict = if (@abs(check.r) > periodicity_flag)
+        "  PERIODICITY SUSPECTED (|r| > 0.2)"
+    else
+        "";
+    std.debug.print(
+        "{s} autocorrelation: lag {d} writes r={d:.3}{s}\n",
+        .{ check.name, check.lag, check.r, verdict },
+    );
+}
+
+/// The inter-completion series must see the forced anchor cadence: a
+/// low correlation there means the instrument is broken, not that the
+/// system is quiet.
+fn printControlCheck(check: LagCheck, series_len: usize) void {
+    if (!check.available) {
+        std.debug.print(
+            "{s}: lag {d} unavailable for {d} samples\n",
+            .{ check.name, check.lag, series_len },
+        );
+        return;
+    }
+    const verdict = if (check.r > periodicity_flag)
+        "  (positive control: anchors visible)"
+    else
+        "  ANCHORS INVISIBLE - instrument broken";
+    std.debug.print(
+        "{s}: lag {d} writes r={d:.3}{s}\n",
+        .{ check.name, check.lag, check.r, verdict },
+    );
 }
 
 const Stats = struct {
@@ -107,17 +187,42 @@ pub fn main(init: std.process.Init) !u8 {
     var node = try Node.open(gpa, io, .{ .directory = root });
     _ = try node.exec("create table b(id integer primary key, k integer, v text)");
 
-    try benchWrites(gpa, io, node, write_count);
+    const control_ok = try benchWrites(gpa, io, node, write_count);
     try benchReads(gpa, io, node, read_count, write_count);
     try benchRecovery(gpa, io, &node, root, write_count);
+    if (!control_ok) {
+        std.debug.print(
+            "FAILED: the anchor positive control did not register; the " ++
+                "periodicity instrument is broken\n",
+            .{},
+        );
+        return 1;
+    }
     return 0;
 }
 
-fn benchWrites(gpa: std.mem.Allocator, io: std.Io, node: *Node, write_count: usize) !void {
+fn benchWrites(gpa: std.mem.Allocator, io: std.Io, node: *Node, write_count: usize) !bool {
     const write_samples = try gpa.alloc(u64, write_count);
     defer gpa.free(write_samples);
+    // Anchors on the natural cadence would need 10,000 slots or 30
+    // seconds; the forced interval guarantees at least two anchor
+    // events inside the run at any bench scale while the maybe call
+    // keeps the natural cadence live. The periodicity series measures
+    // inter-completion time under the saturated loop -- each sample
+    // closes only after the iteration's anchor and pump duties -- so an
+    // anchor stall lands inside its own sample instead of vanishing
+    // between two write timings. The headline row keeps the bare
+    // per-exec timings.
+    const interval_samples = try gpa.alloc(u64, write_count);
+    defer gpa.free(interval_samples);
+    const anchored_flags = try gpa.alloc(bool, write_count);
+    defer gpa.free(anchored_flags);
+    const anchor_every = @max(write_count / 8, 32);
+    var anchor_events: usize = 0;
+    var anchor_duty_ns: u128 = 0;
     var sql_buffer: [160]u8 = undefined;
     const write_start = nowNs(io);
+    var last_completion = write_start;
     for (0..write_count) |index| {
         const sql = std.fmt.bufPrintZ(
             &sql_buffer,
@@ -126,10 +231,94 @@ fn benchWrites(gpa: std.mem.Allocator, io: std.Io, node: *Node, write_count: usi
         ) catch unreachable;
         const op_start = nowNs(io);
         _ = try node.exec(sql);
-        write_samples[index] = @intCast(nowNs(io) - op_start);
+        const exec_done = nowNs(io);
+        write_samples[index] = @intCast(exec_done - op_start);
+        const iteration_anchored = try runAnchorDuty(node, index, anchor_every);
+        if (iteration_anchored) anchor_events += 1;
+        anchored_flags[index] = iteration_anchored;
+        const completion = nowNs(io);
+        anchor_duty_ns += @intCast(completion - exec_done);
+        interval_samples[index] = @intCast(completion - last_completion);
+        last_completion = completion;
     }
     const write_elapsed = nowNs(io) - write_start;
-    printRow("write", write_count, write_elapsed, Stats.compute(write_samples));
+    // Both checks read the series in time order, before Stats.compute
+    // sorts it into order statistics.
+    // The inter-completion series carries the anchor cost itself: the
+    // forced cadence must register there with positive correlation
+    // (positive control). The bare per-exec series answers the gate
+    // question -- whether anchoring degrades the writes around it.
+    const control_check = lagCheck(
+        "anchor-cost visibility",
+        interval_samples,
+        anchor_every,
+    );
+    const anchor_check = lagCheck("anchor-interval", write_samples, anchor_every);
+    const rotation_lag = zaxonlite.segment.rotation_records / journal_records_per_write;
+    const rotation_check = lagCheck("segment-rotation", write_samples, rotation_lag);
+    try reportWriteRun(
+        gpa,
+        interval_samples,
+        write_samples,
+        anchored_flags,
+        write_elapsed,
+        anchor_duty_ns,
+        anchor_events,
+        anchor_every,
+    );
+    printControlCheck(control_check, write_count);
+    printLagCheck(anchor_check, write_count);
+    printLagCheck(rotation_check, write_count);
+    return control_check.available and control_check.r > periodicity_flag;
+}
+
+/// One iteration's anchor duty: the forced cadence guarantees anchor
+/// events at bench scale, and the maybe call keeps the natural cadence
+/// live. Returns whether this iteration carried an anchor.
+fn runAnchorDuty(node: *Node, index: usize, anchor_every: usize) !bool {
+    if ((index + 1) % anchor_every == 0) {
+        try node.createStateAnchor();
+        return true;
+    }
+    return try node.maybeCreateStateAnchor();
+}
+
+/// Prints both latency rows plus the directly timed anchor duty cycle
+/// and the shift between anchor-bearing and adjacent plain iterations:
+/// the magnitudes the correlation only hints at.
+fn reportWriteRun(
+    gpa: std.mem.Allocator,
+    interval_samples: []u64,
+    write_samples: []u64,
+    anchored_flags: []const bool,
+    write_elapsed: i96,
+    anchor_duty_ns: u128,
+    anchor_events: usize,
+    anchor_every: usize,
+) !void {
+    const shift_scratch = try gpa.alloc(u64, anchor_events);
+    defer gpa.free(shift_scratch);
+    const duty_percent = @as(f64, @floatFromInt(anchor_duty_ns)) * 100.0 /
+        @as(f64, @floatFromInt(@max(write_elapsed, 1)));
+    const shift = bench_stats.pairedAnchorShift(
+        shift_scratch,
+        interval_samples,
+        anchored_flags,
+    );
+    printRow("write", write_samples.len, write_elapsed, Stats.compute(write_samples));
+    const interval_stats = Stats.compute(interval_samples);
+    printRow("write+duties", interval_samples.len, write_elapsed, interval_stats);
+    std.debug.print(
+        "anchor events:     {d} during the write run (forced every {d} " ++
+            "writes); anchor+pump duty cycle {d:.1}% (directly timed)\n",
+        .{ anchor_events, anchor_every, duty_percent },
+    );
+    std.debug.print(
+        "anchor-iteration shift: median {d} us over the nearest plain " ++
+            "iteration within eight slots (nonnegative, zero-censored; " ++
+            "{d} paired, {d} dropped)\n",
+        .{ shift.shift / std.time.ns_per_us, shift.paired, shift.dropped },
+    );
 }
 
 fn benchReads(
@@ -178,7 +367,7 @@ fn benchRecovery(
         },
     );
 
-    try node_ptr.*.snapshot();
+    try node_ptr.*.createStateAnchor();
     node_ptr.*.close();
     {
         var db_buffer: [96]u8 = undefined;
@@ -189,7 +378,7 @@ fn benchRecovery(
     node_ptr.* = try Node.open(gpa, io, .{ .directory = root });
     const rebuild_elapsed = nowNs(io) - rebuild_start;
     std.debug.print(
-        "{s:<18} {d:>7} ms (image restored from snapshot)\n",
+        "{s:<18} {d:>7} ms (image restored from anchor)\n",
         .{
             "rebuild",
             @as(u64, @intCast(@divTrunc(rebuild_elapsed, std.time.ns_per_ms))),

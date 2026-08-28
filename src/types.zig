@@ -7,8 +7,11 @@ const command = @import("command.zig");
 
 pub const Command = command.Command;
 
-/// Compile-time bounds for the replicated command log. `max_entries` is the
-/// hard epoch capacity; the host must checkpoint before it is reached.
+/// Compile-time bounds for the replicated command log. `window_slots` is the
+/// consensus window: a backpressure bound on how far chosen history can run
+/// ahead of the trimmed floor. The ZDS 0011 certified chosen trim path
+/// advances that floor during normal service (before ZDS 0011 the window was
+/// a hard epoch capacity the host had to checkpoint before reaching).
 pub const log_options = paxos.ReplicatedLogOptions{
     // This is a voter bound, not a total-node bound. Non-voting learners and
     // gateways live in the runtime product registry and do not consume these
@@ -20,7 +23,7 @@ pub const log_options = paxos.ReplicatedLogOptions{
     // four checkpoint/re-election pauses dominated sustained write latency
     // even though the steady-state commit path was faster. The bound remains
     // deliberately small compared with an unbounded database log.
-    .max_entries = 2048,
+    .window_slots = 2048,
     .max_batch = 16,
     // 512 holds zx2 stop metadata: checkpoint name, manifest digest,
     // next-registry digest, and the bounded replacement seed.
@@ -42,8 +45,9 @@ pub const max_entry_size = blk: {
 
 pub const ballot_size = 8 + 4 + 4;
 
-/// Maximum canonical encoded size of one `Write` payload.
-pub const max_write_size = 1 + ballot_size + 4 + max_entry_size;
+/// Maximum canonical encoded size of one `Write` payload. The slot is a
+/// 64-bit global instance number (ZDS 0011).
+pub const max_write_size = 1 + ballot_size + 8 + max_entry_size;
 
 pub const DecodeError = command.DecodeError || error{
     InvalidEntryTag,
@@ -133,13 +137,19 @@ pub fn encodeWrite(write: Write, writer: *Cursor) void {
         .accept => |accept| {
             writer.byte(1);
             encodeBallot(accept.ballot, writer);
-            writer.int(u32, accept.slot);
+            writer.int(u64, accept.slot);
             encodeEntry(accept.value, writer);
         },
         .commit => |commit| {
             writer.byte(2);
-            writer.int(u32, commit.slot);
+            writer.int(u64, commit.slot);
             encodeEntry(commit.value, writer);
+        },
+        .trim_anchor => |anchor| {
+            writer.byte(3);
+            writer.int(u64, anchor.trim_id);
+            writer.int(u64, anchor.chosen_trim_slot);
+            writer.bytes(&anchor.history_hash);
         },
     }
 }
@@ -151,13 +161,22 @@ pub fn decodeWrite(buffer: []const u8) DecodeError!Write {
         0 => .{ .promise = try decodeBallot(&reader) },
         1 => .{ .accept = .{
             .ballot = try decodeBallot(&reader),
-            .slot = try reader.int(u32),
+            .slot = try reader.int(u64),
             .value = try decodeEntry(&reader),
         } },
         2 => .{ .commit = .{
-            .slot = try reader.int(u32),
+            .slot = try reader.int(u64),
             .value = try decodeEntry(&reader),
         } },
+        3 => blk: {
+            var anchor = Log.TrimAnchor{
+                .trim_id = try reader.int(u64),
+                .chosen_trim_slot = try reader.int(u64),
+            };
+            const hash = try reader.take(32);
+            @memcpy(&anchor.history_hash, hash);
+            break :blk .{ .trim_anchor = anchor };
+        },
         else => return error.InvalidWriteTag,
     };
     if (reader.offset != buffer.len) return error.TruncatedRecord;

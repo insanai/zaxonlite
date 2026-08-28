@@ -235,6 +235,19 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run the zaxonlite test suite");
     test_step.dependOn(&run_unit_tests.step);
 
+    // The benchmark's series estimators live outside the library
+    // surface, so lazy analysis would never reach their tests through
+    // the module artifact; they get their own.
+    const bench_stats_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_stats.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_bench_stats_tests = b.addRunArtifact(bench_stats_tests);
+    test_step.dependOn(&run_bench_stats_tests.step);
+
     // The pure search kernels test as their own module: compiling them
     // without any imports proves the SQLite-free boundary (ZDS 0009).
     const search_tests = b.addTest(.{ .root_module = graph.search });
@@ -352,6 +365,23 @@ pub fn build(b: *std.Build) void {
     );
     replacement_cluster_step.dependOn(&run_replacement_cluster_test.step);
 
+    const transfer_cluster_test = b.addExecutable(.{
+        .name = "zaxon-transfer-cluster-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/transfer_cluster_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zaxonlite", .module = zaxonlite }},
+        }),
+    });
+    const run_transfer_cluster_test = b.addRunArtifact(transfer_cluster_test);
+    run_transfer_cluster_test.addArtifactArg(zaxon);
+    const transfer_cluster_step = b.step(
+        "test-transfer-cluster",
+        "Run the beyond-retention state-transfer crash ladder under mTLS",
+    );
+    transfer_cluster_step.dependOn(&run_transfer_cluster_test.step);
+
     const role_cluster_test = b.addExecutable(.{
         .name = "zaxon-role-cluster-test",
         .root_module = b.createModule(.{
@@ -461,6 +491,29 @@ pub fn build(b: *std.Build) void {
     const soak_step = b.step("soak", "Run the sustained mixed-load soak");
     soak_step.dependOn(&run_soak.step);
 
+    // Long-run retention gate: rotation, reclamation, anchored restart.
+    const longrun_writes = b.option(
+        u64,
+        "longrun-writes",
+        "Long-run write count (default 20000)",
+    ) orelse 20_000;
+    const longrun_exe = b.addExecutable(.{
+        .name = "zaxon-longrun",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/longrun_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zaxonlite", .module = zaxonlite }},
+        }),
+    });
+    const run_longrun = b.addRunArtifact(longrun_exe);
+    run_longrun.addArg(b.fmt("{d}", .{longrun_writes}));
+    const longrun_step = b.step(
+        "test-longrun",
+        "Run the long-run retention and anchored-restart gate",
+    );
+    longrun_step.dependOn(&run_longrun.step);
+
     // Benchmarks always build ReleaseFast regardless of -Doptimize. The
     // shared helper guarantees the benchmark SQLite carries exactly the
     // same extension and SIMD flags as the product build.
@@ -560,6 +613,26 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&cluster_bench_exe.step);
     check_step.dependOn(&bench_exe.step);
     check_step.dependOn(&search_bench_exe.step);
+    // Every test controller compiles under `check`: an integration
+    // harness that only compiles when its suite runs is a harness whose
+    // compile errors ship.
+    check_step.dependOn(&crash_test.step);
+    check_step.dependOn(&cluster_test.step);
+    check_step.dependOn(&replacement_cluster_test.step);
+    check_step.dependOn(&transfer_cluster_test.step);
+    check_step.dependOn(&role_cluster_test.step);
+    check_step.dependOn(&gateway_test.step);
+    check_step.dependOn(&fault_cluster_test.step);
+    check_step.dependOn(&cli_test.step);
+    check_step.dependOn(&fuzz_exe.step);
+    check_step.dependOn(&soak_exe.step);
+    check_step.dependOn(&longrun_exe.step);
+    check_step.dependOn(&unit_tests.step);
+    check_step.dependOn(&bench_stats_tests.step);
+    check_step.dependOn(&search_tests.step);
+    check_step.dependOn(&cli_ui_tests.step);
+    check_step.dependOn(&cli_unit_tests.step);
+    check_step.dependOn(&integration_tests.step);
 
     // Cross-target compile gate for the pure search kernels: the module
     // has no dependencies, so it must build for every supported vector
@@ -700,6 +773,7 @@ pub fn build(b: *std.Build) void {
         .flags = &.{"-std=c11"},
     });
     capi_smoke.root_module.addIncludePath(b.path("include"));
+    check_step.dependOn(&capi_smoke.step);
     if (openssl_prefix.len > 0) {
         capi_smoke.root_module.addLibraryPath(.{
             .cwd_relative = b.fmt("{s}/lib", .{openssl_prefix}),

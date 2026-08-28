@@ -14,8 +14,9 @@
 //!
 //! On disk a registry blob is the canonical encoding followed by its
 //! SHA-256 digest; the `REGISTRY` pointer file names the active blob by
-//! configuration ID, with the same shape and strict length check as the
-//! `CURRENT` snapshot pointer.
+//! configuration ID, with the same pointer-file shape and strict length
+//! check the retired `CURRENT` pointer used (that name now survives only
+//! as a legacy-artifact tripwire).
 
 const std = @import("std");
 const paxos = @import("paxos");
@@ -962,4 +963,93 @@ test "registry blobs and pointer survive a store/load round trip" {
         error.CorruptRegistry,
         load(io, dir, testing.allocator),
     );
+}
+
+/// The voter-replacement seed carried in zx3 stop metadata: the
+/// operation id plus the retiring node, the joining node, and its
+/// endpoint, from which every survivor rebuilds the next registry.
+pub const StopSeed = struct {
+    operation_id: u64,
+    old_node_id: u32,
+    new_node_id: u32,
+    endpoint: [max_endpoint_bytes]u8,
+    endpoint_len: u8,
+
+    pub fn endpointSlice(self: *const StopSeed) []const u8 {
+        return self.endpoint[0..self.endpoint_len];
+    }
+};
+
+pub const StopMetadata = struct {
+    /// Digest of the canonical next decided registry.
+    registry_digest: [32]u8,
+    /// Present only for a decided voter replacement.
+    seed: ?StopSeed,
+};
+
+pub const StopMetadataText = struct {
+    buffer: [types.log_options.max_metadata_bytes]u8,
+    len: usize,
+
+    pub fn slice(self: *const StopMetadataText) []const u8 {
+        return self.buffer[0..self.len];
+    }
+};
+
+/// Renders zx3 stop metadata: the next registry digest plus the
+/// replacement seed every survivor reconstructs the registry from.
+pub fn renderStopMetadata(
+    digest: [32]u8,
+    request: *const ReplacementRequest,
+) StopMetadataText {
+    var text = StopMetadataText{ .buffer = undefined, .len = 0 };
+    const digest_hex = std.fmt.bytesToHex(digest, .lower);
+    const rendered = std.fmt.bufPrint(
+        &text.buffer,
+        "zx3 {s} {x:0>16} {x:0>8} {x:0>8} {s}",
+        .{
+            &digest_hex,
+            request.operation_id,
+            request.old_node_id,
+            request.new_node_id,
+            request.new_endpoint,
+        },
+    ) catch unreachable;
+    text.len = rendered.len;
+    return text;
+}
+
+pub fn parseStopMetadata(metadata: []const u8) !StopMetadata {
+    var parts = std.mem.tokenizeScalar(u8, metadata, ' ');
+    const tag = parts.next() orelse return error.CorruptStopSign;
+    if (!std.mem.eql(u8, tag, "zx3")) return error.CorruptStopSign;
+    const registry_hex = parts.next() orelse return error.CorruptStopSign;
+    if (registry_hex.len != 64) return error.CorruptStopSign;
+    var result = StopMetadata{ .registry_digest = undefined, .seed = null };
+    _ = std.fmt.hexToBytes(&result.registry_digest, registry_hex) catch
+        return error.CorruptStopSign;
+    if (parts.next()) |operation_hex| {
+        if (operation_hex.len != 16) return error.CorruptStopSign;
+        const old_hex = parts.next() orelse return error.CorruptStopSign;
+        if (old_hex.len != 8) return error.CorruptStopSign;
+        const new_hex = parts.next() orelse return error.CorruptStopSign;
+        if (new_hex.len != 8) return error.CorruptStopSign;
+        const endpoint = parts.next() orelse return error.CorruptStopSign;
+        validateEndpoint(endpoint) catch
+            return error.CorruptStopSign;
+        var seed = StopSeed{
+            .operation_id = std.fmt.parseInt(u64, operation_hex, 16) catch
+                return error.CorruptStopSign,
+            .old_node_id = std.fmt.parseInt(u32, old_hex, 16) catch
+                return error.CorruptStopSign,
+            .new_node_id = std.fmt.parseInt(u32, new_hex, 16) catch
+                return error.CorruptStopSign,
+            .endpoint = [_]u8{0} ** max_endpoint_bytes,
+            .endpoint_len = @intCast(endpoint.len),
+        };
+        @memcpy(seed.endpoint[0..endpoint.len], endpoint);
+        result.seed = seed;
+    }
+    if (parts.next() != null) return error.CorruptStopSign;
+    return result;
 }

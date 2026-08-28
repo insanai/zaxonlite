@@ -12,8 +12,9 @@
 //!     the node's materialized image — every read or batch runs on a
 //!     pooled connection inside its own deferred read transaction, so it
 //!     observes exactly one WAL snapshot while writes commit concurrently;
-//!   * a shared/exclusive maintenance gate — checkpoint (`snapshot`),
-//!     image resync, and `close` first drain and close every pooled
+//!   * a shared/exclusive maintenance gate — state-anchor publication
+//!     (`createStateAnchor`), image resync, and `close` first drain and
+//!     close every pooled
 //!     reader (their descriptors go stale once the image file is
 //!     rebuilt), then take the node exclusively; the pool reopens lazily
 //!     afterwards.
@@ -347,16 +348,16 @@ pub const SharedNode = struct {
         return self.inner.integrityCheck();
     }
 
-    /// Takes an online snapshot (checkpoint plus epoch rollover). The
-    /// checkpoint truncates the WAL and rebuilds files pooled readers
-    /// have open, so the exclusive gate drains and closes them first;
-    /// they reopen lazily on the next read.
-    pub fn snapshot(self: *SharedNode) !void {
+    /// Publishes a durable state anchor. The underlying checkpoint
+    /// truncates the WAL and rebuilds files pooled readers have open, so
+    /// the exclusive gate drains and closes them first; they reopen
+    /// lazily on the next read.
+    pub fn createStateAnchor(self: *SharedNode) !void {
         try self.enter();
         defer self.exit();
         try self.acquireExclusive();
         defer self.releaseExclusive();
-        return self.inner.snapshot();
+        return self.inner.createStateAnchor();
     }
 
     /// SQLite extended result code of the node's most recent saved SQL

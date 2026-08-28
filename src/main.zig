@@ -60,7 +60,7 @@ const usage_text =
     \\                    --old-node <id> --new-node <id>@<host>:<port>
     \\  leader            Show the current leader (client mode).
     \\  wait              Wait for --applied <slot> and/or --leader (client mode).
-    \\  snapshot          Take a snapshot and seal the current journal epoch.
+    \\  anchor            Publish a durable state anchor for fast recovery.
     \\  backup            Stream a consistent logical backup. --to <path>.
     \\  integrity-check   Verify SQLite image, descriptor chain, and payloads.
     \\  recover           Rebuild from authoritative state and verify it.
@@ -110,7 +110,14 @@ const usage_text =
     \\                      (disabled); maximum 1073741824 (1 GiB). A mapped
     \\                      I/O fault can terminate the process; opting in
     \\                      accepts that operational risk.
+    \\  --retention-slots <n>  Keep the most recent n slots of journal
+    \\                      history below the chosen trim (default 0).
+    \\  --journal-cap-bytes <n>  Refuse writes once journal plus payload
+    \\                      bytes reach n, rather than delete unproven
+    \\                      history (default 64 GiB; 0 disables).
     \\  --enable-failpoints Honor failpoint RPCs (test controllers only).
+    \\  --segment-records <n>  Test-only journal segment size (64..16384);
+    \\                      requires --enable-failpoints.
     \\  --json              Machine-readable output on stdout.
     \\  --no-color          Plain shell output even on a color terminal.
     \\  --no-history        Never write the interactive shell history file.
@@ -157,6 +164,9 @@ const Options = struct {
     revocation_file: ?[]const u8 = null,
     sync: ?[]const u8 = null,
     mmap_size: ?u64 = null,
+    retention_slots: ?u64 = null,
+    journal_cap_bytes: ?u64 = null,
+    segment_records: ?usize = null,
     enable_failpoints: bool = false,
     dev_psk: bool = false,
     insecure_test_tcp: bool = false,
@@ -452,7 +462,7 @@ fn executeLocalNodeCommand(
         if (options.json) try out.writeAll("]}\n");
         return exit_ok;
     }
-    if (std.mem.eql(u8, command, "snapshot") or
+    if (std.mem.eql(u8, command, "anchor") or
         std.mem.eql(u8, command, "backup") or
         std.mem.eql(u8, command, "integrity-check") or
         std.mem.eql(u8, command, "recover") or
@@ -478,18 +488,18 @@ fn executeLocalMaintenanceCommand(
     out: *std.Io.Writer,
     err_out: *std.Io.Writer,
 ) !u8 {
-    if (std.mem.eql(u8, command, "snapshot")) {
-        try node.snapshot();
+    if (std.mem.eql(u8, command, "anchor")) {
+        try node.createStateAnchor();
         const status = node.status();
         if (options.json) {
             try out.print(
-                "{{\"configuration_id\":{d},\"snapshot\":\"{s}\"}}\n",
-                .{ status.configuration_id, if (status.snapshot) |name| &name else "" },
+                "{{\"durable_state_slot\":{d}}}\n",
+                .{status.durable_state_slot},
             );
         } else {
             try out.print(
-                "snapshot installed; epoch sealed, now at configuration {d}\n",
-                .{status.configuration_id},
+                "state anchor published at slot {d}\n",
+                .{status.durable_state_slot},
             );
         }
         return exit_ok;
@@ -757,6 +767,23 @@ fn serveCommand(
         }, err_out);
     }
 
+    if (options.segment_records) |records| {
+        // Test-only journal geometry: segment-scale scenarios (rotation,
+        // reclamation, beyond-retention transfer) shrink segments instead
+        // of writing millions of rows. Never raised above the production
+        // capacity the on-disk index is sized for.
+        if (!options.enable_failpoints) {
+            return usageError(
+                err_out,
+                "--segment-records is test-only; it requires --enable-failpoints",
+            );
+        }
+        if (records < 64 or records > zaxonlite.segment.capacity_records) {
+            return usageError(err_out, "--segment-records must be 64..16384");
+        }
+        zaxonlite.segment.rotation_records = records;
+    }
+
     return server.serve(gpa, io, .{
         .directory = data,
         .node_id = node_id,
@@ -774,6 +801,9 @@ fn serveCommand(
         .enable_failpoints = options.enable_failpoints,
         .allow_insecure_test_tcp = options.insecure_test_tcp,
         .mmap_size = options.mmap_size orelse 0,
+        .retention_slots = options.retention_slots orelse 0,
+        .journal_cap_bytes = options.journal_cap_bytes orelse
+            64 * 1024 * 1024 * 1024,
     }, err_out);
 }
 
@@ -1035,8 +1065,8 @@ fn buildRemoteRequestBody(
         );
         return false;
     }
-    if (std.mem.eql(u8, command, "snapshot")) {
-        try writer.writeAll("{\"op\":\"snapshot\"}");
+    if (std.mem.eql(u8, command, "anchor")) {
+        try writer.writeAll("{\"op\":\"anchor\"}");
         return true;
     }
     if (std.mem.eql(u8, command, "integrity-check")) {
@@ -1529,6 +1559,21 @@ fn parseOptionFlag(
             return optError(err_out, "--mmap-size needs a value");
         options.mmap_size = std.fmt.parseInt(u64, text, 10) catch
             return optError(err_out, "--mmap-size must be an integer byte count");
+    } else if (std.mem.eql(u8, arg, "--retention-slots")) {
+        const text = iterator.next() orelse
+            return optError(err_out, "--retention-slots needs a value");
+        options.retention_slots = std.fmt.parseInt(u64, text, 10) catch
+            return optError(err_out, "--retention-slots must be an integer");
+    } else if (std.mem.eql(u8, arg, "--journal-cap-bytes")) {
+        const text = iterator.next() orelse
+            return optError(err_out, "--journal-cap-bytes needs a value");
+        options.journal_cap_bytes = std.fmt.parseInt(u64, text, 10) catch
+            return optError(err_out, "--journal-cap-bytes must be an integer");
+    } else if (std.mem.eql(u8, arg, "--segment-records")) {
+        const text = iterator.next() orelse
+            return optError(err_out, "--segment-records needs a value");
+        options.segment_records = std.fmt.parseInt(usize, text, 10) catch
+            return optError(err_out, "--segment-records must be an integer");
     } else if (std.mem.eql(u8, arg, "--enable-failpoints")) {
         options.enable_failpoints = true;
     } else if (std.mem.eql(u8, arg, "--dev-psk")) {

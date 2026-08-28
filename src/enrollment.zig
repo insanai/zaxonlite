@@ -194,6 +194,25 @@ pub fn issueToken(
     );
 }
 
+/// Opens the token store owner-only, creating it if needed. Iterating so
+/// the handle is a real descriptor: `fchmod` and `fsync` reject the
+/// `O_PATH` handles Linux gets from non-iterating opens.
+fn openTokenStore(io: Io, root: Io.Dir) !Io.Dir {
+    _ = try root.createDirPathStatus(
+        io,
+        store_directory,
+        @enumFromInt(0o700),
+    );
+    var directory = try root.openDir(io, store_directory, .{ .iterate = true });
+    errdefer directory.close(io);
+    // Windows protects the store through its inherited ACL; Zig 0.16 does
+    // not implement setting POSIX directory permissions there.
+    if (builtin.os.tag != .windows) {
+        try directory.setPermissions(io, @enumFromInt(0o700));
+    }
+    return directory;
+}
+
 pub fn issueTokenAt(
     io: Io,
     data_directory: []const u8,
@@ -211,20 +230,8 @@ pub fn issueTokenAt(
     }
     var root = try Io.Dir.cwd().openDir(io, data_directory, .{});
     defer root.close(io);
-    _ = try root.createDirPathStatus(
-        io,
-        store_directory,
-        @enumFromInt(0o700),
-    );
-    // Iterate so the handle is a real descriptor: `fchmod` and `fsync`
-    // reject the `O_PATH` handles Linux gets from non-iterating opens.
-    var directory = try root.openDir(io, store_directory, .{ .iterate = true });
+    var directory = try openTokenStore(io, root);
     defer directory.close(io);
-    // Windows protects the store through its inherited ACL; Zig 0.16 does
-    // not implement setting POSIX directory permissions there.
-    if (builtin.os.tag != .windows) {
-        try directory.setPermissions(io, @enumFromInt(0o700));
-    }
 
     var secret: [token_bytes]u8 = undefined;
     io.random(&secret);

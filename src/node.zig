@@ -1,9 +1,10 @@
 //! The embedded zaxonlite node host.
 //!
-//! One node owns one data directory: a framed protocol journal, a
-//! content-addressed payload store, snapshots, and a materialized SQLite
-//! image. The journal plus payloads are authoritative; the SQLite file is
-//! reconstructed from snapshot plus committed journal suffix on every open.
+//! One node owns one data directory: a segmented lifetime journal, a
+//! content-addressed payload store, durable state anchors, and a
+//! materialized SQLite image. The journal plus payloads are authoritative;
+//! the SQLite file is reconstructed from the durable anchor plus the
+//! retained journal suffix on every open.
 //!
 //! Ordering contract per write:
 //!   execute -> capture frames -> persist payload -> Paxos append ->
@@ -31,19 +32,24 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
+const Sha256 = std.crypto.hash.sha2.Sha256;
 const paxos = @import("paxos");
 
 const command = @import("command.zig");
+const segment_mod = @import("segment.zig");
 const types = @import("types.zig");
+const applied_anchor = @import("applied_anchor.zig");
+const history = @import("history.zig");
 const journal_mod = @import("journal.zig");
+const trim = @import("trim.zig");
 const payload_store_mod = @import("payload_store.zig");
-const checkpoint_proof = @import("checkpoint_proof.zig");
 const sqlite = @import("sqlite.zig");
 const search_api = @import("search_api.zig");
 const zaxon_search = @import("zaxon_search");
 const guard_mod = @import("guard.zig");
 const wal = @import("wal.zig");
 const failpoint = @import("failpoint.zig");
+const wire = @import("wire.zig");
 const durability = @import("durability.zig");
 const prepared = @import("prepared.zig");
 const registry = @import("registry.zig");
@@ -59,13 +65,14 @@ const shm_file_name = "current.db-shm";
 const identity_file_name = "identity";
 const current_file_name = "CURRENT";
 const lock_file_name = "LOCK";
+/// Sender-side pinned transfer image, private to `consensus/`.
+const transfer_pin_name = "transfer-pin.db";
+/// Receiver-side staged transfer image, replaced onto `current.db`.
+pub const transfer_install_name = ".transfer-install.db";
 const pending_operation_file_name = "PENDING-OP";
 const deleted_file_tombstone = ".ZX-DELETED";
 const join_file_name = "JOIN";
 const install_tmp_dir = "snapshots/tmp-install";
-
-/// Reserve slots so a checkpoint stop sign always fits in the epoch.
-const capacity_reserve = 4;
 
 pub const OpenOptions = struct {
     /// Node data directory; created when missing.
@@ -93,6 +100,16 @@ pub const OpenOptions = struct {
     /// opens. Zero (the default) disables mmap; a nonzero value is an
     /// explicit operator opt-in bounded at 1 GiB (ZDS 0009).
     mmap_size: u64 = 0,
+    /// Retention horizon in slots: physical reclamation never deletes
+    /// the most recent `retention_slots` of applied history, even below
+    /// the chosen trim, so lagging replicas can range-recover without a
+    /// transfer. Zero keeps only what the trim requires (ZDS 0011).
+    retention_slots: u64 = 0,
+    /// Hard local storage ceiling over journal plus retained payload
+    /// bytes: at or above it, new writes are refused with
+    /// `RecoveryRetentionExceeded` instead of deleting unproven history.
+    /// Ships at the ZDS 0011 Q2 hard ceiling; zero disables it.
+    journal_cap_bytes: u64 = 64 * 1024 * 1024 * 1024,
 };
 
 pub const SessionError = error{
@@ -110,6 +127,15 @@ pub const ExecResult = struct {
     last_insert_rowid: ?i64 = null,
 };
 
+pub const RecentBatch = struct {
+    slot: paxos.Slot = 0,
+    batch_id: u128 = 0,
+};
+
+const HistoryMark = struct {
+    slot: paxos.Slot = 0,
+    hash: [32]u8 = [_]u8{0} ** 32,
+};
 pub const Status = struct {
     node_id: paxos.NodeId,
     database_id: u128,
@@ -118,13 +144,21 @@ pub const Status = struct {
     node_type: []const u8,
     leader: ?paxos.NodeId,
     ballot: paxos.Ballot,
+    /// Global frontiers (ZDS 0011): decided C, executed E, durable A,
+    /// the core memory floor, and the retention window.
     decided_slot: paxos.Slot,
     applied_slot: paxos.Slot,
+    durable_state_slot: paxos.Slot,
+    memory_floor: paxos.Slot,
+    chosen_trim_slot: paxos.Slot,
+    retained_first_slot: paxos.Slot,
     journal_records: u64,
-    epoch_capacity: u64,
+    journal_segment_count: u64,
+    journal_bytes: u64,
+    payload_retained_bytes: u64,
     chain: command.HashBytes,
+    history: command.HashBytes,
     page_size: u32,
-    snapshot: ?[16]u8,
     /// Search capability manifest (ZDS 0009).
     fts5_enabled: bool,
     sqlite_vec_version: []const u8,
@@ -472,15 +506,45 @@ pub const Node = struct {
     /// One-shot enrollment binding retained until the fetched registry is
     /// verified and installed.
     join_descriptor: ?JoinDescriptor = null,
+    /// Campaigning withheld while a joining data voter has nothing
+    /// applied; leading would starve its own catch-up and transfer.
+    join_campaign_hold: bool = false,
     members: [types.log_options.max_members]paxos.NodeId,
     member_count: u16,
     leader_priority: u32,
     committed_frames: u32 = 0,
     captured_frames: u32 = 0,
     page_size: u32 = 4096,
+    /// The executed frontier E_i: the greatest contiguous chosen slot
+    /// reflected in the open materialized image. Not power-loss safe by
+    /// itself; the durable anchor below is.
     applied_slot: paxos.Slot = 0,
+    /// The durable-state frontier A_i: the greatest slot covered by a
+    /// synchronized image and its APPLIED anchor record (ZDS 0011).
+    durable_state_slot: paxos.Slot = 0,
+    /// Generation counter of the alternating APPLIED records.
+    anchor_generation: u64 = 0,
+    /// Durable local trim state: the adopted cluster anchor plus the
+    /// active transfer leases capping deletion (ZDS 0011).
+    trim_state: trim.State = .{},
+    /// Chosen-trim generation the payload sweep last ran for.
+    swept_trim_id: u64 = 0,
+    /// Recent chosen transaction batches, kept so a write waiter can be
+    /// resolved even after the core window released the slot's cell.
+    recent_batches: [64]RecentBatch = [_]RecentBatch{.{}} ** 64,
+    /// Recent per-slot history hashes, for vouching transfer anchors
+    /// (ZDS 0011). Indexed like `recent_batches`; slot 0 means empty.
+    recent_history: [64]HistoryMark = [_]HistoryMark{.{}} ** 64,
+    /// The global ordered-history anchor H at `applied_slot`.
+    history_hash: command.HashBytes,
+    /// The history anchor frozen at `durable_state_slot`; trim candidates
+    /// bind exactly this pair.
+    history_hash_at_anchor: command.HashBytes = [_]u8{0} ** 32,
     last_chain: command.HashBytes,
     last_data_slot: paxos.Slot = 0,
+    /// Batch identity at `last_data_slot`, kept because the consensus
+    /// window may have released that slot's cell.
+    last_batch_id: u128 = 0,
     /// Batch identity of the write currently captured in the live WAL but
     /// not yet decided. Any other decision while this is set means the
     /// live image speculated wrongly and must be resynced.
@@ -490,12 +554,9 @@ pub const Node = struct {
     needs_resync: bool = false,
     /// Result of the most recent local append (see `lastAppend`).
     last_append: ExecResult = .{ .changes = 0, .slot = 0 },
-    /// Set when a decided stop sign awaits epoch rollover. The slot the
-    /// stop sign occupies comes from the log's own latch (`Log.stopSlot`).
-    rollover_pending: bool = false,
-    /// The server defers a new-epoch campaign until its transport generation
-    /// matches the decided registry. Embedded hosts activate immediately.
-    rollover_campaign_pending: bool = false,
+    /// Set when a decided stop sign awaits the membership handover. Slots
+    /// continue on the same global line; only the voter set changes.
+    membership_change_pending: bool = false,
     /// Copy of the SQLite error message from a failed write transaction,
     /// captured before the rollback statement clears it.
     saved_error: [512]u8 = undefined,
@@ -516,6 +577,14 @@ pub const Node = struct {
     test_storage_delay_ms: u64 = 0,
     /// Operator-selected mapped-I/O limit applied to every connection.
     mmap_size: u64 = 0,
+    /// Retention horizon in slots kept below the chosen trim; zero
+    /// keeps only what the trim requires.
+    retention_slots: u64 = 0,
+    /// Hard journal-byte ceiling refusing writes; zero disables.
+    journal_cap_bytes: u64 = 0,
+    /// When the last durable state anchor published, for the 30-second
+    /// cadence trigger; zero until the first anchor of this process.
+    last_anchor_ns: i96 = 0,
     /// The limit SQLite actually accepted on the most recent connection.
     effective_mmap_size: i64 = 0,
     /// Recorded search-feature version of the served image; zero means
@@ -673,13 +742,21 @@ pub const Node = struct {
             .members = [_]paxos.NodeId{0} ** types.log_options.max_members,
             .member_count = @intCast(members.len),
             .leader_priority = options.leader_priority,
+            .history_hash = history.genesis(identity.database_id),
             .last_chain = command.genesisChain(identity.database_id),
             .test_storage_delay_ms = options.test_storage_delay_ms,
             .mmap_size = options.mmap_size,
+            .retention_slots = options.retention_slots,
+            .journal_cap_bytes = options.journal_cap_bytes,
         };
         @memcpy(self.members[0..members.len], members);
 
-        // Restore or initialize the protocol node from the epoch journal.
+        // Any journal v1 artifact fails closed: this format cut has no
+        // bridge (ZDS 0011).
+        try rejectLegacyArtifacts(io, dir);
+
+        // Restore or initialize the protocol node from the segmented
+        // journal, keyed by database identity for the database's lifetime.
         var membership: Log.Membership = undefined;
         try membership.init(members);
         const durable = try gpa.create(Log.DurableState);
@@ -687,78 +764,100 @@ pub const Node = struct {
         durable.* = .{};
 
         var replay_info: journal_mod.ReplayInfo = undefined;
+        var fresh_journal = false;
         if (Journal.open(
             io,
             gpa,
             dir,
-            identity.configuration_id,
+            identity.database_id,
             durable,
             &replay_info,
         )) |opened| {
             self.journal = opened;
-            if (capabilities.votes) {
-                try self.log.restoreWithPriority(
-                    identity.node_id,
-                    identity.configuration_id,
-                    &membership,
-                    durable,
-                    options.leader_priority,
-                );
-            } else {
-                try self.log.restoreLearner(
-                    identity.node_id,
-                    identity.configuration_id,
-                    &membership,
-                    durable,
-                );
-            }
         } else |err| switch (err) {
             error.FileNotFound => {
-                self.journal = try Journal.create(io, dir, identity.configuration_id);
-                if (capabilities.votes) {
-                    try self.log.initWithPriority(
-                        identity.node_id,
-                        identity.configuration_id,
-                        &membership,
-                        options.leader_priority,
-                    );
-                } else {
-                    try self.log.initLearner(
-                        identity.node_id,
-                        identity.configuration_id,
-                        &membership,
-                    );
-                }
+                self.journal = try Journal.create(io, gpa, dir, identity.database_id);
+                fresh_journal = true;
             },
             else => return err,
         }
         errdefer self.journal.close();
-
-        // Resume a snapshot transfer that durably installed CURRENT but
-        // crashed before advancing identity. Equality is also possible: a
-        // member can have reached the sealed epoch without learning its stop
-        // sign. A normal checkpoint interruption has the stop sign and is
-        // completed by the regular rollover path below.
-        if (try self.currentSnapshotName()) |snapshot_name| {
-            const sealed = try self.validateSnapshotGeneration(snapshot_name);
-            if (sealed > self.identity.configuration_id or
-                (sealed == self.identity.configuration_id and
-                    self.log.isReconfigured() == null))
+        if (try trim.load(io, self.journal.dir)) |stored| {
+            self.trim_state = stored;
+            self.journal.noteTrimAnchor(
+                stored.trim_id,
+                stored.through_slot,
+                stored.history_hash,
+            );
+        }
+        // The TRIM file and the journal's replayed anchor are written in
+        // that order, so a crash between them leaves the file one record
+        // ahead; re-installing it keeps the core's anchor at the frontier
+        // that already licensed deletion. Twins under one id, or a journal
+        // ahead of the file, mean corruption and fail closed.
+        const replayed = durable.anchor;
+        if (self.trim_state.trim_id == replayed.trim_id) {
+            if (replayed.trim_id != 0 and
+                (self.trim_state.through_slot != replayed.chosen_trim_slot or
+                    !std.mem.eql(
+                        u8,
+                        &self.trim_state.history_hash,
+                        &replayed.history_hash,
+                    )))
             {
-                if (sealed == std.math.maxInt(u64)) return error.ConfigurationMismatch;
-                try self.activateInstalledSnapshot(sealed + 1, &membership);
-            } else if (!(sealed == self.identity.configuration_id and
-                self.log.isReconfigured() != null))
-            {
-                if (sealed == std.math.maxInt(u64) or
-                    sealed + 1 != self.identity.configuration_id)
-                {
-                    return error.ConfigurationMismatch;
-                }
+                return error.TrimRegression;
             }
+        } else if (self.trim_state.trim_id > replayed.trim_id) {
+            try durable.apply(.{ .trim_anchor = .{
+                .trim_id = self.trim_state.trim_id,
+                .chosen_trim_slot = self.trim_state.through_slot,
+                .history_hash = self.trim_state.history_hash,
+            } });
+        } else {
+            return error.TrimRegression;
+        }
+
+        // Materialize the image from the durable anchor plus the retained
+        // journal suffix (ZDS 0011 recovery ladder), then restore the core
+        // at the consumed floor so its window resumes exactly there.
+        if (!fresh_journal) {
+            self.materializeFromJournal() catch |err| {
+                // Replaying the suffix over a corrupt image fails inside
+                // SQLite; rebuild from the genesis-retained journal.
+                if (err != error.SqliteError) return err;
+                try self.discardImageAndRematerialize();
+            };
+        }
+        if (capabilities.votes) {
+            try self.log.restoreAt(
+                identity.node_id,
+                identity.configuration_id,
+                &membership,
+                durable,
+                self.applied_slot,
+                options.leader_priority,
+            );
+        } else {
+            try self.log.restoreLearner(
+                identity.node_id,
+                identity.configuration_id,
+                &membership,
+                durable,
+            );
         }
 
         self.log.core.setCampaignEnabled(capabilities.campaigns);
+        // A materializing voter that joins an existing cluster with no
+        // applied state must not lead: catch-up and snapshot escalation
+        // run against the leader, so winning the election would starve
+        // its own recovery forever. It still votes; campaigning resumes
+        // once any state is applied.
+        if (capabilities.campaigns and capabilities.materializes and
+            identity.configuration_id > 1 and self.applied_slot == 0)
+        {
+            self.join_campaign_hold = true;
+            self.log.core.setCampaignEnabled(false);
+        }
         if (single and capabilities.campaigns) {
             // Volatile leadership: campaign on every open. A one-member
             // quorum completes phase one immediately.
@@ -766,20 +865,24 @@ pub const Node = struct {
             try self.consumeEffectsRecovery();
         }
 
-        // Materialize the image first: a pending rollover needs the fully
-        // applied database to rebuild its snapshot generation.
-        try self.rebuildMaterializedImage();
-
-        // A decided stop sign from a previous run means the epoch rollover
-        // never completed; finish it before serving.
+        // A decided stop sign from a previous run means a membership
+        // handover never completed (ZDS 0008 over global slots).
         if (self.log.isReconfigured() != null) {
-            try self.completeClusterRollover();
-            try self.rebuildMaterializedImage();
+            self.membership_change_pending = true;
         }
         try self.reconcilePendingOperation();
 
         if (single and capabilities.serves_writes) {
-            try self.openLiveDatabase();
+            self.openLiveDatabase() catch |err| switch (err) {
+                error.SqliteError => {
+                    // A corrupt image under a valid-looking anchor. When
+                    // the journal still retains from genesis the image is
+                    // rebuildable; anything else needs a state transfer.
+                    try self.discardImageAndRematerialize();
+                    try self.openLiveDatabase();
+                },
+                else => return err,
+            };
             try self.bootstrapSchema();
         }
         try self.validateMaterializedBatch();
@@ -831,13 +934,6 @@ pub const Node = struct {
 
     pub fn currentLeader(self: *const Node) ?paxos.NodeId {
         return self.log.currentLeader();
-    }
-
-    /// True when the current epoch is close enough to its slot bound that
-    /// the host must checkpoint before appending another command.
-    pub fn epochNearlyFull(self: *const Node) bool {
-        return self.log.decidedThrough() + capacity_reserve >=
-            types.log_options.max_entries;
     }
 
     /// Processes one protocol message from a peer.
@@ -1462,14 +1558,7 @@ pub const Node = struct {
                     self.metaInt("search_feature_version") catch 0;
             }
         }
-        var snapshot_name: ?[16]u8 = null;
-        if (self.dir.readFileAlloc(self.io, current_file_name, self.gpa, .limited(64))) |bytes| {
-            defer self.gpa.free(bytes);
-            const trimmed = std.mem.trim(u8, bytes, " \n");
-            if (trimmed.len == 16) {
-                snapshot_name = trimmed[0..16].*;
-            }
-        } else |_| {}
+        const journal_stats = self.journal.stats();
         return .{
             .node_id = self.identity.node_id,
             .database_id = self.identity.database_id,
@@ -1480,11 +1569,17 @@ pub const Node = struct {
             .ballot = self.log.core.ballot,
             .decided_slot = self.log.decidedThrough(),
             .applied_slot = self.applied_slot,
+            .durable_state_slot = self.durable_state_slot,
+            .memory_floor = self.log.memoryFloor(),
+            .chosen_trim_slot = self.log.trimAnchor().chosen_trim_slot,
+            .retained_first_slot = self.journal.retainedFirstSlot(),
             .journal_records = self.journal.next_sequence - 1,
-            .epoch_capacity = types.log_options.max_entries,
+            .journal_segment_count = journal_stats.segment_count,
+            .journal_bytes = journal_stats.journal_bytes,
+            .payload_retained_bytes = self.store.retained_bytes,
             .chain = self.last_chain,
+            .history = self.history_hash,
             .page_size = self.page_size,
-            .snapshot = snapshot_name,
             .fts5_enabled = sqlite.compileOptionUsed("ENABLE_FTS5"),
             .sqlite_vec_version = self.sqliteVecVersion(),
             .search_feature_version = self.search_feature_version,
@@ -1518,51 +1613,6 @@ pub const Node = struct {
     ) void {
         self.pre_durable_outbox_hook = hook;
     }
-
-    /// Takes an online snapshot, seals the epoch, and starts the next one.
-    /// Requires the one-member configuration, where the checkpoint decision
-    /// is immediate. Cluster hosts use `prepareCheckpoint` and complete the
-    /// rollover once the stop sign commits.
-    pub fn snapshot(self: *Node) !void {
-        std.debug.assert(self.single);
-        try self.prepareCheckpoint();
-        if (self.log.isReconfigured() == null) return error.CheckpointNotDecided;
-        try self.completeClusterRollover();
-    }
-
-    /// Materializes the epoch into a snapshot generation and proposes the
-    /// stop sign that seals the epoch. Leader only; no write may be in
-    /// flight. In a cluster the decision arrives asynchronously.
-    pub fn prepareCheckpoint(self: *Node) !void {
-        if (!self.capabilities.serves_writes) return error.RoleCannotWrite;
-        if (self.fatal_storage_error) return error.StorageFailed;
-        if (self.needs_resync) try self.resyncImage();
-        if (!self.db_open) try self.ensureWriter();
-        if (self.db.inTransaction()) return error.TransactionOpen;
-        if (self.capture_batch_id != null) return error.WriteInFlight;
-
-        // 1. Materialize every committed frame into the main database file
-        //    and reset WAL capture.
-        try self.db.checkpointTruncate();
-        self.committed_frames = 0;
-        self.captured_frames = 0;
-
-        // 2. Build the snapshot generation under a temporary name.
-        const metadata = try self.buildSnapshotGeneration(self.applied_slot, null);
-
-        // 3. Propose the stop sign that seals this epoch.
-        _ = try self.log.checkpoint(metadata.slice(), self.effects);
-        try self.consumeEffects();
-    }
-
-    const SnapshotMetadata = struct {
-        buffer: [types.log_options.max_metadata_bytes]u8,
-        len: usize,
-
-        fn slice(self: *const SnapshotMetadata) []const u8 {
-            return self.buffer[0..self.len];
-        }
-    };
 
     pub const PendingOperationPhase = enum { prepared, proposed };
 
@@ -1604,6 +1654,460 @@ pub const Node = struct {
             };
         }
     };
+
+    /// Slots of execution beyond the durable anchor that trigger a new
+    /// anchor (ZDS 0011 Q5).
+    /// Proven worst-case growth of one admitted write: the maximum
+    /// payload plus its accept and commit journal records, a sealing
+    /// trailer, and a fresh segment header, each taken from the
+    /// constant it must cover so the bound cannot drift. Held in
+    /// reserve below the storage cap so an admitted write can never
+    /// land above it.
+    pub const admission_reserve_bytes: u64 =
+        @as(u64, command.max_payload_bytes) +
+        2 * (@as(u64, segment_mod.record_header_size) +
+            @as(u64, types.max_write_size)) +
+        @as(u64, segment_mod.Writer.trailer_size_max) +
+        @as(u64, segment_mod.header_size);
+
+    /// Whether one more write may be admitted under the storage cap:
+    /// the current usage plus the proven one-write reserve must stay
+    /// below the cap, so a cap at or below the reserve refuses every
+    /// write. Pure, so the arithmetic is unit-testable with synthetic
+    /// numbers.
+    pub fn admissionOverCap(usage: u64, reserve: u64, cap: u64) bool {
+        return usage +| reserve >= cap;
+    }
+    pub const anchor_interval_slots: paxos.Slot = 10_000;
+    /// Test-overridable so the cadence trigger is verifiable without a
+    /// thirty-second wait; production never changes it.
+    pub var anchor_interval_ns: i96 = 30 * std.time.ns_per_s;
+    pub const anchor_wal_bytes: u64 = 64 * 1024 * 1024;
+
+    /// Creates a durable state anchor: checkpoints the live WAL into the
+    /// image, synchronizes it, and publishes the alternating APPLIED
+    /// record binding `(applied_slot, history_hash)`. Periodic work
+    /// proportional to dirty pages, never a full-database copy or hash.
+    pub fn createStateAnchor(self: *Node) !void {
+        if (self.fatal_storage_error) return error.StorageFailed;
+        if (!self.capabilities.materializes) return error.RoleCannotWrite;
+        if (self.needs_resync) try self.resyncImage();
+        if (self.live_transaction) return error.TransactionOpen;
+        if (self.capture_batch_id != null) return error.WriteInFlight;
+        if (self.applied_slot <= self.durable_state_slot) return;
+
+        if (self.db_open) {
+            try self.db.checkpointTruncate();
+            self.committed_frames = 0;
+            self.captured_frames = 0;
+        }
+        const file = try self.dir.openFile(self.io, db_file_name, .{
+            .mode = .read_write,
+        });
+        defer file.close(self.io);
+        failpoint.hit("before_db_sync");
+        try durability.syncFile(self.io, file);
+        failpoint.hit("after_db_sync");
+        const length = try file.length(self.io);
+
+        self.anchor_generation += 1;
+        try applied_anchor.publish(self.io, self.journal.dir, .{
+            .generation = self.anchor_generation,
+            .database_id = self.identity.database_id,
+            .global_slot = self.applied_slot,
+            .configuration_id = self.identity.configuration_id,
+            .history_hash = self.history_hash,
+            .sqlite_page_size = self.page_size,
+            .sqlite_page_count = length / self.page_size,
+            .last_data_slot = self.last_data_slot,
+            .last_batch_id = self.last_batch_id,
+            .last_chain = self.last_chain,
+        });
+        self.durable_state_slot = self.applied_slot;
+        self.history_hash_at_anchor = self.history_hash;
+        self.last_anchor_ns =
+            std.Io.Clock.Timestamp.now(self.io, .awake).raw.nanoseconds;
+
+        // A one-member configuration is its own only data replica: the
+        // conservative trim degenerates to the fresh anchor, chosen and
+        // reclaimed inline (ZDS 0011).
+        if (self.single and self.capabilities.votes) {
+            if (self.durable_state_slot > self.trim_state.through_slot) {
+                try self.proposeTrim(.{
+                    .through_slot = self.durable_state_slot,
+                    .history_hash = self.history_hash_at_anchor,
+                });
+                try self.reclaim();
+            }
+        }
+    }
+
+    /// Proposes a chosen trim entry. Leader only; the candidate comes
+    /// from the minimum durable-state frontier of every data replica.
+    pub fn proposeTrim(self: *Node, candidate: trim.Candidate) !void {
+        if (self.fatal_storage_error) return error.StorageFailed;
+        const record = command.TrimRecord{
+            .trim_id = self.trim_state.trim_id + 1,
+            .through_slot = candidate.through_slot,
+            .history_hash = candidate.history_hash,
+            .configuration_id = self.identity.configuration_id,
+            .policy = 0,
+        };
+        _ = try self.log.append(.{ .trim = record }, self.effects);
+        try self.consumeEffects();
+    }
+
+    /// Adopts a chosen trim record: validates it against the durable trim
+    /// state, persists the TRIM file, installs the core anchor, and
+    /// leaves physical reclamation to the next pump.
+    fn adoptChosenTrim(self: *Node, record: command.TrimRecord) !void {
+        switch (trim.classify(&self.trim_state, record)) {
+            .ignore => return,
+            .corrupt => {
+                self.fatal_storage_error = true;
+                return error.TrimRegression;
+            },
+            .adopt => {},
+        }
+        self.trim_state.trim_id = record.trim_id;
+        self.trim_state.through_slot = record.through_slot;
+        self.trim_state.history_hash = record.history_hash;
+        self.trim_state.configuration_id = record.configuration_id;
+        failpoint.hit("before_trim_file");
+        try trim.store(self.io, self.journal.dir, self.trim_state);
+        failpoint.hit("after_trim_file");
+        try self.log.installChosenTrim(.{
+            .trim_id = record.trim_id,
+            .chosen_trim_slot = record.through_slot,
+            .history_hash = record.history_hash,
+        }, self.effects);
+        self.journal.noteTrimAnchor(
+            record.trim_id,
+            record.through_slot,
+            record.history_hash,
+        );
+    }
+
+    /// Records a chosen transfer lease; deletion is capped at its base
+    /// until completion, whatever happens to the sender.
+    fn trackLease(self: *Node, lease: command.TransferLease) void {
+        for (self.trim_state.leases[0..self.trim_state.lease_count]) |held| {
+            if (held.lease_id == lease.lease_id) return;
+        }
+        // Admission is deterministic: every replica applies the same
+        // chosen lease sequence against the same fixed table, so a lease
+        // past capacity is dropped identically everywhere and simply does
+        // not cap trimming; the sender's pinned image copy, not the
+        // lease, is what keeps a running transfer safe (ZDS 0011).
+        if (self.trim_state.lease_count >= trim.max_leases) return;
+        self.trim_state.leases[self.trim_state.lease_count] = .{
+            .lease_id = lease.lease_id,
+            .receiver_id = lease.receiver_id,
+            .base_slot = lease.base_slot,
+            .expiry_ticks_left = lease.expires_after_leader_ticks,
+        };
+        self.trim_state.lease_count += 1;
+        trim.store(self.io, self.journal.dir, self.trim_state) catch {
+            self.fatal_storage_error = true;
+        };
+    }
+
+    fn releaseLease(self: *Node, lease_id: u64) void {
+        var index: u8 = 0;
+        while (index < self.trim_state.lease_count) : (index += 1) {
+            if (self.trim_state.leases[index].lease_id == lease_id) break;
+        } else return;
+        self.trim_state.lease_count -= 1;
+        self.trim_state.leases[index] =
+            self.trim_state.leases[self.trim_state.lease_count];
+        trim.store(self.io, self.journal.dir, self.trim_state) catch {
+            self.fatal_storage_error = true;
+        };
+    }
+
+    /// Physically reclaims journal segments and payload objects below the
+    /// local delete floor. Called from the host pump, never inline in the
+    /// commit path.
+    pub fn reclaim(self: *Node) !void {
+        if (self.trim_state.through_slot == 0) return;
+        // A witness holds no materialized state: its trim anchor alone is
+        // its recovery base, so it deletes through the anchor (ZDS 0011).
+        // A data replica is additionally capped by its durable anchor.
+        const durable_cap = if (self.capabilities.materializes)
+            self.durable_state_slot
+        else
+            self.trim_state.through_slot;
+        // The retention horizon keeps a recent suffix below the chosen
+        // trim so lagging replicas range-recover instead of transferring.
+        const retention_cutoff = if (self.retention_slots == 0)
+            std.math.maxInt(u64)
+        else
+            self.applied_slot -| self.retention_slots;
+        const floor = trim.deleteFloor(
+            self.trim_state.through_slot,
+            durable_cap,
+            retention_cutoff,
+            self.trim_state.leasesSlice(),
+        );
+        if (floor == 0) return;
+        failpoint.hit("before_segment_unlink");
+        const removed = try self.journal.trimThrough(floor);
+        failpoint.hit("after_segment_unlink");
+        // The payload sweep streams the whole retained journal, so it
+        // runs when history was removed or the chosen trim advanced —
+        // never on every pump.
+        if (removed or self.trim_state.trim_id > self.swept_trim_id) {
+            try self.sweepPayloads();
+            self.swept_trim_id = self.trim_state.trim_id;
+        }
+    }
+
+    /// Deletes payload objects no retained journal record references.
+    /// The reachable set is streamed from the retained segments, so a
+    /// crash can leak an object but never delete a reachable one.
+    fn sweepPayloads(self: *Node) !void {
+        var reachable = std.AutoHashMap([32]u8, void).init(self.gpa);
+        defer reachable.deinit();
+        var it = try self.journal.iterate(1);
+        defer it.close();
+        while (try it.next()) |write| {
+            const entry = switch (write) {
+                .accept => |accept| accept.value,
+                .commit => |commit| commit.value,
+                else => continue,
+            };
+            switch (entry) {
+                .command => |cmd| switch (cmd) {
+                    .transaction_batch => |batch| {
+                        try reachable.put(batch.payload_hash, {});
+                    },
+                    else => {},
+                },
+                .stop => {},
+            }
+        }
+        failpoint.hit("before_payload_gc_publish");
+        try self.store.sweepUnreachable(&reachable);
+        failpoint.hit("after_payload_gc_publish");
+    }
+
+    /// The history hash after applying `slot`, when this node can still
+    /// vouch for it: from the recent ring, the durable anchor, or the
+    /// chosen trim anchor. Null when the slot left every source.
+    pub fn historyHashAt(self: *const Node, slot: paxos.Slot) ?[32]u8 {
+        if (slot == 0) return null;
+        const mark = self.recent_history[@intCast(slot % self.recent_history.len)];
+        if (mark.slot == slot) return mark.hash;
+        if (slot == self.durable_state_slot) return self.history_hash_at_anchor;
+        if (slot == self.trim_state.through_slot) return self.trim_state.history_hash;
+        return null;
+    }
+
+    pub const TransferPin = struct {
+        node: *Node,
+        file: Io.File,
+        size: u64,
+        sha256: [32]u8,
+        anchor: applied_anchor.Anchor,
+
+        pub fn close(self: *TransferPin) void {
+            self.file.close(self.node.io);
+            self.node.journal.dir.deleteFile(
+                self.node.io,
+                transfer_pin_name,
+            ) catch {};
+            self.* = undefined;
+        }
+    };
+
+    /// Pins the durable anchor for a state transfer: publishes a fresh
+    /// anchor, then copies the synchronized image into a private file
+    /// the stream reads without blocking later anchors (ZDS 0011). The
+    /// copy is O(database) — the cost inherent to a full state transfer.
+    pub fn pinTransferImage(self: *Node) !TransferPin {
+        try self.createStateAnchor();
+        const anchor = applied_anchor.select(
+            self.io,
+            self.journal.dir,
+            self.identity.database_id,
+        ) orelse return error.StateUnavailable;
+
+        const source = try self.dir.openFile(self.io, db_file_name, .{});
+        defer source.close(self.io);
+        self.journal.dir.deleteFile(self.io, transfer_pin_name) catch {};
+        const pin = try self.journal.dir.createFile(
+            self.io,
+            transfer_pin_name,
+            .{ .read = true },
+        );
+        errdefer {
+            pin.close(self.io);
+            self.journal.dir.deleteFile(self.io, transfer_pin_name) catch {};
+        }
+        var sha = Sha256.init(.{});
+        var buffer: [64 * 1024]u8 = undefined;
+        var offset: u64 = 0;
+        while (true) {
+            const count = try source.readPositionalAll(self.io, &buffer, offset);
+            if (count == 0) break;
+            sha.update(buffer[0..count]);
+            try pin.writePositionalAll(self.io, buffer[0..count], offset);
+            offset += count;
+            failpoint.hit("during_transfer_pin");
+        }
+        failpoint.hit("after_transfer_pin");
+        return .{
+            .node = self,
+            .file = pin,
+            .size = offset,
+            .sha256 = sha.finalResult(),
+            .anchor = anchor,
+        };
+    }
+
+    /// Installs a verified anchor-pinned image as this node's base state
+    /// (ZDS 0011): the image becomes `current.db`, a fresh durable anchor
+    /// binds it, and the protocol node resumes at the anchor slot on the
+    /// same global slot line. The caller has already confirmed the image
+    /// digest and quorum-vouched `(anchor_slot, history_hash)`.
+    pub fn installTransferredState(
+        self: *Node,
+        begin: wire.SnapshotBegin,
+    ) !void {
+        if (self.fatal_storage_error) return error.StorageFailed;
+        if (!self.capabilities.materializes) return error.RoleCannotWrite;
+        if (begin.configuration_id != self.identity.configuration_id) {
+            return error.ConfigurationMismatch;
+        }
+        if (begin.anchor_slot <= self.applied_slot) return error.StaleTransfer;
+        if (self.live_transaction) return error.TransactionOpen;
+
+        const image_sha = try fileSha256(self.io, self.dir, transfer_install_name);
+        if (!std.mem.eql(u8, &image_sha, &begin.image_sha256)) {
+            return error.TransferDigestMismatch;
+        }
+        failpoint.hit("before_transfer_install");
+
+        if (self.db_open) {
+            self.db.close();
+            self.db_open = false;
+        }
+        self.capture_batch_id = null;
+        self.needs_resync = false;
+        self.dir.deleteFile(self.io, wal_file_name) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+        self.dir.deleteFile(self.io, shm_file_name) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+        try self.dir.rename(transfer_install_name, self.dir, db_file_name, self.io);
+        try durability.syncPathnameTransition(self.io, self.dir, db_file_name);
+        failpoint.hit("after_transfer_install");
+
+        self.history_hash = begin.history_hash;
+        self.history_hash_at_anchor = begin.history_hash;
+        self.last_chain = begin.last_chain;
+        self.last_data_slot = begin.last_data_slot;
+        self.last_batch_id = begin.last_batch_id;
+        self.page_size = begin.sqlite_page_size;
+        self.applied_slot = begin.anchor_slot;
+        self.recent_batches = [_]RecentBatch{.{}} ** 64;
+        self.recent_history = [_]HistoryMark{.{}} ** 64;
+
+        self.anchor_generation += 1;
+        try applied_anchor.publish(self.io, self.journal.dir, .{
+            .generation = self.anchor_generation,
+            .database_id = self.identity.database_id,
+            .global_slot = begin.anchor_slot,
+            .configuration_id = self.identity.configuration_id,
+            .history_hash = begin.history_hash,
+            .sqlite_page_size = begin.sqlite_page_size,
+            .sqlite_page_count = begin.db_size / begin.sqlite_page_size,
+            .last_data_slot = begin.last_data_slot,
+            .last_batch_id = begin.last_batch_id,
+            .last_chain = begin.last_chain,
+        });
+        self.durable_state_slot = begin.anchor_slot;
+        failpoint.hit("after_transfer_anchor");
+
+        // The protocol node resumes at the anchor; everything below it is
+        // covered by the installed image, everything above arrives through
+        // ordinary catch-up. The transfer stays inside one configuration,
+        // so the promise and votes above the anchor must survive it.
+        try self.continueOnConfigurationPreserving(begin.anchor_slot);
+        failpoint.hit("after_transfer_resume");
+    }
+
+    /// This node's progress report for trim coordination and monitoring.
+    pub fn frontier(self: *const Node) trim.Frontier {
+        return .{
+            .node_id = self.identity.node_id,
+            .configuration_id = self.identity.configuration_id,
+            .durable_state_slot = if (self.capabilities.materializes)
+                self.durable_state_slot
+            else
+                0,
+            .history_hash = self.history_hash_at_anchor,
+            .executed_slot = self.applied_slot,
+            .persisted_slot = self.journal.persistedThrough(),
+            .local_delete_floor = self.journal.trimmed_through,
+        };
+    }
+
+    /// Creates a state anchor once execution has run far enough past the
+    /// durable one. Returns whether an anchor was published.
+    /// Re-enables campaigning once a joining voter has applied any state
+    /// (through catch-up or an installed transfer); the host calls this
+    /// from its periodic duties.
+    pub fn releaseCampaignHold(self: *Node) void {
+        if (!self.join_campaign_hold) return;
+        if (self.applied_slot == 0) return;
+        self.join_campaign_hold = false;
+        self.log.core.setCampaignEnabled(self.capabilities.campaigns);
+    }
+
+    pub fn maybeCreateStateAnchor(self: *Node) !bool {
+        if (!self.anchorDue()) return false;
+        try self.createStateAnchor();
+        return true;
+    }
+
+    /// The ZDS 0011 Q5 cadence: a node with no anchor at all still
+    /// recovers from genesis, so the first anchor publishes promptly;
+    /// afterwards an anchor is due every 10,000 applied slots, every 30
+    /// seconds, or when the uncheckpointed WAL reaches 64 MiB —
+    /// whichever arrives first, and only while new applied state exists
+    /// to anchor.
+    fn anchorDue(self: *Node) bool {
+        if (self.durable_state_slot == 0) return self.applied_slot > 0;
+        if (self.applied_slot <= self.durable_state_slot) return false;
+        if (self.applied_slot >= self.durable_state_slot +| anchor_interval_slots) {
+            return true;
+        }
+        const now = std.Io.Clock.Timestamp.now(self.io, .awake).raw.nanoseconds;
+        if (self.last_anchor_ns == 0) {
+            // The 30-second clock starts at the first cadence check of
+            // this process, so a restarted node whose anchor predates
+            // the restart still time-anchors.
+            self.last_anchor_ns = now;
+        } else if (now - self.last_anchor_ns >= anchor_interval_ns) {
+            return true;
+        }
+        const wal_stat = self.dir.statFile(self.io, wal_file_name, .{}) catch
+            return false;
+        return wal_stat.size >= anchor_wal_bytes;
+    }
+
+    /// The batch identity chosen at `slot`, if it was a transaction batch
+    /// and is recent enough to still be tracked. Survives consensus-cell
+    /// reuse, which `log.read` does not.
+    pub fn batchAtSlot(self: *const Node, slot: paxos.Slot) ?u128 {
+        const entry = self.recent_batches[@intCast(slot % self.recent_batches.len)];
+        if (entry.slot != slot) return null;
+        return entry.batch_id;
+    }
 
     /// Reads the durable pending replacement record, if one exists.
     pub fn pendingOperation(self: *Node) !?PendingOperation {
@@ -1685,7 +2189,7 @@ pub const Node = struct {
         const pending = (try self.pendingOperation()) orelse return;
         if (pending.phase == .proposed) return;
         const stop = self.log.pendingStopSign() orelse return;
-        const parsed = try parseStopMetadata(stop.metadataSlice());
+        const parsed = try registry.parseStopMetadata(stop.metadataSlice());
         const seed = parsed.seed orelse {
             try self.clearPendingOperation();
             return;
@@ -1723,8 +2227,7 @@ pub const Node = struct {
             .retry => return error.OperationAlreadyComplete,
         }
         if (self.needs_resync) try self.resyncImage();
-        if (!self.db_open) try self.ensureWriter();
-        if (self.db.inTransaction()) return error.TransactionOpen;
+        if (self.live_transaction) return error.TransactionOpen;
         if (self.capture_batch_id != null) return error.WriteInFlight;
 
         // The request is durable before anything is proposed, so an
@@ -1732,15 +2235,12 @@ pub const Node = struct {
         try self.persistPendingOperation(request, .prepared);
         failpoint.hit("after_pending_op");
 
-        // Materialize every committed frame and reset WAL capture.
-        try self.db.checkpointTruncate();
-        self.committed_frames = 0;
-        self.captured_frames = 0;
-
-        const metadata = try self.buildSnapshotGeneration(self.applied_slot, request);
-        failpoint.hit("after_replacement_checkpoint");
-
+        // The stop sign binds only the canonical next registry and the
+        // seed reconstructing it. State rides the retained journal and
+        // the anchor-pinned transfer, never a snapshot generation
+        // (ZDS 0011); global slots continue across the transition.
         const next = try decided.successor(request);
+        const metadata = registry.renderStopMetadata(next.digest(), request);
         var voter_buffer: [types.log_options.max_members]paxos.NodeId = undefined;
         const next_voters = next.voterIds(&voter_buffer);
         _ = try self.log.reconfigure(
@@ -1755,132 +2255,181 @@ pub const Node = struct {
         failpoint.hit("after_replacement_proposed");
     }
 
-    /// Copies the fully materialized database into `snapshots/<name>` with
-    /// a manifest, and returns the stop-sign metadata naming it. The
-    /// database file must be fully checkpointed (leader) or fully applied
-    /// offline (follower). `manifest_applied_slot` is the highest slot the
-    /// image covers, excluding the stop sign itself, so every member
-    /// renders a byte-identical manifest.
-    fn buildSnapshotGeneration(
-        self: *Node,
-        manifest_applied_slot: paxos.Slot,
-        pending_request: ?*const registry.ReplacementRequest,
-    ) !SnapshotMetadata {
-        var name_buffer: [16]u8 = undefined;
-        const snapshot_name = std.fmt.bufPrint(
-            &name_buffer,
-            "{x:0>16}",
-            .{self.identity.configuration_id},
-        ) catch unreachable;
-        var tmp_path_buffer: [64]u8 = undefined;
-        const tmp_path = std.fmt.bufPrint(
-            &tmp_path_buffer,
-            "snapshots/tmp-{s}",
-            .{snapshot_name},
-        ) catch unreachable;
-        var final_path_buffer: [64]u8 = undefined;
-        const final_path = std.fmt.bufPrint(
-            &final_path_buffer,
-            "snapshots/{s}",
-            .{snapshot_name},
-        ) catch unreachable;
+    /// Completes a decided membership change on a survivor: reconstructs
+    /// and durably installs the next registry, advances the identity, and
+    /// continues the protocol node on the same global slot line
+    /// (ZDS 0008 over ZDS 0011). A voter the stop sign removed stays
+    /// permanently sealed on its final configuration.
+    pub fn completeMembershipChange(self: *Node) !void {
+        const stop = self.log.isReconfigured() orelse return error.NoStopSign;
+        const stop_slot = self.log.stopSlot() orelse return error.NoStopSign;
+        // Nothing can be chosen beyond a sealed configuration, so the
+        // handover waits only for the stop itself to be applied.
+        if (self.applied_slot < stop_slot) return error.StopNotApplied;
+        std.debug.assert(self.applied_slot == stop_slot);
+        const parsed = try registry.parseStopMetadata(stop.metadataSlice());
 
-        self.dir.deleteTree(self.io, tmp_path) catch {};
-        self.dir.deleteTree(self.io, final_path) catch {};
-        var tmp_dir = try self.dir.createDirPathOpen(self.io, tmp_path, .{});
-        defer tmp_dir.close(self.io);
-
-        try self.dir.copyFile(db_file_name, tmp_dir, "db", self.io, .{});
-        {
-            const snapshot_db = try tmp_dir.openFile(
-                self.io,
-                "db",
-                .{ .mode = .read_write },
-            );
-            defer snapshot_db.close(self.io);
-            try durability.syncFile(self.io, snapshot_db);
-        }
-        const db_digest = try fileSha256(self.io, tmp_dir, "db");
-
-        const manifest = try self.renderManifest(manifest_applied_slot, db_digest);
-        defer self.gpa.free(manifest);
-        try atomicWriteFile(self.io, tmp_dir, "manifest", manifest);
-        try self.dir.rename(tmp_path, self.dir, final_path, self.io);
-        // The snapshot becomes authoritative only when the stop sign
-        // naming it is journaled and synced; that barrier, on this volume,
-        // is what persists this entry where a directory cannot be flushed.
-        try durability.syncChildDirectory(self.io, self.dir, "snapshots");
-
-        var metadata = SnapshotMetadata{ .buffer = undefined, .len = 0 };
-        const manifest_digest = PayloadStore.hashOf(manifest);
-        const rendered = blk: {
-            const decided = self.decidedRegistry() orelse {
-                // Registry-less embedded and local hosts keep zx1.
-                if (pending_request != null) return error.CorruptStopSign;
-                break :blk std.fmt.bufPrint(
-                    &metadata.buffer,
-                    "zx1 {s} {s}",
-                    .{ snapshot_name, &std.fmt.bytesToHex(manifest_digest, .lower) },
-                ) catch unreachable;
-            };
-            // Bind the canonical next registry into the stop metadata.
-            const next = if (pending_request) |request|
-                try decided.successor(request)
-            else
-                try decided.checkpointSuccessor();
-            const registry_digest = next.digest();
-            if (pending_request) |request| {
-                break :blk std.fmt.bufPrint(
-                    &metadata.buffer,
-                    "zx2 {s} {s} {s} {x:0>16} {x:0>8} {x:0>8} {s}",
-                    .{
-                        snapshot_name,
-                        &std.fmt.bytesToHex(manifest_digest, .lower),
-                        &std.fmt.bytesToHex(registry_digest, .lower),
-                        request.operation_id,
-                        request.old_node_id,
-                        request.new_node_id,
-                        request.new_endpoint,
-                    },
-                ) catch unreachable;
+        if (self.capabilities.votes) {
+            var still_member = false;
+            for (stop.membersSlice()) |member| {
+                if (member == self.identity.node_id) still_member = true;
             }
-            break :blk std.fmt.bufPrint(
-                &metadata.buffer,
-                "zx2 {s} {s} {s}",
-                .{
-                    snapshot_name,
-                    &std.fmt.bytesToHex(manifest_digest, .lower),
-                    &std.fmt.bytesToHex(registry_digest, .lower),
-                },
-            ) catch unreachable;
-        };
-        metadata.len = rendered.len;
-        return metadata;
+            if (!still_member) return error.RetiredByReconfiguration;
+        }
+
+        const decided = self.decidedRegistry() orelse
+            return error.NoDecidedRegistry;
+        const next = try reconstructNextRegistry(
+            decided,
+            &parsed,
+            stop.configuration_id,
+        );
+        try registry.storeBlob(self.io, self.dir, &next);
+        failpoint.hit("after_registry_blob");
+        try registry.activatePointer(self.io, self.dir, next.configuration_id);
+        failpoint.hit("after_registry_pointer");
+
+        self.identity.configuration_id = next.configuration_id;
+        try writeIdentity(self.io, self.dir, self.identity);
+        self.decided_registry = next;
+        try self.adoptDecidedMembers();
+        try self.continueOnConfiguration(stop_slot);
+
+        if (try self.pendingOperation()) |pending| {
+            if (parsed.seed) |seed| {
+                if (pending.operation_id == seed.operation_id) {
+                    try self.clearPendingOperation();
+                }
+            }
+        }
+        self.membership_change_pending = false;
     }
 
-    fn renderManifest(
+    /// Installs the decided registry a joining replacement fetched from a
+    /// peer, verified against the enrollment join descriptor, then joins
+    /// the configuration it names at the empty global slot line. The
+    /// pointer write commits the install; a crash before it repeats the
+    /// fetch on restart.
+    pub fn installFetchedRegistry(self: *Node, blob: []const u8) !void {
+        const join = self.join_descriptor orelse return error.NoJoinPending;
+        // Stored blobs are canonical bytes plus a 32-byte digest trailer;
+        // the join descriptor binds the digest of the canonical bytes.
+        if (blob.len <= 32) return error.RegistryMismatch;
+        const encoded = blob[0 .. blob.len - 32];
+        var blob_digest: [32]u8 = undefined;
+        Sha256.hash(encoded, &blob_digest, .{});
+        if (!std.mem.eql(u8, &blob_digest, blob[blob.len - 32 ..]) or
+            !std.mem.eql(u8, &blob_digest, &join.registry_digest))
+        {
+            return error.RegistryMismatch;
+        }
+        var fetched = registry.Decided.decode(encoded) catch
+            return error.RegistryMismatch;
+        fetched.validate() catch return error.RegistryMismatch;
+        if (fetched.database_id != self.identity.database_id or
+            fetched.configuration_id != join.configuration_id)
+        {
+            return error.RegistryMismatch;
+        }
+
+        try registry.storeBlob(self.io, self.dir, &fetched);
+        failpoint.hit("after_registry_blob");
+        try registry.activatePointer(self.io, self.dir, fetched.configuration_id);
+        failpoint.hit("after_registry_pointer");
+        try durableDeleteFile(self.io, self.dir, join_file_name);
+        self.join_descriptor = null;
+
+        self.identity.configuration_id = fetched.configuration_id;
+        try writeIdentity(self.io, self.dir, self.identity);
+        self.decided_registry = fetched;
+        try self.adoptDecidedMembers();
+        try self.continueOnConfiguration(self.applied_slot);
+    }
+
+    /// Refreshes the member table from the decided registry.
+    fn adoptDecidedMembers(self: *Node) !void {
+        var member_storage: [types.log_options.max_members]paxos.NodeId = undefined;
+        const members = self.decided_registry.?.voterIds(&member_storage);
+        var found_self = false;
+        for (members) |member| {
+            if (member == self.identity.node_id) found_self = true;
+        }
+        if (found_self != self.capabilities.votes) {
+            return error.RoleMembershipMismatch;
+        }
+        @memcpy(self.members[0..members.len], members);
+        self.member_count = @intCast(members.len);
+        self.single = self.capabilities.votes and members.len == 1;
+    }
+
+    /// Restarts the protocol node under the current identity and member
+    /// table at `floor`, keeping the global slot line and the adopted
+    /// trim anchor. Accepted-only state above the floor belongs to the
+    /// sealed configuration and is discarded, exactly as a restart is.
+    fn continueOnConfiguration(self: *Node, floor: paxos.Slot) !void {
+        const durable = try self.gpa.create(Log.DurableState);
+        defer self.gpa.destroy(durable);
+        durable.* = .{};
+        durable.anchor = self.log.trimAnchor();
+        try self.restoreCoreOn(durable, floor);
+    }
+
+    /// Same-configuration continuation onto an installed state image. The
+    /// image discharges every slot at or below `floor`, but the node's
+    /// open Paxos obligations survive it: the durable promise and every
+    /// vote above the floor are carried into the restored core, so a
+    /// transfer can never let an older ballot win a slot this node
+    /// already helped choose. Discarding them is safe only across a
+    /// configuration change, where the new configuration id fences the
+    /// old ballot line.
+    fn continueOnConfigurationPreserving(self: *Node, floor: paxos.Slot) !void {
+        const durable = try self.gpa.create(Log.DurableState);
+        defer self.gpa.destroy(durable);
+        durable.* = self.log.core.durable;
+        try self.restoreCoreOn(durable, floor);
+    }
+
+    fn restoreCoreOn(
         self: *Node,
-        applied_slot: paxos.Slot,
-        db_digest: [32]u8,
-    ) ![]u8 {
-        return std.fmt.allocPrint(self.gpa,
-            \\format=1
-            \\database_id={x:0>32}
-            \\sealed_configuration_id={d}
-            \\applied_slot={d}
-            \\chain={s}
-            \\db_sha256={s}
-            \\
-        , .{
-            self.identity.database_id,
-            self.identity.configuration_id,
-            applied_slot,
-            &std.fmt.bytesToHex(self.last_chain, .lower),
-            &std.fmt.bytesToHex(db_digest, .lower),
-        });
+        durable: *const Log.DurableState,
+        floor: paxos.Slot,
+    ) !void {
+        var membership: Log.Membership = undefined;
+        try membership.init(self.members[0..self.member_count]);
+        if (self.capabilities.votes) {
+            try self.log.restoreAt(
+                self.identity.node_id,
+                self.identity.configuration_id,
+                &membership,
+                durable,
+                floor,
+                self.leader_priority,
+            );
+        } else {
+            try self.log.restoreLearner(
+                self.identity.node_id,
+                self.identity.configuration_id,
+                &membership,
+                durable,
+            );
+        }
+        // A stateless continuation of a joined configuration must not
+        // lead (a joiner opens at configuration 1 and only learns its
+        // real configuration from the fetched registry, so this is
+        // where the hold is decided); it lifts once anything applies.
+        self.join_campaign_hold = self.capabilities.campaigns and
+            self.capabilities.materializes and
+            self.identity.configuration_id > 1 and
+            self.applied_slot == 0;
+        self.log.core.setCampaignEnabled(
+            self.capabilities.campaigns and !self.join_campaign_hold,
+        );
+        if (self.single and self.capabilities.campaigns) {
+            try self.log.campaign(.noop, self.effects);
+            try self.consumeEffects();
+        }
     }
 
-    /// Streams a consistent logical backup into `destination`.
     pub fn backup(self: *Node, destination: []const u8) !void {
         if (self.fatal_storage_error) return error.StorageFailed;
         if (self.needs_resync) try self.resyncImage();
@@ -1991,40 +2540,68 @@ pub const Node = struct {
             .chain_ok = true,
             .payloads_ok = true,
         };
-        var chain = self.epochBaseChain() catch {
-            report.chain_ok = false;
-            return report;
-        };
+        // Walk the retained journal suffix from the durable anchor,
+        // revalidating the batch chain and payload store (ZDS 0011: the
+        // trimmed prefix is vouched for by the anchor itself).
+        var chain = command.genesisChain(self.identity.database_id);
         var data_slot: paxos.Slot = 0;
-        var slot: paxos.Slot = 1;
-        const decided = self.log.decidedThrough();
-        while (slot <= decided) : (slot += 1) {
-            const entry = self.log.read(slot) orelse break;
-            switch (entry) {
-                .command => |cmd| switch (cmd) {
-                    .transaction_batch => |batch| {
-                        if (batch.database_id != self.identity.database_id or
-                            batch.base_data_slot != data_slot or
-                            !std.mem.eql(u8, &batch.base_chain_hash, &chain) or
-                            !command.chainValid(batch))
-                        {
-                            report.chain_ok = false;
-                        }
-                        chain = batch.result_chain_hash;
-                        const payload = self.store.load(self.gpa, batch.payload_hash) catch {
-                            report.payloads_ok = false;
-                            continue;
-                        };
-                        defer self.gpa.free(payload);
-                        _ = self.validateBatchPayload(batch, payload) catch {
-                            report.payloads_ok = false;
-                            continue;
-                        };
-                        data_slot = slot;
+        var next_slot: paxos.Slot = 1;
+        if (applied_anchor.select(
+            self.io,
+            self.journal.dir,
+            self.identity.database_id,
+        )) |anchor| {
+            chain = anchor.last_chain;
+            data_slot = anchor.last_data_slot;
+            next_slot = anchor.global_slot + 1;
+        }
+        var progressed = true;
+        while (progressed) {
+            progressed = false;
+            var it = self.journal.iterate(next_slot) catch {
+                report.chain_ok = false;
+                return report;
+            };
+            defer it.close();
+            while (it.next() catch {
+                report.chain_ok = false;
+                break;
+            }) |write| {
+                const commit = switch (write) {
+                    .commit => |commit| commit,
+                    else => continue,
+                };
+                if (commit.slot != next_slot) continue;
+                next_slot += 1;
+                progressed = true;
+                switch (commit.value) {
+                    .command => |cmd| switch (cmd) {
+                        .transaction_batch => |batch| {
+                            if (batch.database_id != self.identity.database_id or
+                                batch.base_data_slot != data_slot or
+                                !std.mem.eql(u8, &batch.base_chain_hash, &chain) or
+                                !command.chainValid(batch))
+                            {
+                                report.chain_ok = false;
+                            }
+                            chain = batch.result_chain_hash;
+                            data_slot = commit.slot;
+                            const payload = self.store.load(
+                                self.gpa,
+                                batch.payload_hash,
+                            ) catch {
+                                report.payloads_ok = false;
+                                continue;
+                            };
+                            defer self.gpa.free(payload);
+                            _ = self.validateBatchPayload(batch, payload) catch {
+                                report.payloads_ok = false;
+                            };
+                        },
+                        else => {},
                     },
-                    else => {},
-                },
-                .stop => {},
+                    .stop => {},
+                }
             }
         }
         return report;
@@ -2069,7 +2646,7 @@ pub const Node = struct {
             self.db_open = false;
         }
         self.capture_batch_id = null;
-        try self.rebuildMaterializedImage();
+        try self.materializeFromJournal();
         self.needs_resync = false;
     }
 
@@ -2137,15 +2714,32 @@ pub const Node = struct {
         capture: ?*WriteCapture,
     ) !ExecResult {
         if (self.fatal_storage_error) return error.StorageFailed;
-        if (self.needs_resync) try self.resyncImage();
-        if (self.rollover_pending) {
-            if (!self.single) return error.LogSealed;
-            try self.completeClusterRollover();
+        // The storage-budget hard ceiling (ZDS 0011): past the
+        // configured cap, new writes are refused rather than unproven
+        // history deleted; a safe trim, a state transfer, or an
+        // operator capacity change restores service. Admission holds a
+        // one-transaction reserve below the cap, so no leader-admitted
+        // write can land above it; followers install what consensus
+        // chose regardless and fail loudly on their own write path.
+        if (self.journal_cap_bytes != 0) {
+            const usage = self.journal.stats().journal_bytes +|
+                self.store.retained_bytes;
+            if (admissionOverCap(
+                usage,
+                admission_reserve_bytes,
+                self.journal_cap_bytes,
+            )) {
+                return error.RecoveryRetentionExceeded;
+            }
         }
-        if (self.single) try self.ensureEpochCapacity();
+        if (self.needs_resync) try self.resyncImage();
         // Never execute SQL that cannot be appended: a sealed log would
         // otherwise leave a committed SQLite transaction with no slot.
-        if (self.log.stop_pending or self.log.isReconfigured() != null) {
+        // Slots continue globally; sealing now means membership change
+        // only (ZDS 0011).
+        if (self.membership_change_pending or self.log.stop_pending or
+            self.log.isReconfigured() != null)
+        {
             return error.LogSealed;
         }
         try self.ensureWriter();
@@ -2357,9 +2951,9 @@ pub const Node = struct {
         if (self.live_transaction) return error.TransactionOpen;
         if (self.fatal_storage_error) return error.StorageFailed;
         if (self.needs_resync) try self.resyncImage();
-        if (self.rollover_pending) try self.completeClusterRollover();
-        try self.ensureEpochCapacity();
-        if (self.log.stop_pending or self.log.isReconfigured() != null) {
+        if (self.membership_change_pending or self.log.stop_pending or
+            self.log.isReconfigured() != null)
+        {
             return error.LogSealed;
         }
         try self.ensureWriter();
@@ -2647,12 +3241,6 @@ pub const Node = struct {
         return self.last_append;
     }
 
-    fn ensureEpochCapacity(self: *Node) !void {
-        if (self.epochNearlyFull()) {
-            try self.snapshot();
-        }
-    }
-
     fn totalChanges(self: *Node) i64 {
         return self.db.totalChanges64();
     }
@@ -2774,12 +3362,17 @@ pub const Node = struct {
         while (true) {
             const writes = self.effects.writesSlice();
             if (writes.len > 0) {
+                // Every record is appended: the journal is the recovery
+                // authority under ZDS 0011, so commit markers must reach
+                // it. A commit-only batch is derived from durable quorum
+                // evidence and skips only the barrier, riding the next
+                // synced batch instead.
+                self.journal.appendWrites(writes) catch |err| {
+                    self.fatal_storage_error = true;
+                    return err;
+                };
                 const requires_barrier = self.effects.requiresPowerLossBarrier();
                 if (requires_barrier) {
-                    self.journal.appendWrites(writes) catch |err| {
-                        self.fatal_storage_error = true;
-                        return err;
-                    };
                     failpoint.hit("after_accept_append");
 
                     // Phase-two requests do not claim the leader's local vote
@@ -2839,15 +3432,66 @@ pub const Node = struct {
                     try self.outbox.append(self.gpa, envelope);
                 }
             }
+            const writes_before_accounting = self.effects.writes_count;
             self.accountCommitted(self.effects.committedSlice()) catch |err| {
                 self.fatal_storage_error = true;
                 return err;
             };
+            // Accounting can adopt a chosen trim, which appends its own
+            // durable marker; journal the tail before the reset below
+            // would discard it. Derived records ride the next barrier.
+            if (self.effects.writes_count > writes_before_accounting) {
+                const tail = self.effects
+                    .writes[writes_before_accounting..self.effects.writes_count];
+                self.journal.appendWrites(tail) catch |err| {
+                    self.fatal_storage_error = true;
+                    return err;
+                };
+                // Derived records (trim anchors) ride the next barrier.
+                self.effects.confirmWritesDurable();
+            }
+            // Everything accounted is journal-durable and consumed, so its
+            // consensus cells may be reused (ZDS 0011 memory floor).
+            self.journal.noteChosen(self.log.decidedThrough());
+            const floor = @min(
+                self.journal.persistedThrough(),
+                self.log.decidedThrough(),
+            );
+            try self.log.core.advanceMemoryFloor(floor);
+            try self.serveJournalRanges();
             self.effects.reset();
             if (pending == 0) return;
             for (self.inbox[0..pending]) |envelope| {
                 try self.log.step(envelope, self.effects);
             }
+        }
+    }
+
+    /// Serves catch-up history the core released below its memory floor:
+    /// the journal streams retained commits back as ordinary envelopes.
+    fn serveJournalRanges(self: *Node) !void {
+        for (self.effects.requestsSlice()) |request| {
+            const range = request.serve_range;
+            const Sink = struct {
+                node: *Node,
+                peer: paxos.NodeId,
+                fn emit(context: @This(), slot: paxos.Slot, entry: types.Entry) !void {
+                    try context.node.outbox.append(context.node.gpa, .{
+                        .from = context.node.identity.node_id,
+                        .to = context.peer,
+                        .message = .{ .commit = .{
+                            .slot = slot,
+                            .value = entry,
+                        } },
+                    });
+                }
+            };
+            try self.journal.serveRange(
+                range.first,
+                range.count,
+                Sink{ .node = self, .peer = range.peer },
+                Sink.emit,
+            );
         }
     }
 
@@ -2897,6 +3541,27 @@ pub const Node = struct {
                             self.needs_resync = true;
                         }
                     },
+                    .trim => |record| {
+                        if (self.capture_batch_id != null) {
+                            self.capture_batch_id = null;
+                            self.needs_resync = true;
+                        }
+                        try self.adoptChosenTrim(record);
+                    },
+                    .transfer_lease => |lease| {
+                        if (self.capture_batch_id != null) {
+                            self.capture_batch_id = null;
+                            self.needs_resync = true;
+                        }
+                        self.trackLease(lease);
+                    },
+                    .lease_complete => |complete| {
+                        if (self.capture_batch_id != null) {
+                            self.capture_batch_id = null;
+                            self.needs_resync = true;
+                        }
+                        self.releaseLease(complete.lease_id);
+                    },
                     .transaction_batch => |batch| {
                         if (batch.database_id != self.identity.database_id or
                             !std.mem.eql(u8, &batch.base_chain_hash, &self.last_chain) or
@@ -2922,16 +3587,35 @@ pub const Node = struct {
                         }
                         self.last_chain = batch.result_chain_hash;
                         self.last_data_slot = entry.slot;
+                        self.last_batch_id = batch.batch_id;
+                        self.recent_batches[
+                            @intCast(entry.slot % self.recent_batches.len)
+                        ] = .{ .slot = entry.slot, .batch_id = batch.batch_id };
                     },
                 },
-                .stop => {
+                .stop => |stop| {
                     if (self.capture_batch_id != null) {
                         self.capture_batch_id = null;
                         self.needs_resync = true;
                     }
-                    self.rollover_pending = true;
+                    // A stop at or below the running configuration is
+                    // replayed history, not a pending handover.
+                    if (stop.configuration_id > self.identity.configuration_id) {
+                        self.membership_change_pending = true;
+                    }
                 },
             }
+            // Every chosen entry advances the global history anchor,
+            // including noops, stops, and retention records (ZDS 0011).
+            self.history_hash = history.advance(
+                self.history_hash,
+                self.identity.database_id,
+                self.identity.configuration_id,
+                entry.slot,
+                entry.value,
+            );
+            self.recent_history[@intCast(entry.slot % self.recent_history.len)] =
+                .{ .slot = entry.slot, .hash = self.history_hash };
             self.applied_slot = entry.slot;
         }
     }
@@ -2969,8 +3653,8 @@ pub const Node = struct {
         });
         defer file.close(self.io);
         try wal.applyPayload(self.io, file, &view);
-        // `current.db` is a materialized cache, rebuilt from the snapshot,
-        // accepted journal records, and payload store on every open. The page
+        // `current.db` is a materialized cache, rebuilt from the durable
+        // anchor, accepted journal records, and payload store on every open. The page
         // writes need to finish before local reads, but do not require a
         // second power-loss barrier per chosen transaction.
     }
@@ -3002,10 +3686,27 @@ pub const Node = struct {
     // Recovery
     // ------------------------------------------------------------------
 
-    /// Rebuilds the materialized SQLite image from the snapshot base plus
-    /// every committed transaction payload of the current epoch, applying
-    /// pages offline in slot order.
-    fn rebuildMaterializedImage(self: *Node) !void {
+    /// Refuses to open over any journal v1 artifact: the ZDS 0011 format
+    /// cut has no bridge, and guessing would risk both histories.
+    fn rejectLegacyArtifacts(io: Io, dir: Io.Dir) !void {
+        if (dir.access(io, current_file_name, .{})) |_| {
+            return error.UnsupportedLegacyFormat;
+        } else |_| {}
+        var name_buffer: [26]u8 = undefined;
+        const legacy = std.fmt.bufPrint(
+            &name_buffer,
+            "paxos-{x:0>16}.log",
+            .{@as(u64, 1)},
+        ) catch unreachable;
+        if (dir.access(io, legacy, .{})) |_| {
+            return error.UnsupportedLegacyFormat;
+        } else |_| {}
+    }
+
+    /// Materializes `current.db` from the durable APPLIED anchor plus the
+    /// retained journal suffix (ZDS 0011 recovery ladder, steps 1 and 3).
+    /// Startup cost follows the anchor cadence, never the log lifetime.
+    fn materializeFromJournal(self: *Node) !void {
         std.debug.assert(!self.db_open);
         // SQLite's own WAL is a working artifact, never authoritative.
         self.dir.deleteFile(self.io, wal_file_name) catch |err| switch (err) {
@@ -3017,47 +3718,49 @@ pub const Node = struct {
             else => return err,
         };
 
-        // The image is never an input to recovery. Reusing it would allow a
-        // speculative or corrupted page inherited from the snapshot base but
-        // untouched by this epoch's suffix to survive replay.
-        self.dir.deleteFile(self.io, db_file_name) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        };
-        var snapshot_covers_current_epoch = false;
-        if (try self.currentSnapshotName()) |name| {
-            const sealed_configuration = try self.snapshotSealedConfiguration(name);
-            if (sealed_configuration == self.identity.configuration_id) {
-                // Crash after CURRENT installation but before identity/journal
-                // rollover: this generation already covers the sealed epoch.
-                if (self.log.isReconfigured() == null) return error.CorruptManifest;
-                snapshot_covers_current_epoch = true;
-            } else if (sealed_configuration == std.math.maxInt(u64) or
-                sealed_configuration + 1 != self.identity.configuration_id)
-            {
-                return error.ConfigurationMismatch;
+        var base: paxos.Slot = 0;
+        var anchor_config = self.identity.configuration_id;
+        if (applied_anchor.select(
+            self.io,
+            self.journal.dir,
+            self.identity.database_id,
+        )) |anchor| {
+            if (try self.anchorMatchesImage(anchor)) {
+                base = anchor.global_slot;
+                self.anchor_generation = anchor.generation;
+                anchor_config = anchor.configuration_id;
+                self.history_hash = anchor.history_hash;
+                self.history_hash_at_anchor = anchor.history_hash;
+                self.last_chain = anchor.last_chain;
+                self.last_data_slot = anchor.last_data_slot;
+                self.last_batch_id = anchor.last_batch_id;
+                self.durable_state_slot = anchor.global_slot;
+                self.page_size = anchor.sqlite_page_size;
             }
-            var snapshot_db_path_buffer: [64]u8 = undefined;
-            const snapshot_db_path = std.fmt.bufPrint(
-                &snapshot_db_path_buffer,
-                "snapshots/{s}/db",
-                .{&name},
-            ) catch unreachable;
-            try self.dir.copyFile(snapshot_db_path, self.dir, db_file_name, self.io, .{});
         }
-
-        self.last_chain = try self.epochBaseChain();
-        self.last_data_slot = 0;
-        self.applied_slot = 0;
-        self.rollover_pending = false;
-
-        const decided = self.log.decidedThrough();
-        if (decided == 0) return;
-
-        if (snapshot_covers_current_epoch) {
-            self.applied_slot = decided;
-            self.rollover_pending = true;
-            return;
+        if (base == 0) {
+            // No usable anchor: only a journal physically retained from
+            // genesis can rebuild the image; anything else needs a state
+            // transfer. A chosen trim alone does not destroy records.
+            if (self.journal.retainedFirstSlot() > 1) {
+                return error.StateUnavailable;
+            }
+            self.dir.deleteFile(self.io, db_file_name) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => return err,
+            };
+            self.history_hash = history.genesis(self.identity.database_id);
+            self.last_chain = command.genesisChain(self.identity.database_id);
+            self.last_data_slot = 0;
+            self.durable_state_slot = 0;
+        }
+        self.applied_slot = base;
+        if (base > 0 and self.journal.retainedFirstSlot() > base + 1) {
+            // The retained journal no longer reaches the anchor: the
+            // newest anchor generation was lost and the fallback sits
+            // below what reclamation already deleted. Serving the stale
+            // image would silently skip the gap.
+            return error.StateUnavailable;
         }
 
         const file = try self.dir.createFile(self.io, db_file_name, .{
@@ -3066,39 +3769,160 @@ pub const Node = struct {
         });
         defer file.close(self.io);
 
-        var slot: paxos.Slot = 1;
-        while (slot <= decided) : (slot += 1) {
-            const entry = self.log.read(slot) orelse return error.MissingCommitted;
-            switch (entry) {
-                .command => |cmd| switch (cmd) {
-                    .noop, .read_barrier => {},
-                    .transaction_batch => |batch| {
-                        if (batch.database_id != self.identity.database_id or
-                            !std.mem.eql(u8, &batch.base_chain_hash, &self.last_chain) or
-                            batch.base_data_slot != self.last_data_slot or
-                            !command.chainValid(batch))
-                        {
-                            return error.ChainMismatch;
-                        }
-                        const payload = self.store.load(self.gpa, batch.payload_hash) catch {
-                            // A committed descriptor without payload bytes:
-                            // this node must not serve.
-                            return error.PayloadMissing;
-                        };
-                        defer self.gpa.free(payload);
-                        const view = try self.validateBatchPayload(batch, payload);
-                        try wal.applyPayload(self.io, file, &view);
-                        self.last_chain = batch.result_chain_hash;
-                        self.last_data_slot = slot;
-                    },
-                },
-                .stop => {
-                    self.rollover_pending = true;
-                },
+        // Entries fold into the history hash under the configuration
+        // they were chosen in; a replayed stop advances the cursor the
+        // same way the live handover does. A genesis rebuild starts at
+        // the database's first configuration.
+        var config_cursor: u64 = if (base == 0) 1 else anchor_config;
+
+        // Commit records sit in arrival order in the journal, but the
+        // reorder distance is bounded by the consensus window (the core
+        // only journals in-window commits), so one streaming pass with a
+        // window-sized park ring applies the whole contiguous suffix.
+        const window = types.log_options.window_slots;
+        const Parked = struct { slot: paxos.Slot = 0, value: types.Entry = undefined };
+        const parked = try self.gpa.alloc(Parked, window);
+        defer self.gpa.free(parked);
+        @memset(parked, .{});
+
+        var it = try self.journal.iterate(self.applied_slot + 1);
+        defer it.close();
+        while (try it.next()) |write| {
+            const commit = switch (write) {
+                .commit => |commit| commit,
+                else => continue,
+            };
+            if (commit.slot <= self.applied_slot) continue;
+            if (commit.slot == self.applied_slot + 1) {
+                try self.applyReplayCommit(file, commit.slot, commit.value, &config_cursor);
+                while (true) {
+                    const cell = &parked[@intCast((self.applied_slot + 1) % window)];
+                    if (cell.slot != self.applied_slot + 1) break;
+                    const value = cell.value;
+                    cell.slot = 0;
+                    try self.applyReplayCommit(file, self.applied_slot + 1, value, &config_cursor);
+                }
+            } else if (commit.slot - self.applied_slot <= window) {
+                parked[@intCast(commit.slot % window)] =
+                    .{ .slot = commit.slot, .value = commit.value };
             }
-            self.applied_slot = slot;
         }
         try durability.syncFile(self.io, file);
+    }
+
+    /// Applies one replayed commit and advances the configuration cursor
+    /// across stop entries: the stop itself is hashed under the outgoing
+    /// configuration, everything after it under the incoming one, byte
+    /// for byte the ordering the live handover produces.
+    fn applyReplayCommit(
+        self: *Node,
+        file: Io.File,
+        slot: paxos.Slot,
+        value: types.Entry,
+        config_cursor: *u64,
+    ) !void {
+        try self.applyEntryToImage(file, slot, value, config_cursor.*);
+        switch (value) {
+            .stop => |stop| if (stop.configuration_id > config_cursor.*) {
+                config_cursor.* = stop.configuration_id;
+            },
+            else => {},
+        }
+        self.applied_slot = slot;
+    }
+
+    /// Discards the local image and its anchors, then re-materializes
+    /// from the genesis-retained journal. Only legal while nothing has
+    /// been trimmed; the durable frontier restarts at zero and re-anchors
+    /// on the next cadence.
+    fn discardImageAndRematerialize(self: *Node) !void {
+        if (self.journal.retainedFirstSlot() > 1) {
+            return error.StateUnavailable;
+        }
+        self.dir.deleteFile(self.io, db_file_name) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+        self.journal.dir.deleteFile(self.io, "APPLIED.0") catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+        self.journal.dir.deleteFile(self.io, "APPLIED.1") catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+        self.durable_state_slot = 0;
+        try self.materializeFromJournal();
+    }
+
+    /// Whether a selected anchor matches the on-disk image geometry; a
+    /// mismatch means the image was lost or replaced and the anchor is
+    /// not a recovery base.
+    fn anchorMatchesImage(self: *Node, anchor: applied_anchor.Anchor) !bool {
+        const file = self.dir.openFile(self.io, db_file_name, .{}) catch |err|
+            switch (err) {
+                error.FileNotFound => return false,
+                else => return err,
+            };
+        defer file.close(self.io);
+        // Offline applies legitimately grow the image past the anchor;
+        // replaying the suffix over them is idempotent. Only an image
+        // smaller than the anchored base is unusable.
+        const length = try file.length(self.io);
+        return length >=
+            @as(u64, anchor.sqlite_page_count) * anchor.sqlite_page_size;
+    }
+
+    /// Applies one chosen entry to the materialized image and advances
+    /// the chain cursors and the global history anchor.
+    fn applyEntryToImage(
+        self: *Node,
+        file: Io.File,
+        slot: paxos.Slot,
+        entry: types.Entry,
+        configuration_id: u64,
+    ) !void {
+        switch (entry) {
+            .command => |cmd| switch (cmd) {
+                // Retention records change no page; membership stops are
+                // finished by the pending-handover path after open.
+                .noop, .read_barrier, .trim, .transfer_lease, .lease_complete => {},
+                .transaction_batch => |batch| {
+                    if (batch.database_id != self.identity.database_id or
+                        !std.mem.eql(u8, &batch.base_chain_hash, &self.last_chain) or
+                        batch.base_data_slot != self.last_data_slot or
+                        !command.chainValid(batch))
+                    {
+                        return error.ChainMismatch;
+                    }
+                    const payload = self.store.load(self.gpa, batch.payload_hash) catch {
+                        // A committed descriptor without payload bytes:
+                        // this node must not serve.
+                        return error.PayloadMissing;
+                    };
+                    defer self.gpa.free(payload);
+                    const view = try self.validateBatchPayload(batch, payload);
+                    try wal.applyPayload(self.io, file, &view);
+                    self.last_chain = batch.result_chain_hash;
+                    self.last_data_slot = slot;
+                    self.last_batch_id = batch.batch_id;
+                },
+            },
+            .stop => |stop| {
+                if (stop.configuration_id > self.identity.configuration_id) {
+                    self.membership_change_pending = true;
+                }
+            },
+        }
+        self.history_hash = history.advance(
+            self.history_hash,
+            self.identity.database_id,
+            configuration_id,
+            slot,
+            entry,
+        );
+        self.recent_history[@intCast(slot % self.recent_history.len)] =
+            .{ .slot = slot, .hash = self.history_hash };
     }
 
     fn openLiveDatabase(self: *Node) !void {
@@ -3142,13 +3966,11 @@ pub const Node = struct {
     }
 
     /// After rebuild, the materialized image's recorded batch marker must
-    /// match the last committed transaction batch of the epoch.
+    /// match the last committed transaction batch in the retained journal.
     fn validateMaterializedBatch(self: *Node) !void {
         if (self.last_data_slot == 0) return;
-        const entry = self.log.read(self.last_data_slot) orelse return error.MissingCommitted;
-        const batch = entry.command.transaction_batch;
         var batch_id_bytes: [16]u8 = undefined;
-        std.mem.writeInt(u128, &batch_id_bytes, batch.batch_id, .little);
+        std.mem.writeInt(u128, &batch_id_bytes, self.last_batch_id, .little);
         const expected = std.fmt.bytesToHex(batch_id_bytes, .lower);
 
         var lease = try self.readLease();
@@ -3163,367 +3985,6 @@ pub const Node = struct {
         }
     }
 
-    /// The chain identity at the base of the current epoch: the snapshot
-    /// manifest's chain, or the genesis chain for a fresh database.
-    fn epochBaseChain(self: *Node) !command.HashBytes {
-        if (try self.currentSnapshotName()) |name| {
-            var manifest_path_buffer: [64]u8 = undefined;
-            const manifest_path = std.fmt.bufPrint(
-                &manifest_path_buffer,
-                "snapshots/{s}/manifest",
-                .{&name},
-            ) catch unreachable;
-            const manifest = try self.dir.readFileAlloc(
-                self.io,
-                manifest_path,
-                self.gpa,
-                .limited(4096),
-            );
-            defer self.gpa.free(manifest);
-            const chain_hex = manifestValue(manifest, "chain") orelse
-                return error.CorruptManifest;
-            if (chain_hex.len != 64) return error.CorruptManifest;
-            var chain: command.HashBytes = undefined;
-            _ = std.fmt.hexToBytes(&chain, chain_hex) catch return error.CorruptManifest;
-            return chain;
-        }
-        return command.genesisChain(self.identity.database_id);
-    }
-
-    fn snapshotSealedConfiguration(self: *Node, name: [16]u8) !u64 {
-        var manifest_path_buffer: [64]u8 = undefined;
-        const manifest_path = std.fmt.bufPrint(
-            &manifest_path_buffer,
-            "snapshots/{s}/manifest",
-            .{&name},
-        ) catch unreachable;
-        const manifest = try self.dir.readFileAlloc(
-            self.io,
-            manifest_path,
-            self.gpa,
-            .limited(4096),
-        );
-        defer self.gpa.free(manifest);
-        const sealed_text = manifestValue(manifest, "sealed_configuration_id") orelse
-            return error.CorruptManifest;
-        return std.fmt.parseInt(u64, sealed_text, 10) catch
-            error.CorruptManifest;
-    }
-
-    /// Validates every field that binds an installed snapshot generation to
-    /// this database and verifies the image digest before it can become a
-    /// recovery base. Returns the sealed (previous) configuration ID.
-    fn validateSnapshotGeneration(self: *Node, name: [16]u8) !u64 {
-        var directory_path_buffer: [64]u8 = undefined;
-        const directory_path = std.fmt.bufPrint(
-            &directory_path_buffer,
-            "snapshots/{s}",
-            .{&name},
-        ) catch unreachable;
-        var snapshot_dir = try self.dir.openDir(self.io, directory_path, .{});
-        defer snapshot_dir.close(self.io);
-        const manifest = try snapshot_dir.readFileAlloc(
-            self.io,
-            "manifest",
-            self.gpa,
-            .limited(4096),
-        );
-        defer self.gpa.free(manifest);
-
-        const format = manifestValue(manifest, "format") orelse
-            return error.CorruptManifest;
-        if (!std.mem.eql(u8, format, "1")) return error.CorruptManifest;
-        const database_text = manifestValue(manifest, "database_id") orelse
-            return error.CorruptManifest;
-        const database_id = std.fmt.parseInt(u128, database_text, 16) catch
-            return error.CorruptManifest;
-        if (database_id != self.identity.database_id) return error.DatabaseMismatch;
-        const sealed_text = manifestValue(manifest, "sealed_configuration_id") orelse
-            return error.CorruptManifest;
-        const sealed = std.fmt.parseInt(u64, sealed_text, 10) catch
-            return error.CorruptManifest;
-        var expected_name_buffer: [16]u8 = undefined;
-        const expected_name = std.fmt.bufPrint(
-            &expected_name_buffer,
-            "{x:0>16}",
-            .{sealed},
-        ) catch unreachable;
-        if (!std.mem.eql(u8, expected_name, &name)) return error.CorruptManifest;
-        const applied = manifestValue(manifest, "applied_slot") orelse
-            return error.CorruptManifest;
-        _ = std.fmt.parseInt(paxos.Slot, applied, 10) catch
-            return error.CorruptManifest;
-        const chain_hex = manifestValue(manifest, "chain") orelse
-            return error.CorruptManifest;
-        var chain: command.HashBytes = undefined;
-        if (chain_hex.len != chain.len * 2) return error.CorruptManifest;
-        _ = std.fmt.hexToBytes(&chain, chain_hex) catch return error.CorruptManifest;
-        const digest_hex = manifestValue(manifest, "db_sha256") orelse
-            return error.CorruptManifest;
-        var expected_digest: [32]u8 = undefined;
-        if (digest_hex.len != expected_digest.len * 2) return error.CorruptManifest;
-        _ = std.fmt.hexToBytes(&expected_digest, digest_hex) catch
-            return error.CorruptManifest;
-        const actual_digest = try fileSha256(self.io, snapshot_dir, "db");
-        if (!std.mem.eql(u8, &actual_digest, &expected_digest)) {
-            return error.SnapshotDigestMismatch;
-        }
-        return sealed;
-    }
-
-    /// Switches an interrupted receiver to the empty epoch immediately after
-    /// its verified snapshot. The old journal remains as a recovery fallback
-    /// and is collected by a later successful rollover.
-    fn activateInstalledSnapshot(
-        self: *Node,
-        configuration_id: u64,
-        membership: *const Log.Membership,
-    ) !void {
-        var new_journal = Journal.create(
-            self.io,
-            self.dir,
-            configuration_id,
-        ) catch |err| switch (err) {
-            error.PathAlreadyExists => blk: {
-                const durable = try self.gpa.create(Log.DurableState);
-                defer self.gpa.destroy(durable);
-                durable.* = .{};
-                var info: journal_mod.ReplayInfo = undefined;
-                var opened = try Journal.open(
-                    self.io,
-                    self.gpa,
-                    self.dir,
-                    configuration_id,
-                    durable,
-                    &info,
-                );
-                if (info.record_count != 0) {
-                    opened.close();
-                    return error.ConfigurationMismatch;
-                }
-                break :blk opened;
-            },
-            else => return err,
-        };
-        var journal_installed = false;
-        errdefer if (!journal_installed) new_journal.close();
-
-        // A crash advanced CURRENT before the identity file; the registry
-        // pointer sits between them in the recovery order, so it may also
-        // need to advance before identity moves.
-        if (self.decidedRegistry()) |decided| {
-            if (decided.configuration_id < configuration_id) {
-                var name_buffer: [16]u8 = undefined;
-                const sealed_name = std.fmt.bufPrint(
-                    &name_buffer,
-                    "{x:0>16}",
-                    .{configuration_id - 1},
-                ) catch unreachable;
-                var proof_path_buffer: [64]u8 = undefined;
-                const proof_path = std.fmt.bufPrint(
-                    &proof_path_buffer,
-                    "snapshots/{s}/proof",
-                    .{sealed_name},
-                ) catch unreachable;
-                const proof_bytes = try self.dir.readFileAlloc(
-                    self.io,
-                    proof_path,
-                    self.gpa,
-                    .limited(4096),
-                );
-                defer self.gpa.free(proof_bytes);
-                const proof = try checkpoint_proof.decode(proof_bytes);
-                const parsed = try parseStopMetadata(proof.metadataSlice());
-                const next = try reconstructNextRegistry(
-                    decided,
-                    &parsed,
-                    configuration_id,
-                );
-                try registry.storeBlob(self.io, self.dir, &next);
-                try registry.activatePointer(self.io, self.dir, next.configuration_id);
-                self.decided_registry = next;
-            }
-        }
-
-        try writeIdentity(self.io, self.dir, .{
-            .node_id = self.identity.node_id,
-            .database_id = self.identity.database_id,
-            .configuration_id = configuration_id,
-            .role = self.identity.role,
-        });
-        self.journal.close();
-        self.journal = new_journal;
-        journal_installed = true;
-        self.identity.configuration_id = configuration_id;
-        try self.initLogForRole(configuration_id, membership);
-    }
-
-    fn currentSnapshotName(self: *Node) !?[16]u8 {
-        const bytes = self.dir.readFileAlloc(
-            self.io,
-            current_file_name,
-            self.gpa,
-            .limited(64),
-        ) catch |err| switch (err) {
-            error.FileNotFound => return null,
-            else => return err,
-        };
-        defer self.gpa.free(bytes);
-        const trimmed = std.mem.trim(u8, bytes, " \n");
-        if (trimmed.len != 16) return error.CorruptCurrentPointer;
-        return trimmed[0..16].*;
-    }
-
-    // ------------------------------------------------------------------
-    // Epoch rollover
-    // ------------------------------------------------------------------
-
-    /// Completes a decided checkpoint on any member. A follower first
-    /// materializes its own snapshot generation from the offline image;
-    /// the leader (or a one-member node) already built it while preparing
-    /// the checkpoint.
-    pub fn completeClusterRollover(self: *Node) !void {
-        try self.completeClusterRolloverDeferred();
-        try self.activateRollover();
-    }
-
-    /// Installs the next epoch without emitting its first campaign. A
-    /// transport host calls `activateRollover` only after publishing the
-    /// matching peer generation.
-    pub fn completeClusterRolloverDeferred(self: *Node) !void {
-        const stop = self.log.isReconfigured() orelse return error.NoStopSign;
-        if (!self.db_open) {
-            try self.buildFollowerSnapshot(&stop);
-        }
-        try self.completeRollover();
-    }
-
-    pub fn activateRollover(self: *Node) !void {
-        if (!self.rollover_campaign_pending) return;
-        self.rollover_campaign_pending = false;
-        try self.log.campaign(.noop, self.effects);
-        try self.consumeEffects();
-    }
-
-    /// Builds this member's snapshot generation for a decided stop sign
-    /// from the fully applied materialized image, and verifies that its
-    /// manifest digest matches the decided metadata. Deterministic page
-    /// application makes the generation byte-identical to the leader's.
-    fn buildFollowerSnapshot(self: *Node, stop: *const Log.StopSign) !void {
-        const parsed = try parseStopMetadata(stop.metadataSlice());
-
-        // Already built (crash between build and rollover completion).
-        var manifest_path_buffer: [64]u8 = undefined;
-        const manifest_path = std.fmt.bufPrint(
-            &manifest_path_buffer,
-            "snapshots/{s}/manifest",
-            .{&parsed.name},
-        ) catch unreachable;
-        if (self.dir.access(self.io, manifest_path, .{})) |_| {
-            return;
-        } else |_| {}
-
-        // Every slot before the stop sign is applied; the image file is
-        // the canonical checkpointed database. The manifest records the
-        // slot before the stop sign, matching the proposer's view.
-        const stop_slot = self.log.stopSlot() orelse return error.NoStopSign;
-        if (self.applied_slot < stop_slot) return error.NotCaughtUp;
-        // A follower reproduces the leader's metadata exactly, including
-        // the replacement seed the chosen stop sign carries.
-        const request: ?registry.ReplacementRequest = if (parsed.seed) |*seed| .{
-            .operation_id = seed.operation_id,
-            .expected_configuration_id = self.identity.configuration_id,
-            .old_node_id = seed.old_node_id,
-            .new_node_id = seed.new_node_id,
-            .new_endpoint = seed.endpointSlice(),
-        } else null;
-        const metadata = try self.buildSnapshotGeneration(
-            stop_slot - 1,
-            if (request) |*live| live else null,
-        );
-        if (!std.mem.eql(u8, metadata.slice(), stop.metadataSlice())) {
-            return error.SnapshotDigestMismatch;
-        }
-    }
-
-    /// The bounded replacement seed carried by zx2 stop metadata. It makes
-    /// the next registry a pure function of the current registry and the
-    /// chosen stop sign, so survivors reconstruct it without the network.
-    const StopSeed = struct {
-        operation_id: u64,
-        old_node_id: paxos.NodeId,
-        new_node_id: paxos.NodeId,
-        endpoint: [registry.max_endpoint_bytes]u8,
-        endpoint_len: u8,
-
-        fn endpointSlice(self: *const StopSeed) []const u8 {
-            return self.endpoint[0..self.endpoint_len];
-        }
-    };
-
-    const StopMetadata = struct {
-        name: [16]u8,
-        manifest_hash: [32]u8,
-        /// Digest of the canonical next decided registry; null for `zx1`
-        /// metadata written by registry-less embedded and local hosts.
-        registry_digest: ?[32]u8,
-        /// Present only for a decided voter replacement.
-        seed: ?StopSeed,
-    };
-
-    fn parseStopMetadata(metadata: []const u8) !StopMetadata {
-        var parts = std.mem.tokenizeScalar(u8, metadata, ' ');
-        const tag = parts.next() orelse return error.CorruptStopSign;
-        const versioned = std.mem.eql(u8, tag, "zx2");
-        if (!versioned and !std.mem.eql(u8, tag, "zx1")) {
-            return error.CorruptStopSign;
-        }
-        const snapshot_name = parts.next() orelse return error.CorruptStopSign;
-        if (snapshot_name.len != 16) return error.CorruptStopSign;
-        const manifest_hash_hex = parts.next() orelse return error.CorruptStopSign;
-        if (manifest_hash_hex.len != 64) return error.CorruptStopSign;
-        var result = StopMetadata{
-            .name = snapshot_name[0..16].*,
-            .manifest_hash = undefined,
-            .registry_digest = null,
-            .seed = null,
-        };
-        _ = std.fmt.hexToBytes(&result.manifest_hash, manifest_hash_hex) catch
-            return error.CorruptStopSign;
-        if (versioned) {
-            const registry_hex = parts.next() orelse return error.CorruptStopSign;
-            if (registry_hex.len != 64) return error.CorruptStopSign;
-            var registry_digest: [32]u8 = undefined;
-            _ = std.fmt.hexToBytes(&registry_digest, registry_hex) catch
-                return error.CorruptStopSign;
-            result.registry_digest = registry_digest;
-            if (parts.next()) |operation_hex| {
-                if (operation_hex.len != 16) return error.CorruptStopSign;
-                const old_hex = parts.next() orelse return error.CorruptStopSign;
-                if (old_hex.len != 8) return error.CorruptStopSign;
-                const new_hex = parts.next() orelse return error.CorruptStopSign;
-                if (new_hex.len != 8) return error.CorruptStopSign;
-                const endpoint = parts.next() orelse return error.CorruptStopSign;
-                registry.validateEndpoint(endpoint) catch
-                    return error.CorruptStopSign;
-                var seed = StopSeed{
-                    .operation_id = std.fmt.parseInt(u64, operation_hex, 16) catch
-                        return error.CorruptStopSign,
-                    .old_node_id = std.fmt.parseInt(paxos.NodeId, old_hex, 16) catch
-                        return error.CorruptStopSign,
-                    .new_node_id = std.fmt.parseInt(paxos.NodeId, new_hex, 16) catch
-                        return error.CorruptStopSign,
-                    .endpoint = [_]u8{0} ** registry.max_endpoint_bytes,
-                    .endpoint_len = @intCast(endpoint.len),
-                };
-                @memcpy(seed.endpoint[0..endpoint.len], endpoint);
-                result.seed = seed;
-            }
-        }
-        if (parts.next() != null) return error.CorruptStopSign;
-        return result;
-    }
-
     /// Reconstructs and verifies the decided next registry named by stop
     /// metadata. Deterministic: a same-member rollover is the checkpoint
     /// successor, a replacement applies the metadata seed, and a lagging
@@ -3531,11 +3992,10 @@ pub const Node = struct {
     /// digest bound into the chosen stop sign is the only acceptance test.
     fn reconstructNextRegistry(
         decided: *const registry.Decided,
-        parsed: *const StopMetadata,
+        parsed: *const registry.StopMetadata,
         next_configuration: u64,
     ) !registry.Decided {
-        const expected_digest = parsed.registry_digest orelse
-            return error.CorruptStopSign;
+        const expected_digest = parsed.registry_digest;
         var base = decided.*;
         if (base.configuration_id == next_configuration) {
             // The pointer already advanced in a previous crashed rollover.
@@ -3573,407 +4033,8 @@ pub const Node = struct {
         return next;
     }
 
-    /// Finishes a decided checkpoint: installs the snapshot pointer, starts
-    /// the next epoch's journal, switches the protocol node to the new
-    /// configuration, and garbage-collects covered files.
-    fn completeRollover(self: *Node) !void {
-        const stop = self.log.isReconfigured() orelse return error.NoStopSign;
-        const stop_slot = self.log.stopSlot() orelse return error.NoStopSign;
-        const parsed = try parseStopMetadata(stop.metadataSlice());
-
-        // A voter the chosen stop sign removed must not enter the next
-        // configuration. It stays permanently sealed, and the allocation
-        // fence retires its ID forever.
-        if (self.capabilities.votes) {
-            var still_member = false;
-            for (stop.membersSlice()) |member| {
-                if (member == self.identity.node_id) still_member = true;
-            }
-            if (!still_member) return error.RetiredByReconfiguration;
-        }
-
-        // The snapshot generation must exist and match the decided digest.
-        var manifest_path_buffer: [64]u8 = undefined;
-        const manifest_path = std.fmt.bufPrint(
-            &manifest_path_buffer,
-            "snapshots/{s}/manifest",
-            .{&parsed.name},
-        ) catch unreachable;
-        const manifest = try self.dir.readFileAlloc(
-            self.io,
-            manifest_path,
-            self.gpa,
-            .limited(4096),
-        );
-        defer self.gpa.free(manifest);
-        const manifest_digest = PayloadStore.hashOf(manifest);
-        if (!std.mem.eql(u8, &manifest_digest, &parsed.manifest_hash)) {
-            return error.SnapshotDigestMismatch;
-        }
-        const sealed_configuration = try self.validateSnapshotGeneration(parsed.name);
-        if (sealed_configuration != self.identity.configuration_id) {
-            return error.ConfigurationMismatch;
-        }
-
-        // Reconstruct, verify, and durably store the decided next registry
-        // before any pointer advances. The digest bound into the chosen
-        // stop sign is the only acceptance test; a mismatch stops the
-        // rollover instead of activating a divergent registry.
-        var next_registry: ?registry.Decided = null;
-        if (self.decidedRegistry()) |decided| {
-            const next = try reconstructNextRegistry(
-                decided,
-                &parsed,
-                stop.configuration_id,
-            );
-            try registry.storeBlob(self.io, self.dir, &next);
-            failpoint.hit("after_registry_blob");
-            next_registry = next;
-        } else if (parsed.registry_digest != null) {
-            // A registry-less host must not blindly accept registry-bound
-            // metadata it cannot verify.
-            return error.CorruptStopSign;
-        }
-
-        // Retain the exact already-chosen stop sign beside the image. This
-        // is deliberately not a signature over a locally materialized
-        // SQLite file and does not add a consensus round: all fields below
-        // are either the chosen stop value or values bound by its manifest
-        // digest. A lagging receiver asks a read quorum to confirm the
-        // canonical proof digest before installing the transferred image.
-        const proof = try checkpoint_proof.create(
-            self.identity.database_id,
-            self.identity.configuration_id,
-            stop.configuration_id,
-            stop_slot,
-            stop_slot - 1,
-            self.last_chain,
-            manifest_digest,
-            parsed.registry_digest orelse checkpoint_proof.no_registry_digest,
-            self.members[0..self.member_count],
-            stop.membersSlice(),
-            stop.metadataSlice(),
-        );
-        var snapshot_path_buffer: [64]u8 = undefined;
-        const snapshot_path = std.fmt.bufPrint(
-            &snapshot_path_buffer,
-            "snapshots/{s}",
-            .{&parsed.name},
-        ) catch unreachable;
-        var snapshot_dir = try self.dir.openDir(self.io, snapshot_path, .{});
-        defer snapshot_dir.close(self.io);
-        try atomicWriteFile(self.io, snapshot_dir, "proof", proof.slice());
-
-        // Collect payload hashes still referenced by the sealed epoch before
-        // its in-memory state is replaced; they stay until its journal is
-        // garbage-collected.
-        var retained = std.AutoHashMap([32]u8, void).init(self.gpa);
-        defer retained.deinit();
-        try self.collectReferencedPayloads(&retained);
-
-        const was_leader = self.log.core.role == .leader;
-
-        // Install the snapshot pointer first: a crash before the identity
-        // update replays the sealed epoch and re-runs this function.
-        try atomicWriteFile(self.io, self.dir, current_file_name, &parsed.name);
-
-        // The registry pointer advances after the snapshot pointer and
-        // before the identity file, extending the recovery order: a crash
-        // on either side of it converges through this same function.
-        if (next_registry) |*next| {
-            try registry.activatePointer(self.io, self.dir, next.configuration_id);
-            failpoint.hit("after_registry_pointer");
-        }
-
-        const old_configuration = self.identity.configuration_id;
-        const new_configuration = stop.configuration_id;
-
-        var new_journal = Journal.create(
-            self.io,
-            self.dir,
-            new_configuration,
-        ) catch |err| switch (err) {
-            error.PathAlreadyExists => blk: {
-                // A previous rollover attempt crashed after creating the
-                // file; it can only be empty or already truncated.
-                const durable = try self.gpa.create(Log.DurableState);
-                defer self.gpa.destroy(durable);
-                durable.* = .{};
-                var info: journal_mod.ReplayInfo = undefined;
-                var opened = try Journal.open(
-                    self.io,
-                    self.gpa,
-                    self.dir,
-                    new_configuration,
-                    durable,
-                    &info,
-                );
-                if (info.record_count != 0) {
-                    opened.close();
-                    return error.ConfigurationMismatch;
-                }
-                break :blk opened;
-            },
-            else => return err,
-        };
-        var journal_installed = false;
-        errdefer if (!journal_installed) new_journal.close();
-
-        try writeIdentity(self.io, self.dir, .{
-            .node_id = self.identity.node_id,
-            .database_id = self.identity.database_id,
-            .configuration_id = new_configuration,
-            .role = self.identity.role,
-        });
-        self.identity.configuration_id = new_configuration;
-
-        self.journal.close();
-        self.journal = new_journal;
-        journal_installed = true;
-
-        // The chosen stop sign is the membership authority for the next
-        // configuration: the host's member array follows it, so snapshot
-        // installation and proof validation can never read a stale set.
-        const stop_members = stop.membersSlice();
-        @memcpy(self.members[0..stop_members.len], stop_members);
-        self.member_count = @intCast(stop_members.len);
-        if (next_registry) |next| self.decided_registry = next;
-
-        var membership: Log.Membership = undefined;
-        try membership.init(stop_members);
-        try self.initLogForRole(new_configuration, &membership);
-        self.applied_slot = 0;
-        self.last_data_slot = 0;
-        self.rollover_pending = false;
-        self.last_chain = try self.epochBaseChain();
-        self.rollover_campaign_pending =
-            self.capabilities.campaigns and (self.single or was_leader);
-
-        // The decided registry ring now records the operation outcome; the
-        // scratch pending record has served its purpose.
-        try self.clearPendingOperation();
-
-        try self.garbageCollect(old_configuration, &retained);
-    }
-
-    // ------------------------------------------------------------------
-    // Snapshot install (lagging member joining a newer epoch)
-    // ------------------------------------------------------------------
-
-    /// Directory that accumulates a snapshot transfer in progress.
-    pub fn beginSnapshotInstall(self: *Node) !Io.Dir {
-        self.dir.deleteTree(self.io, install_tmp_dir) catch {};
-        return self.dir.createDirPathOpen(self.io, install_tmp_dir, .{});
-    }
-
-    /// Installs a transferred snapshot generation and jumps this member to
-    /// `configuration_id` with an empty journal. The transfer directory
-    /// must contain the database image under `db`; `manifest` is the
-    /// generation manifest bytes.
-    pub fn installSnapshot(
-        self: *Node,
-        configuration_id: u64,
-        name: [16]u8,
-        manifest: []const u8,
-        proof_bytes: []const u8,
-        registry_blob: ?[]const u8,
-    ) !void {
-        if (configuration_id <= self.identity.configuration_id) {
-            self.dir.deleteTree(self.io, install_tmp_dir) catch {};
-            return error.StaleSnapshot;
-        }
-
-        // Validate the already-chosen stop evidence before trusting the
-        // transferred image. The transport host separately confirms this
-        // proof digest with a voter quorum.
-        _ = try self.validateCheckpointProof(
-            proof_bytes,
-            configuration_id,
-            name,
-            manifest,
-        );
-
-        // Validate the transferred image against the manifest.
-        const format = manifestValue(manifest, "format") orelse
-            return error.CorruptManifest;
-        if (!std.mem.eql(u8, format, "1")) return error.CorruptManifest;
-        const database_text = manifestValue(manifest, "database_id") orelse
-            return error.CorruptManifest;
-        const database_id = std.fmt.parseInt(u128, database_text, 16) catch
-            return error.CorruptManifest;
-        if (database_id != self.identity.database_id) return error.DatabaseMismatch;
-        const sealed_text = manifestValue(manifest, "sealed_configuration_id") orelse
-            return error.CorruptManifest;
-        const sealed_configuration = std.fmt.parseInt(u64, sealed_text, 10) catch
-            return error.CorruptManifest;
-        if (sealed_configuration == std.math.maxInt(u64) or
-            sealed_configuration + 1 != configuration_id)
-        {
-            return error.ConfigurationMismatch;
-        }
-        var expected_name_buffer: [16]u8 = undefined;
-        const expected_name = std.fmt.bufPrint(
-            &expected_name_buffer,
-            "{x:0>16}",
-            .{sealed_configuration},
-        ) catch unreachable;
-        if (!std.mem.eql(u8, expected_name, &name)) return error.CorruptManifest;
-        const applied_text = manifestValue(manifest, "applied_slot") orelse
-            return error.CorruptManifest;
-        _ = std.fmt.parseInt(paxos.Slot, applied_text, 10) catch
-            return error.CorruptManifest;
-        const chain_hex = manifestValue(manifest, "chain") orelse
-            return error.CorruptManifest;
-        var snapshot_chain: command.HashBytes = undefined;
-        if (chain_hex.len != snapshot_chain.len * 2) return error.CorruptManifest;
-        _ = std.fmt.hexToBytes(&snapshot_chain, chain_hex) catch
-            return error.CorruptManifest;
-        const digest_hex = manifestValue(manifest, "db_sha256") orelse
-            return error.CorruptManifest;
-        var expected_digest: [32]u8 = undefined;
-        if (digest_hex.len != 64) return error.CorruptManifest;
-        _ = std.fmt.hexToBytes(&expected_digest, digest_hex) catch
-            return error.CorruptManifest;
-        {
-            var tmp_dir = try self.dir.openDir(self.io, install_tmp_dir, .{});
-            defer tmp_dir.close(self.io);
-            const actual = try fileSha256(self.io, tmp_dir, "db");
-            if (!std.mem.eql(u8, &actual, &expected_digest)) {
-                return error.SnapshotDigestMismatch;
-            }
-            try atomicWriteFile(self.io, tmp_dir, "manifest", manifest);
-            try atomicWriteFile(self.io, tmp_dir, "proof", proof_bytes);
-        }
-
-        // Advance the decided registry along with the installed epoch. The
-        // stop metadata inside the proof binds the target registry digest;
-        // a member with a predecessor registry reconstructs the next one
-        // locally, while a joining replacement verifies the fetched blob
-        // against that quorum-confirmed digest. Both fail closed.
-        var next_registry: ?registry.Decided = null;
-        if (self.decidedRegistry()) |decided| {
-            const proof = try checkpoint_proof.decode(proof_bytes);
-            const parsed = try parseStopMetadata(proof.metadataSlice());
-            const next = try reconstructNextRegistry(
-                decided,
-                &parsed,
-                configuration_id,
-            );
-            try registry.storeBlob(self.io, self.dir, &next);
-            failpoint.hit("after_registry_blob");
-            next_registry = next;
-        } else if (registry_blob) |blob| {
-            const proof = try checkpoint_proof.decode(proof_bytes);
-            const parsed = try parseStopMetadata(proof.metadataSlice());
-            const expected_registry_digest = parsed.registry_digest orelse
-                return error.CorruptRegistry;
-            if (blob.len <= 32) return error.CorruptRegistry;
-            const encoded = blob[0 .. blob.len - 32];
-            const blob_digest = PayloadStore.hashOf(encoded);
-            if (!std.mem.eql(u8, &blob_digest, blob[blob.len - 32 ..]) or
-                !std.mem.eql(u8, &blob_digest, &expected_registry_digest) or
-                !std.mem.eql(u8, &blob_digest, &proof.next_registry_digest))
-            {
-                return error.RegistryDigestMismatch;
-            }
-            if (self.join_descriptor) |descriptor| {
-                if (descriptor.database_id != self.identity.database_id or
-                    descriptor.configuration_id != configuration_id or
-                    !std.mem.eql(u8, &descriptor.registry_digest, &blob_digest))
-                {
-                    return error.RegistryMismatch;
-                }
-            }
-            const decided = registry.Decided.decode(encoded) catch
-                return error.CorruptRegistry;
-            if (decided.configuration_id != configuration_id or
-                decided.database_id != self.identity.database_id)
-            {
-                return error.CorruptRegistry;
-            }
-            var voter_buffer: [types.log_options.max_members]paxos.NodeId = undefined;
-            if (!std.mem.eql(
-                paxos.NodeId,
-                decided.voterIds(&voter_buffer),
-                proof.nextMembersSlice(),
-            )) {
-                return error.CorruptRegistry;
-            }
-            try registry.storeBlob(self.io, self.dir, &decided);
-            failpoint.hit("after_registry_blob");
-            next_registry = decided;
-        } else {
-            // Without a registry of its own or a fetched blob, this node
-            // may only install registry-less state; a registry-bound
-            // transfer must wait for the fetch to arrive.
-            const proof = try checkpoint_proof.decode(proof_bytes);
-            if (!std.mem.eql(
-                u8,
-                &proof.next_registry_digest,
-                &checkpoint_proof.no_registry_digest,
-            )) {
-                return error.RegistryUnavailable;
-            }
-        }
-
-        var final_path_buffer: [64]u8 = undefined;
-        const final_path = std.fmt.bufPrint(
-            &final_path_buffer,
-            "snapshots/{s}",
-            .{&name},
-        ) catch unreachable;
-        self.dir.deleteTree(self.io, final_path) catch {};
-        try self.dir.rename(install_tmp_dir, self.dir, final_path, self.io);
-        // The `current` pointer written immediately below is the barrier
-        // that persists this entry; nothing reads the snapshot until it
-        // names one.
-        try durability.syncChildDirectory(self.io, self.dir, "snapshots");
-        try atomicWriteFile(self.io, self.dir, current_file_name, &name);
-        if (next_registry) |*next| {
-            try registry.activatePointer(self.io, self.dir, next.configuration_id);
-            failpoint.hit("after_registry_pointer");
-        }
-
-        // The old epoch is sealed and fully covered by this snapshot; its
-        // journal and any prior ones are obsolete.
-        if (self.db_open) {
-            self.db.close();
-            self.db_open = false;
-        }
-        self.journal.close();
-        try self.deleteAllJournals();
-        try writeIdentity(self.io, self.dir, .{
-            .node_id = self.identity.node_id,
-            .database_id = self.identity.database_id,
-            .configuration_id = configuration_id,
-            .role = self.identity.role,
-        });
-        self.identity.configuration_id = configuration_id;
-        self.journal = try Journal.create(self.io, self.dir, configuration_id);
-
-        if (next_registry) |next| {
-            self.decided_registry = next;
-            var voter_buffer: [types.log_options.max_members]paxos.NodeId = undefined;
-            const voters = next.voterIds(&voter_buffer);
-            @memcpy(self.members[0..voters.len], voters);
-            self.member_count = @intCast(voters.len);
-            self.join_descriptor = null;
-            try durableDeleteFile(self.io, self.dir, join_file_name);
-        }
-
-        var membership: Log.Membership = undefined;
-        try membership.init(self.members[0..self.member_count]);
-        try self.initLogForRole(configuration_id, &membership);
-        self.capture_batch_id = null;
-        self.needs_resync = false;
-        self.rollover_pending = false;
-
-        self.dir.deleteFile(self.io, db_file_name) catch {};
-        try self.rebuildMaterializedImage();
-    }
-
-    /// Reads one stored decided-registry blob (canonical bytes plus digest
-    /// trailer) for a member serving a joining replacement's fetch.
+    /// Reads the persisted registry blob for one configuration from the
+    /// data directory, bounded by the registry encoding limit.
     pub fn readRegistryBlob(
         self: *Node,
         gpa: std.mem.Allocator,
@@ -3987,349 +4048,6 @@ pub const Node = struct {
             gpa,
             .limited(registry.max_encoded_bytes + 32),
         );
-    }
-
-    fn initLogForRole(
-        self: *Node,
-        configuration_id: u64,
-        membership: *const Log.Membership,
-    ) !void {
-        if (self.capabilities.votes) {
-            try self.log.initWithPriority(
-                self.identity.node_id,
-                configuration_id,
-                membership,
-                self.leader_priority,
-            );
-            self.log.core.setCampaignEnabled(self.capabilities.campaigns);
-        } else {
-            try self.log.initLearner(
-                self.identity.node_id,
-                configuration_id,
-                membership,
-            );
-        }
-    }
-
-    fn deleteAllJournals(self: *Node) !void {
-        var listing = try self.dir.openDir(self.io, ".", .{ .iterate = true });
-        defer listing.close(self.io);
-        var names: std.ArrayList([26]u8) = .empty;
-        defer names.deinit(self.gpa);
-        var iterator = listing.iterate();
-        while (try iterator.next(self.io)) |entry| {
-            if (entry.kind != .file) continue;
-            if (entry.name.len != 26) continue;
-            if (!std.mem.startsWith(u8, entry.name, "paxos-")) continue;
-            if (!std.mem.endsWith(u8, entry.name, ".log")) continue;
-            try names.append(self.gpa, entry.name[0..26].*);
-        }
-        for (names.items) |name| {
-            self.dir.deleteFile(self.io, &name) catch {};
-        }
-    }
-
-    fn collectReferencedPayloads(
-        self: *Node,
-        retained: *std.AutoHashMap([32]u8, void),
-    ) !void {
-        for (self.log.core.durable.accepted) |accepted| {
-            const vote = accepted orelse continue;
-            switch (vote.value) {
-                .command => |cmd| switch (cmd) {
-                    .transaction_batch => |batch| try retained.put(batch.payload_hash, {}),
-                    else => {},
-                },
-                .stop => {},
-            }
-        }
-        for (self.log.core.durable.committed) |committed| {
-            const value = committed orelse continue;
-            switch (value) {
-                .command => |cmd| switch (cmd) {
-                    .transaction_batch => |batch| try retained.put(batch.payload_hash, {}),
-                    else => {},
-                },
-                .stop => {},
-            }
-        }
-    }
-
-    /// Retention policy: keep the current epoch journal, the sealed epoch's
-    /// journal as a fallback generation, the two newest snapshots, and every
-    /// payload referenced by a retained journal. Everything older is covered
-    /// by the installed snapshot.
-    fn garbageCollect(
-        self: *Node,
-        sealed_configuration: u64,
-        retained_payloads: *std.AutoHashMap([32]u8, void),
-    ) !void {
-        // Journals older than the sealed epoch.
-        var configuration = sealed_configuration;
-        while (configuration > 1) {
-            configuration -= 1;
-            var name_buffer: [26]u8 = undefined;
-            const name = journal_mod.fileName(&name_buffer, configuration);
-            self.dir.deleteFile(self.io, name) catch |err| switch (err) {
-                error.FileNotFound => continue,
-                else => return err,
-            };
-        }
-
-        // Snapshots other than the two newest generations.
-        if (sealed_configuration > 1) {
-            var snapshots_dir = self.dir.openDir(self.io, "snapshots", .{
-                .iterate = true,
-            }) catch return;
-            defer snapshots_dir.close(self.io);
-            var names: std.ArrayList([16]u8) = .empty;
-            defer names.deinit(self.gpa);
-            var iterator = snapshots_dir.iterate();
-            while (try iterator.next(self.io)) |entry| {
-                if (entry.kind != .directory) continue;
-                if (entry.name.len != 16) {
-                    // Abandoned tmp-* generation from a crashed snapshot.
-                    snapshots_dir.deleteTree(self.io, entry.name) catch {};
-                    continue;
-                }
-                try names.append(self.gpa, entry.name[0..16].*);
-            }
-            std.mem.sort([16]u8, names.items, {}, struct {
-                fn lessThan(_: void, a: [16]u8, b: [16]u8) bool {
-                    return std.mem.order(u8, &a, &b) == .lt;
-                }
-            }.lessThan);
-            if (names.items.len > 2) {
-                for (names.items[0 .. names.items.len - 2]) |name| {
-                    snapshots_dir.deleteTree(self.io, &name) catch {};
-                }
-            }
-        }
-
-        // Registry blobs other than the two newest generations; the
-        // pointer names the newest and the sealed epoch keeps its blob as
-        // the fallback, mirroring snapshot retention.
-        if (self.decided_registry != null) {
-            var registries_dir = self.dir.openDir(self.io, registry.directory_name, .{
-                .iterate = true,
-            }) catch return;
-            defer registries_dir.close(self.io);
-            var blob_names: std.ArrayList([16]u8) = .empty;
-            defer blob_names.deinit(self.gpa);
-            var blob_iterator = registries_dir.iterate();
-            while (try blob_iterator.next(self.io)) |entry| {
-                if (entry.kind != .file or entry.name.len != 16) continue;
-                try blob_names.append(self.gpa, entry.name[0..16].*);
-            }
-            std.mem.sort([16]u8, blob_names.items, {}, struct {
-                fn lessThan(_: void, a: [16]u8, b: [16]u8) bool {
-                    return std.mem.order(u8, &a, &b) == .lt;
-                }
-            }.lessThan);
-            if (blob_names.items.len > 2) {
-                for (blob_names.items[0 .. blob_names.items.len - 2]) |name| {
-                    registries_dir.deleteFile(self.io, &name) catch {};
-                }
-            }
-        }
-
-        // Payloads not referenced by any retained journal. The current
-        // epoch is empty right after rollover, so the sealed epoch's
-        // references (collected before reinit) are the live set.
-        var payloads_dir = self.store.dir.openDir(self.io, ".", .{ .iterate = true }) catch return;
-        defer payloads_dir.close(self.io);
-        var shard_iterator = payloads_dir.iterate();
-        while (try shard_iterator.next(self.io)) |shard| {
-            if (shard.kind != .directory or shard.name.len != 2) continue;
-            var shard_name: [2]u8 = shard.name[0..2].*;
-            var shard_dir = payloads_dir.openDir(self.io, &shard_name, .{
-                .iterate = true,
-            }) catch continue;
-            defer shard_dir.close(self.io);
-            var object_iterator = shard_dir.iterate();
-            while (try object_iterator.next(self.io)) |object| {
-                if (object.kind != .file or object.name.len != 62) continue;
-                var hex: [64]u8 = undefined;
-                @memcpy(hex[0..2], &shard_name);
-                @memcpy(hex[2..], object.name[0..62]);
-                var digest: [32]u8 = undefined;
-                _ = std.fmt.hexToBytes(&digest, &hex) catch continue;
-                if (!retained_payloads.contains(digest)) {
-                    shard_dir.deleteFile(self.io, object.name) catch {};
-                }
-            }
-        }
-    }
-
-    // ------------------------------------------------------------------
-    // Snapshot transfer source (serving a lagging peer)
-    // ------------------------------------------------------------------
-
-    pub const SnapshotHandle = struct {
-        configuration_id: u64,
-        name: [16]u8,
-        manifest: []u8,
-        proof: []u8,
-        db_size: u64,
-        file: Io.File,
-
-        pub fn close(self: *SnapshotHandle, io: Io, gpa: std.mem.Allocator) void {
-            self.file.close(io);
-            gpa.free(self.manifest);
-            gpa.free(self.proof);
-            self.* = undefined;
-        }
-    };
-
-    /// Opens the installed snapshot generation for streaming to a peer.
-    pub fn openCurrentSnapshot(self: *Node) !SnapshotHandle {
-        const name = (try self.currentSnapshotName()) orelse
-            return error.NoSnapshot;
-        var dir_path_buffer: [64]u8 = undefined;
-        const dir_path = std.fmt.bufPrint(
-            &dir_path_buffer,
-            "snapshots/{s}",
-            .{&name},
-        ) catch unreachable;
-        var snapshot_dir = try self.dir.openDir(self.io, dir_path, .{});
-        defer snapshot_dir.close(self.io);
-        const manifest = try snapshot_dir.readFileAlloc(
-            self.io,
-            "manifest",
-            self.gpa,
-            .limited(4096),
-        );
-        errdefer self.gpa.free(manifest);
-        const proof = try snapshot_dir.readFileAlloc(
-            self.io,
-            "proof",
-            self.gpa,
-            .limited(checkpoint_proof.max_encoded_bytes),
-        );
-        errdefer self.gpa.free(proof);
-        _ = try self.validateCheckpointProof(
-            proof,
-            self.identity.configuration_id,
-            name,
-            manifest,
-        );
-        const file = try snapshot_dir.openFile(self.io, "db", .{});
-        errdefer file.close(self.io);
-        return .{
-            .configuration_id = self.identity.configuration_id,
-            .name = name,
-            .manifest = manifest,
-            .proof = proof,
-            .db_size = try file.length(self.io),
-            .file = file,
-        };
-    }
-
-    /// Validates the canonical stop proof and returns the digest peers use
-    /// for quorum confirmation. This checks logical Paxos state (epoch,
-    /// voters, stop slot, chain, exact metadata) and the manifest digest;
-    /// the database file itself is verified separately against the manifest.
-    pub fn validateCheckpointProof(
-        self: *const Node,
-        proof_bytes: []const u8,
-        configuration_id: u64,
-        name: [16]u8,
-        manifest: []const u8,
-    ) ![32]u8 {
-        const proof = try checkpoint_proof.decode(proof_bytes);
-        if (proof.database_id != self.identity.database_id or
-            proof.next_configuration_id != configuration_id or
-            proof.sealed_configuration_id + 1 != configuration_id)
-        {
-            return error.InvalidCheckpointProof;
-        }
-        // The receiver must recognize its own decided voter set on one
-        // side of the transition: a lagging survivor holds the sealed set,
-        // an installing replacement holds the next set. The registry
-        // digest below binds the authoritative next membership.
-        const own_members = self.members[0..self.member_count];
-        const sealed_matches = std.mem.eql(
-            paxos.NodeId,
-            proof.sealedMembersSlice(),
-            own_members,
-        );
-        const next_matches = std.mem.eql(
-            paxos.NodeId,
-            proof.nextMembersSlice(),
-            own_members,
-        );
-        if (!sealed_matches and !next_matches) {
-            return error.InvalidCheckpointProof;
-        }
-
-        const parsed = try parseStopMetadata(proof.metadataSlice());
-        if (!std.mem.eql(u8, &parsed.name, &name)) {
-            return error.InvalidCheckpointProof;
-        }
-        // The registry digest inside the metadata and the proof field must
-        // agree; registry-less hosts carry the all-zero digest.
-        if (parsed.registry_digest) |expected| {
-            if (!std.mem.eql(u8, &proof.next_registry_digest, &expected)) {
-                return error.InvalidCheckpointProof;
-            }
-        } else if (!std.mem.eql(
-            u8,
-            &proof.next_registry_digest,
-            &checkpoint_proof.no_registry_digest,
-        )) {
-            return error.InvalidCheckpointProof;
-        }
-        const manifest_digest = PayloadStore.hashOf(manifest);
-        if (!std.mem.eql(u8, &manifest_digest, &proof.manifest_sha256) or
-            !std.mem.eql(u8, &manifest_digest, &parsed.manifest_hash))
-        {
-            return error.InvalidCheckpointProof;
-        }
-
-        const database_text = manifestValue(manifest, "database_id") orelse
-            return error.InvalidCheckpointProof;
-        const database_id = std.fmt.parseInt(u128, database_text, 16) catch
-            return error.InvalidCheckpointProof;
-        const sealed_text = manifestValue(
-            manifest,
-            "sealed_configuration_id",
-        ) orelse return error.InvalidCheckpointProof;
-        const sealed = std.fmt.parseInt(u64, sealed_text, 10) catch
-            return error.InvalidCheckpointProof;
-        const applied_text = manifestValue(manifest, "applied_slot") orelse
-            return error.InvalidCheckpointProof;
-        const applied = std.fmt.parseInt(paxos.Slot, applied_text, 10) catch
-            return error.InvalidCheckpointProof;
-        const chain_hex = manifestValue(manifest, "chain") orelse
-            return error.InvalidCheckpointProof;
-        var chain: [32]u8 = undefined;
-        if (chain_hex.len != chain.len * 2) return error.InvalidCheckpointProof;
-        _ = std.fmt.hexToBytes(&chain, chain_hex) catch
-            return error.InvalidCheckpointProof;
-        if (database_id != proof.database_id or
-            sealed != proof.sealed_configuration_id or
-            applied != proof.applied_slot or
-            proof.stop_slot != applied + 1 or
-            !std.mem.eql(u8, &chain, &proof.chain))
-        {
-            return error.InvalidCheckpointProof;
-        }
-        return checkpoint_proof.digest(proof_bytes);
-    }
-
-    /// Returns the digest of this node's retained proof for a sealed epoch.
-    /// Used only to answer another member's quorum-confirmation probe.
-    pub fn currentCheckpointProofDigest(
-        self: *Node,
-        sealed_configuration_id: u64,
-    ) ![32]u8 {
-        var handle = try self.openCurrentSnapshot();
-        defer handle.close(self.io, self.gpa);
-        const proof = try checkpoint_proof.decode(handle.proof);
-        if (proof.sealed_configuration_id != sealed_configuration_id) {
-            return error.ConfigurationMismatch;
-        }
-        return checkpoint_proof.digest(handle.proof);
     }
 };
 

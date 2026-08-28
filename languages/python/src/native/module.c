@@ -862,7 +862,7 @@ zx_snapshot(PyObject *self, PyObject *args)
     }
     int rc;
     Py_BEGIN_ALLOW_THREADS
-    rc = zaxonlite_snapshot(box->handle);
+    rc = zaxonlite_state_anchor(box->handle);
     Py_END_ALLOW_THREADS
     if (rc != 0) {
         raise_native_error(box->handle, rc);

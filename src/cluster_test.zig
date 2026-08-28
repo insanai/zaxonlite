@@ -4,8 +4,8 @@
 //! data directories and drives the mandatory scenario over the client RPC
 //! protocol: election, replicated writes through every endpoint, follower
 //! stop/catch-up, logical hash comparison, a leader SIGKILL failpoint with
-//! exactly-once session retry, epoch rollover with a stopped follower
-//! (snapshot transfer), image rebuild, and total restart.
+//! exactly-once session retry, a configuration change with a stopped
+//! follower (snapshot transfer), image rebuild, and total restart.
 //!
 //! Every wait is deadline-based on observable conditions. On failure the
 //! controller prints each node's status and recent log tail, then exits 1.
@@ -288,6 +288,11 @@ fn hasLeader(parsed: *const Parsed, _: void) bool {
 fn appliedAtLeast(parsed: *const Parsed, target: i64) bool {
     const applied = fieldInt(parsed, "applied_slot") orelse return false;
     return applied >= target;
+}
+
+fn trimmedAtLeast(parsed: *const Parsed, target: i64) bool {
+    const trimmed = fieldInt(parsed, "chosen_trim_slot") orelse return false;
+    return trimmed >= target;
 }
 
 fn configurationAtLeast(parsed: *const Parsed, target: i64) bool {
@@ -852,18 +857,19 @@ fn runScenario(
     step("restart the killed leader");
     try cluster.spawnNode(leader_now, false);
 
-    step("epoch rollover with a stopped follower (snapshot transfer)");
+    step("state anchor with a stopped follower (journal catch-up)");
     const lag_follower = (leaderIndex(&cluster) + 1) % 3;
     cluster.killNode(lag_follower);
     execSql(&cluster, "insert into t(b) values ('pre-roll')", 15_000);
     {
-        const body = mustCall(&cluster, "{\"op\":\"snapshot\"}", 20_000);
+        const body = mustCall(&cluster, "{\"op\":\"anchor\"}", 20_000);
         cluster.gpa.free(body);
     }
     execSql(&cluster, "insert into t(b) values ('post-roll')", 15_000);
     try cluster.spawnNode(lag_follower, false);
-    // The restarted node is one sealed epoch behind and must install a
-    // transferred snapshot, then catch up within the new epoch.
+    // The restarted node catches up from the retained journal (ZDS 0011):
+    // slots are global, the configuration never changes, and history the
+    // survivors released from their windows is served from segments.
     {
         const leader_status_2 = mustCall(&cluster, "{\"op\":\"status\"}", 10_000);
         const parsed = parse(&cluster, leader_status_2);
@@ -871,26 +877,26 @@ fn runScenario(
         const target_applied = fieldInt(&parsed, "applied_slot") orelse 0;
         parsed.deinit();
         cluster.gpa.free(leader_status_2);
-        waitFor(
-            &cluster,
-            cluster.endpoints[lag_follower],
-            configurationAtLeast,
-            target_configuration,
-            45_000,
-            "snapshot install (configuration)",
-        );
+        if (target_configuration != 1) {
+            fail(&cluster, "configuration changed to {d}", .{target_configuration});
+        }
         waitFor(
             &cluster,
             cluster.endpoints[lag_follower],
             appliedAtLeast,
             target_applied,
             30_000,
-            "catch-up after snapshot install",
+            "catch-up after restart",
         );
     }
-    expectAllDigestsEqual(&cluster, "after snapshot transfer");
+    expectAllDigestsEqual(&cluster, "after journal catch-up");
 
-    step("delete a follower image; node rebuilds from snapshot plus suffix");
+    step("conservative trim advances once every data replica reported");
+    for (cluster.endpoints) |endpoint| {
+        waitFor(&cluster, endpoint, trimmedAtLeast, 1, 30_000, "chosen trim");
+    }
+
+    step("delete a follower image; node rebuilds from anchor plus suffix");
     const rebuild_follower = (leaderIndex(&cluster) + 2) % 3;
     cluster.killNode(rebuild_follower);
     {
@@ -915,7 +921,7 @@ fn runScenario(
             appliedAtLeast,
             target_applied,
             30_000,
-            "rebuild from snapshot plus suffix",
+            "rebuild from the retained journal",
         );
     }
     expectAllDigestsEqual(&cluster, "after image rebuild");

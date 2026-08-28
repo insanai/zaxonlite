@@ -43,8 +43,8 @@ write is framed, checksummed, appended, and fsynced before the consensus
 layer is allowed to proceed. A write is acknowledged only after its slot
 commits and carries the client's own batch. The SQLite file is just
 materialized state: delete `current.db` and the node rebuilds it from the
-last snapshot plus the journal suffix. If you remember one thing about
-operating zaxonlite, remember this one.
+last durable state anchor plus the journal suffix. If you remember one
+thing about operating zaxonlite, remember this one.
 
 ## What you get
 
@@ -59,9 +59,11 @@ operating zaxonlite, remember this one.
 - Three read levels: `any` (local, possibly stale, labeled, with a
   freshness bound), `leader`, and `linearizable` (a quorum read fence with
   no log append and no disk sync per read).
-- Snapshots and epoch rollover: online checkpoints seal 2,048-slot epochs,
-  every member builds a byte-identical generation, and rollover is
-  crash-resumable.
+- Bounded recovery without rollover: slots are 64-bit and never reset,
+  periodic durable state anchors bound restart replay to the journal
+  suffix, and the cluster trims history it has certified as applied
+  everywhere -- no epoch seal, no full-database copy or hash on the write
+  path, whatever the database size.
 - Decided membership: served clusters persist a consensus-decided
   registry, and `zaxon replace-voter` replaces one failed data voter
   online -- same database identity, client connections stay open, and the
@@ -159,17 +161,21 @@ per system with equal payloads, excluded warmup, verified results, and
 percentile latency.
 
 First, the boring benchmark: one client, sequential single-row writes, each
-waiting for full durability. macOS arm64, three local voters, 256-byte rows.
+waiting for full durability. macOS arm64, three local voters, 256-byte rows,
+recorded 27 August 2026 with zaxon 0.6.0.
 
 | System            | Writes/s | p50 latency | p99 latency |
 | ----------------- | -------: | ----------: | ----------: |
-| zaxonlite         |     28.0 |     35.1 ms |     45.9 ms |
-| rqlite v10.2.7    |     44.5 |     22.0 ms |     33.7 ms |
+| zaxonlite 0.6.0   |     65.9 |     15.1 ms |     21.8 ms |
+| rqlite v10.2.7    |     45.9 |     21.4 ms |     32.2 ms |
 
-rqlite wins this one, and honesty requires printing it. Both systems are
-paying for fsync on every write; the difference is bookkeeping around the
-disk, not the disk itself. If a benchmark table only shows the rows its
-author likes, you should not trust the other rows either.
+Earlier recorded runs of this same table had zaxonlite losing it (28
+writes/s against 44.5 in July 2026), and honesty required printing that.
+The global-slot journal that replaced the old epoch rollover (ZDS 0011)
+removed enough bookkeeping around the disk that the ranking flipped. Both
+systems still pay for a full cache flush on every write; the difference
+is what happens around the flush. If a benchmark table only shows the
+rows its author likes, you should not trust the other rows either.
 
 Second, the benchmark that looks like a product: a deterministic
 order-processing simulation. Four clients, idempotent writes, linearizable
@@ -180,18 +186,20 @@ revenue, ledger, uniqueness, and per-node convergence.
 
 | Measure                        | zaxonlite | rqlite v10.2.7 |
 | ------------------------------ | --------: | -------------: |
-| Healthy throughput             |  1,783/s  |        177/s   |
-| Throughput, follower down      |  1,073/s  |        222/s   |
-| Throughput, leader down        |    387/s  |         94/s   |
-| Leader crash to first success  |    591 ms |       2,190 ms |
-| Follower catch-up              |    112 ms |        949 ms  |
-| Full cluster restart           |    446 ms |      1,626 ms  |
+| Healthy throughput             |    227/s  |        169/s   |
+| Throughput, follower down      |    320/s  |        224/s   |
+| Throughput, leader down        |    193/s  |         83/s   |
+| Leader crash to first success  |    610 ms |       2,816 ms |
+| Follower catch-up              |    239 ms |        940 ms  |
+| Full cluster restart           |    439 ms |      1,289 ms  |
 
-Why does the same system lose the first table and win the second? Because
-the first table measures one client waiting on one disk, and the second
-measures a cluster doing concurrent work and recovering from failures.
-The workload shape decides the winner. Run the harnesses yourself before
-believing anyone's table, including this one:
+Older recordings of this simulation showed zaxonlite near 1,800
+operations per second; those runs predate the full-fsync default, so
+their writes did not flush the drive cache. The table above is the
+durability-matched run, and it is the one to trust. The two tables
+measure different things: one client waiting on one disk, and a cluster
+doing concurrent work while members die and recover. Run the harnesses
+yourself before believing anyone's table, including this one:
 
 ```sh
 zig build benchmark                       # write/read/recovery microbenchmarks
@@ -203,7 +211,7 @@ sh benchmarks/compare-rqlite-3node.sh     # needs installed rqlited/rqlite
 
 Production TCP requires mutual TLS 1.3. Peer certificate common names are
 bound to configured node IDs, and TLS covers SQL, results, payloads, and
-snapshots. An optional provider-file PSK adds sequenced HMAC protection
+state transfers. An optional provider-file PSK adds sequenced HMAC protection
 inside TLS. `--dev-psk` is for loopback experiments only; plaintext TCP is
 gated behind test failpoints; local single-node service uses an owner-only
 Unix socket. The decided membership registry is the authorization
@@ -212,7 +220,7 @@ is rejected even with an otherwise valid certificate. Privileged
 membership operations additionally require a `zaxon-admin-<name>`
 certificate from the server's allow-list.
 
-Files on disk (database, WAL, journal, snapshots, backups) are plaintext.
+Files on disk (database, WAL, journal, backups) are plaintext.
 If you need protection from someone holding the disk, use full-disk or
 filesystem encryption. We would rather tell you that than have you assume
 otherwise.
@@ -270,10 +278,9 @@ browsers refuse to load from `file://`).
 data/
   LOCK                     # exclusive process lock
   identity                 # node/database IDs, current configuration
-  paxos-<config>.log       # framed, checksummed protocol journal
+  consensus/               # lifetime journal: slot-named segments,
+                           #   MANIFEST, APPLIED.0/1 anchors, TRIM state
   payloads/aa/<hash>       # immutable frame payloads by SHA-256
-  snapshots/<config>/      # db image + manifest per sealed epoch
-  CURRENT                  # installed snapshot pointer
   registries/<config>      # canonical decided-registry blobs
   REGISTRY                 # active decided-registry pointer
   PENDING-OP               # one in-flight replacement request, if any

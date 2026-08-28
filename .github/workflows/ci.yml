@@ -9,6 +9,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Nightly long-run retention gate; regular pushes skip it.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -68,6 +72,13 @@ jobs:
       - name: Zig format check
         run: zig fmt --check build.zig src
 
+      # The style checker lives in the paxos-zig checkout at the
+      # workspace root and scans both trees, including the per-file
+      # code-line pins.
+      - name: Project style check
+        working-directory: .
+        run: sh tools/check-style.sh
+
       # Only src/sqlite/ may import the translated SQLite C module
       # (ZDS 0009). A plain grep keeps that boundary honest.
       - name: SQLite C import boundary
@@ -101,6 +112,11 @@ jobs:
       - name: Crash matrix
         run: zig build test-crash
 
+      # The write benchmark carries the periodicity instrument and its
+      # positive control; a broken instrument fails this step.
+      - name: Write benchmark instrument
+        run: zig build benchmark
+
       - name: C ABI smoke test
         run: zig build test-cabi
 
@@ -114,6 +130,52 @@ jobs:
       - name: Voter replacement scenario
         if: runner.os == 'Linux'
         run: zig build test-replace-cluster
+
+      - name: Beyond-retention transfer crash ladder
+        if: runner.os == 'Linux'
+        run: zig build test-transfer-cluster
+
+      - name: Adverse network scenario
+        if: runner.os == 'Linux'
+        run: zig build test-fault-network
+
+  # The long-run gate rotates journal segments many times and proves
+  # bounded retention plus anchored restart (ZDS 0011). It is nightly
+  # work, not per-push work.
+  longrun:
+    name: long-run retention gate
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: zaxonlite
+    steps:
+      - name: Checkout paxos-zig (path dependency parent)
+        uses: actions/checkout@v4
+        with:
+          repository: insanai/paxos-zig
+          token: ${{ secrets.CROSS_REPO_TOKEN || github.token }}
+          path: .
+
+      - name: Checkout zaxonlite
+        uses: actions/checkout@v4
+        with:
+          path: zaxonlite
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install OpenSSL 3
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+
+      - name: Prepare Zig package cache
+        run: mkdir -p "${ZIG_GLOBAL_CACHE_DIR:-$HOME/.cache/zig}/tmp"
+
+      - name: Long-run retention and anchored-restart gate
+        run: zig build test-longrun -Dlongrun-writes=100000
 
   # Cross-compiling is not proof that Windows works, but it is proof that
   # the port still builds. Without this the POSIX-only assumptions creep
