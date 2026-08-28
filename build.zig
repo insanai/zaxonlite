@@ -614,6 +614,11 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&fuzz_exe.step);
     check_step.dependOn(&soak_exe.step);
     check_step.dependOn(&longrun_exe.step);
+    check_step.dependOn(&unit_tests.step);
+    check_step.dependOn(&search_tests.step);
+    check_step.dependOn(&cli_ui_tests.step);
+    check_step.dependOn(&cli_unit_tests.step);
+    check_step.dependOn(&integration_tests.step);
 
     // Cross-target compile gate for the pure search kernels: the module
     // has no dependencies, so it must build for every supported vector
@@ -754,6 +759,7 @@ pub fn build(b: *std.Build) void {
         .flags = &.{"-std=c11"},
     });
     capi_smoke.root_module.addIncludePath(b.path("include"));
+    check_step.dependOn(&capi_smoke.step);
     if (openssl_prefix.len > 0) {
         capi_smoke.root_module.addLibraryPath(.{
             .cwd_relative = b.fmt("{s}/lib", .{openssl_prefix}),
