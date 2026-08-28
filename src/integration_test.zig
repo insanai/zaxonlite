@@ -400,7 +400,7 @@ test "the storage ceiling refuses writes instead of deleting history" {
     // deletion of unproven history.
     const node = try Node.open(gpa, testing.io, .{
         .directory = dir,
-        .journal_cap_bytes = 16 * 1024,
+        .journal_cap_bytes = 64 * 1024,
     });
     defer node.close();
     _ = try node.exec("create table t(id integer primary key, v text)");

@@ -1656,6 +1656,10 @@ pub const Node = struct {
 
     /// Slots of execution beyond the durable anchor that trigger a new
     /// anchor (ZDS 0011 Q5).
+    /// One maximum transaction (the 64 MiB wire frame ceiling) held in
+    /// reserve below the storage cap, so an admitted write cannot land
+    /// above it.
+    pub const admission_reserve_bytes: u64 = 64 * 1024 * 1024;
     pub const anchor_interval_slots: paxos.Slot = 10_000;
     /// Test-overridable so the cadence trigger is verifiable without a
     /// thirty-second wait; production never changes it.
@@ -2693,14 +2697,26 @@ pub const Node = struct {
     ) !ExecResult {
         if (self.fatal_storage_error) return error.StorageFailed;
         // The storage-budget hard ceiling (ZDS 0011): past the
-        // configured journal cap, new writes are refused rather than
-        // unproven history deleted; a safe trim, a state transfer, or
-        // an operator capacity change restores service.
-        if (self.journal_cap_bytes != 0 and
-            self.journal.stats().journal_bytes + self.store.retained_bytes >=
-                self.journal_cap_bytes)
-        {
-            return error.RecoveryRetentionExceeded;
+        // configured cap, new writes are refused rather than unproven
+        // history deleted; a safe trim, a state transfer, or an
+        // operator capacity change restores service. Admission holds a
+        // one-transaction reserve below the cap, so no leader-admitted
+        // write can land above it; followers install what consensus
+        // chose regardless and fail loudly on their own write path.
+        if (self.journal_cap_bytes != 0) {
+            const usage = self.journal.stats().journal_bytes +
+                self.store.retained_bytes;
+            // At production caps the reserve is one maximum transaction,
+            // so no admitted write can land above the cap; a cap smaller
+            // than four transactions keeps a quarter in reserve instead,
+            // bounding overshoot at cap/4 for test-scale ceilings.
+            const reserve = @min(
+                admission_reserve_bytes,
+                self.journal_cap_bytes / 4,
+            );
+            if (usage +| reserve >= self.journal_cap_bytes) {
+                return error.RecoveryRetentionExceeded;
+            }
         }
         if (self.needs_resync) try self.resyncImage();
         // Never execute SQL that cannot be appended: a sealed log would

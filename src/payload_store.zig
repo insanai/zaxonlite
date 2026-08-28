@@ -49,35 +49,37 @@ pub const PayloadStore = struct {
         try durability.syncDirectory(parent);
         try durability.syncDirectory(dir);
         var self = PayloadStore{ .io = io, .dir = dir };
-        self.retained_bytes = self.measureRetainedBytes();
+        self.retained_bytes = try self.measureRetainedBytes();
         return self;
     }
 
-    /// Sums every retained object once; open-time only.
-    fn measureRetainedBytes(self: *PayloadStore) u64 {
+    /// Sums every retained object once at open. Fails closed: capacity
+    /// enforcement built on an undercount would be a lie, so an
+    /// unreadable shard or object is an open error, not a zero.
+    fn measureRetainedBytes(self: *PayloadStore) !u64 {
         var total: u64 = 0;
         var shards = self.dir.iterate();
-        while (shards.next(self.io) catch null) |shard| {
+        while (try shards.next(self.io)) |shard| {
             if (shard.kind != .directory or shard.name.len != 2) continue;
             var shard_name: [2]u8 = shard.name[0..2].*;
-            var shard_dir = self.dir.openDir(
+            var shard_dir = try self.dir.openDir(
                 self.io,
                 &shard_name,
                 .{ .iterate = true },
-            ) catch continue;
+            );
             defer shard_dir.close(self.io);
             var objects = shard_dir.iterate();
-            while (objects.next(self.io) catch null) |object| {
+            while (try objects.next(self.io)) |object| {
                 if (object.kind != .file) continue;
                 var object_name: [62]u8 = undefined;
                 if (object.name.len != 62) continue;
                 object_name = object.name[0..62].*;
-                const stat = shard_dir.statFile(
+                const stat = try shard_dir.statFile(
                     self.io,
                     &object_name,
                     .{},
-                ) catch continue;
-                total += stat.size;
+                );
+                total +|= stat.size;
             }
         }
         return total;
@@ -155,7 +157,7 @@ pub const PayloadStore = struct {
             },
             else => return err,
         };
-        self.retained_bytes += bytes.len;
+        self.retained_bytes +|= bytes.len;
         try durability.syncChildDirectoryBeforeBarrier(self.io, self.dir, path[0..2]);
     }
 
@@ -323,4 +325,28 @@ test "payload store detects corruption and missing objects" {
         error.PayloadMissing,
         store.load(testing.allocator, absent),
     );
+}
+
+test "retained bytes track installs, duplicates, removal, and reopening" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+
+    var store = try PayloadStore.init(io, tmp.dir);
+    const first = try store.put("twelve bytes");
+    try std.testing.expectEqual(@as(u64, 12), store.retained_bytes);
+    // An idempotent re-install of identical content counts once.
+    _ = try store.put("twelve bytes");
+    try std.testing.expectEqual(@as(u64, 12), store.retained_bytes);
+    _ = try store.put("four");
+    try std.testing.expectEqual(@as(u64, 16), store.retained_bytes);
+
+    try store.remove(first);
+    try std.testing.expectEqual(@as(u64, 4), store.retained_bytes);
+    store.deinit();
+
+    // A reopen recounts what the directory actually holds.
+    var reopened = try PayloadStore.init(io, tmp.dir);
+    defer reopened.deinit();
+    try std.testing.expectEqual(@as(u64, 4), reopened.retained_bytes);
 }
