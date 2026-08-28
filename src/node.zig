@@ -36,6 +36,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const paxos = @import("paxos");
 
 const command = @import("command.zig");
+const segment_mod = @import("segment.zig");
 const types = @import("types.zig");
 const applied_anchor = @import("applied_anchor.zig");
 const history = @import("history.zig");
@@ -1656,13 +1657,27 @@ pub const Node = struct {
 
     /// Slots of execution beyond the durable anchor that trigger a new
     /// anchor (ZDS 0011 Q5).
-    /// Proven worst-case growth of one admitted write -- the maximum
+    /// Proven worst-case growth of one admitted write: the maximum
     /// payload plus its accept and commit journal records, a sealing
-    /// trailer, and a fresh segment header, rounded up with margin --
-    /// held in reserve below the storage cap so an admitted write can
-    /// never land above it. Test-overridable so small-cap scenarios can
-    /// exercise refusal; production never changes it.
-    pub var admission_reserve_bytes: u64 = 65 * 1024 * 1024;
+    /// trailer, and a fresh segment header, each taken from the
+    /// constant it must cover so the bound cannot drift. Held in
+    /// reserve below the storage cap so an admitted write can never
+    /// land above it.
+    pub const admission_reserve_bytes: u64 =
+        @as(u64, command.max_payload_bytes) +
+        2 * (@as(u64, segment_mod.record_header_size) +
+            @as(u64, types.max_write_size)) +
+        @as(u64, segment_mod.Writer.trailer_size_max) +
+        @as(u64, segment_mod.header_size);
+
+    /// Whether one more write may be admitted under the storage cap:
+    /// the current usage plus the proven one-write reserve must stay
+    /// below the cap, so a cap at or below the reserve refuses every
+    /// write. Pure, so the arithmetic is unit-testable with synthetic
+    /// numbers.
+    pub fn admissionOverCap(usage: u64, reserve: u64, cap: u64) bool {
+        return usage +| reserve >= cap;
+    }
     pub const anchor_interval_slots: paxos.Slot = 10_000;
     /// Test-overridable so the cadence trigger is verifiable without a
     /// thirty-second wait; production never changes it.
@@ -2709,10 +2724,11 @@ pub const Node = struct {
         if (self.journal_cap_bytes != 0) {
             const usage = self.journal.stats().journal_bytes +|
                 self.store.retained_bytes;
-            // The reserve is the proven worst-case growth of one write,
-            // so an admitted write can never land above the cap; a cap
-            // at or below the reserve refuses every write.
-            if (usage +| admission_reserve_bytes >= self.journal_cap_bytes) {
+            if (admissionOverCap(
+                usage,
+                admission_reserve_bytes,
+                self.journal_cap_bytes,
+            )) {
                 return error.RecoveryRetentionExceeded;
             }
         }

@@ -388,6 +388,23 @@ test "idempotent sessions execute a sequence exactly once" {
     }
 }
 
+test "admission arithmetic refuses at and beyond the reserve boundary" {
+    // The pure check, exercised with synthetic numbers so the boundary
+    // cases stay visible: a cap at or below the reserve refuses
+    // everything, and admission flips exactly where usage plus the
+    // reserve reaches the cap.
+    try testing.expect(Node.admissionOverCap(0, 100, 100));
+    try testing.expect(Node.admissionOverCap(0, 100, 50));
+    try testing.expect(!Node.admissionOverCap(0, 100, 101));
+    try testing.expect(!Node.admissionOverCap(49, 100, 150));
+    try testing.expect(Node.admissionOverCap(50, 100, 150));
+    try testing.expect(Node.admissionOverCap(
+        std.math.maxInt(u64),
+        100,
+        std.math.maxInt(u64),
+    ));
+}
+
 test "the storage ceiling refuses writes instead of deleting history" {
     const gpa = testing.allocator;
     var test_dir = try TestDir.init(gpa);
@@ -395,14 +412,12 @@ test "the storage ceiling refuses writes instead of deleting history" {
     const dir = try test_dir.nodeDir(gpa);
     defer gpa.free(dir);
 
-    // A test-sized reserve stands in for the proven worst-case write
-    // growth, matching the tiny rows this scenario admits; the refusal
-    // must be RecoveryRetentionExceeded, never a deletion of unproven
-    // history, and admitted usage must never land above the cap.
-    const cap: u64 = 64 * 1024;
-    const saved_reserve = Node.admission_reserve_bytes;
-    Node.admission_reserve_bytes = 4 * 1024;
-    defer Node.admission_reserve_bytes = saved_reserve;
+    // The production reserve stays in force; the cap grants a small
+    // budget above it, so refusal arrives after a handful of writes.
+    // The invariant under test: admitted usage never lands above the
+    // cap, and the refusal is RecoveryRetentionExceeded, never a
+    // deletion of unproven history.
+    const cap: u64 = Node.admission_reserve_bytes + 256 * 1024;
     const node = try Node.open(gpa, testing.io, .{
         .directory = dir,
         .journal_cap_bytes = cap,
@@ -411,7 +426,7 @@ test "the storage ceiling refuses writes instead of deleting history" {
     _ = try node.exec("create table t(id integer primary key, v text)");
     var refused = false;
     var index: usize = 0;
-    while (index < 200) : (index += 1) {
+    while (index < 400) : (index += 1) {
         _ = node.exec("insert into t(v) values ('row')") catch |err| {
             try testing.expectEqual(error.RecoveryRetentionExceeded, err);
             refused = true;

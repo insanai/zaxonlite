@@ -311,7 +311,7 @@ pub const Writer = struct {
         return digest;
     }
 
-    const trailer_size_max = trailer_fixed_size +
+    pub const trailer_size_max = trailer_fixed_size +
         max_sparse_entries * 16 + trailer_tail_size;
 };
 
