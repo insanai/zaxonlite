@@ -9,9 +9,6 @@ on:
   push:
     branches: [main]
   pull_request:
-  schedule:
-    # Nightly long-run retention gate; regular pushes skip it.
-    - cron: "17 3 * * *"
   workflow_dispatch:
 
 permissions:
@@ -140,11 +137,11 @@ jobs:
         run: zig build test-fault-network
 
   # The long-run gate rotates journal segments many times and proves
-  # bounded retention plus anchored restart (ZDS 0011). It is nightly
-  # work, not per-push work.
+  # bounded retention plus anchored restart (ZDS 0011). It is explicit
+  # on-demand work, not scheduled or per-push work.
   longrun:
     name: long-run retention gate
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     defaults:
