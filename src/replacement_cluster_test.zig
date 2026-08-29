@@ -19,6 +19,7 @@ const Io = std.Io;
 const zaxonlite = @import("zaxonlite");
 const client = zaxonlite.client;
 const tls = zaxonlite.tls;
+const PortReservations = @import("test_ports.zig").FourReservations;
 
 const Endpoint = client.Endpoint;
 
@@ -41,6 +42,7 @@ const Cluster = struct {
     ca_key_path: []const u8,
     nodes: [4]NodeProc,
     replacement_port: u16,
+    port_reservations: *PortReservations,
     admin: tls.Context,
 
     fn endpointOf(self: *Cluster, index: usize) Endpoint {
@@ -58,6 +60,10 @@ const Cluster = struct {
     ) !void {
         const node = &self.nodes[index];
         std.debug.assert(node.child == null);
+
+        // The kernel-selected port stays unavailable to every other process
+        // until the child that owns it is ready to be spawned.
+        self.port_reservations.release(self.io, index);
 
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(self.gpa);
@@ -461,7 +467,9 @@ pub fn main(init: std.process.Init) !u8 {
     var random_bytes: [8]u8 = undefined;
     io.random(&random_bytes);
     const nonce = std.mem.readInt(u64, &random_bytes, .little);
-    const base_port: u16 = @intCast(41000 + (nonce % 500) * 8);
+
+    var port_reservations = try PortReservations.init(io);
+    defer port_reservations.deinit(io);
 
     const root = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/zx-replace-{x}", .{nonce});
     defer gpa.free(root);
@@ -503,7 +511,8 @@ pub fn main(init: std.process.Init) !u8 {
         .ca_path = ca_path,
         .ca_key_path = ca_key_path,
         .nodes = undefined,
-        .replacement_port = base_port + 4,
+        .replacement_port = port_reservations.ports[3],
+        .port_reservations = &port_reservations,
         .admin = try tls.Context.initClient(.{
             .cert_path = admin_cert,
             .key_path = admin_key,
@@ -514,7 +523,7 @@ pub fn main(init: std.process.Init) !u8 {
         const node_id: u32 = index + 1;
         cluster.nodes[index] = .{
             .id = node_id,
-            .port = base_port + index + 1,
+            .port = port_reservations.ports[index],
             .directory = try std.fmt.allocPrint(gpa, "{s}/n{d}", .{ root, node_id }),
             .log_path = try std.fmt.allocPrint(gpa, "{s}/n{d}.log", .{ root, node_id }),
             .cert = try std.fmt.allocPrint(gpa, "{s}/node{d}.crt", .{ root, node_id }),
