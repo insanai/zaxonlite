@@ -44,6 +44,7 @@ const diagnostic = @import("diagnostic.zig");
 const durability = @import("durability.zig");
 const configuration = @import("configuration.zig");
 const registry = @import("registry.zig");
+const replacement_error = @import("replacement_error.zig");
 
 const Node = node_mod.Node;
 const Log = types.Log;
@@ -3652,7 +3653,10 @@ pub const Server = struct {
 
         switch (outcome) {
             .not_leader => return self.writeNotLeader(out),
-            .rejected => |err| return writeReplacementError(out, err),
+            .rejected => |err| {
+                const response = replacement_error.classify(err);
+                return writeErrorResponse(out, response.code, response.message);
+            },
             .complete => |configuration_id| try out.print(
                 "{{\"ok\":true,\"operation\":{d},\"phase\":\"complete\"," ++
                     "\"configuration_id\":{d}}}",
@@ -5128,84 +5132,6 @@ fn writeErrorResponse(out: *Io.Writer, code: []const u8, message: []const u8) !v
     try out.print("{{\"ok\":false,\"error\":\"{s}\",\"message\":", .{code});
     try writeJsonString(out, message);
     try out.writeAll("}");
-}
-
-fn writeReplacementError(out: *Io.Writer, err: anyerror) !void {
-    const response: struct { code: []const u8, message: []const u8 } = switch (err) {
-        error.StaleConfiguration => .{
-            .code = "stale_configuration",
-            .message = "The expected configuration is no longer active.",
-        },
-        error.UnknownVoter => .{
-            .code = "unknown_voter",
-            .message = "The node being replaced is not a current data voter.",
-        },
-        error.NodeIdNotFresh => .{
-            .code = "node_id_not_fresh",
-            .message = "The replacement node ID has already been allocated.",
-        },
-        error.NodeIdExhausted => .{
-            .code = "node_id_exhausted",
-            .message = "The node ID allocation fence cannot advance.",
-        },
-        error.OperationIdExhausted => .{
-            .code = "operation_id_exhausted",
-            .message = "The replacement operation ID space cannot advance.",
-        },
-        error.ConfigurationIdExhausted => .{
-            .code = "configuration_id_exhausted",
-            .message = "The configuration ID space cannot advance.",
-        },
-        error.InvalidEndpoint => .{
-            .code = "invalid_endpoint",
-            .message = "The replacement endpoint is empty, malformed, or too long.",
-        },
-        error.EndpointInUse => .{
-            .code = "endpoint_in_use",
-            .message = "Another current node already uses the replacement endpoint.",
-        },
-        error.TooFewVoters => .{
-            .code = "too_few_voters",
-            .message = "Replacing a voter would leave an unsupported voter set.",
-        },
-        error.OperationConflict => .{
-            .code = "operation_conflict",
-            .message = "This operation ID is bound to different replacement arguments.",
-        },
-        error.OperationPending => .{
-            .code = "operation_pending",
-            .message = "Another voter replacement is still pending.",
-        },
-        error.OperationHistoryExpired => .{
-            .code = "operation_history_expired",
-            .message = "This operation ID is older than the retained result history.",
-        },
-        error.CorruptPendingOperation => .{
-            .code = "corrupt_pending_operation",
-            .message = "The durable pending replacement record is unreadable.",
-        },
-        error.TransactionOpen, error.WriteInFlight => .{
-            .code = "replacement_busy",
-            .message = "A database write is still in progress.",
-        },
-        error.StorageFailed => .{
-            .code = "storage_failed",
-            .message = "Durable storage failed, so this node cannot replace a voter.",
-        },
-        error.NoDecidedRegistry => .{
-            .code = "no_registry",
-            .message = "This node does not have decided registry membership.",
-        },
-        error.RoleCannotWrite => .{
-            .code = "role_cannot_write",
-            .message = "This node role cannot coordinate a voter replacement.",
-        },
-        else => .{
-            .code = "replace_rejected",
-            .message = @errorName(err),
-        },
-    };
-    return writeErrorResponse(out, response.code, response.message);
 }
 
 fn writeSqlError(out: *Io.Writer, message: []const u8) !void {
