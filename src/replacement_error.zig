@@ -84,6 +84,16 @@ const table = [_]Entry{
         .message = "A database write is still in progress.",
     },
     .{
+        .err = error.LeaderCatchingUp,
+        .code = "replacement_busy",
+        .message = "The leader is still applying slots it inherited; retry.",
+    },
+    .{
+        .err = error.LeaderNotReady,
+        .code = "replacement_busy",
+        .message = "The leader is still applying slots it inherited; retry.",
+    },
+    .{
         .err = error.StorageFailed,
         .code = "storage_failed",
         .message = "Durable storage failed, so this node cannot replace a voter.",

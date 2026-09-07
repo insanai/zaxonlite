@@ -25,6 +25,9 @@ pub const log_options = paxos.ReplicatedLogOptions{
     // deliberately small compared with an unbounded database log.
     .window_slots = 2048,
     .max_batch = 16,
+    // A batch's chain base is read from applied state, so a new leader
+    // must deliver everything it inherited before it proposes again.
+    .gate_proposals_on_inherited_prefix = true,
     // 512 holds zx2 stop metadata: checkpoint name, manifest digest,
     // next-registry digest, and the bounded replacement seed.
     .max_metadata_bytes = 512,

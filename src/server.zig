@@ -1017,6 +1017,16 @@ pub const Server = struct {
     snapshot_requested_tick: u64 = 0,
     catch_up_last_decided: paxos.Slot = 0,
     catch_up_stalled: u32 = 0,
+    /// Signalled when the applied frontier moves while a client waits for
+    /// the leader to finish applying what it inherited (issue #5).
+    frontier_cond: std.Io.Condition = .init,
+    frontier_waiters: u32 = 0,
+    frontier_last_applied: paxos.Slot = 0,
+    /// Set while parked votes are re-queued so the drain does not park
+    /// them again.
+    releasing_votes: bool = false,
+    /// Phase-two votes parked by the `vote_delay_ms` test fault.
+    held_votes: std.ArrayList(struct { envelope: Log.Envelope, release_tick: u64 }) = .empty,
     /// Latest per-peer progress reports for trim coordination (ZDS 0011).
     frontiers: [types.log_options.max_members]?trim.Frontier =
         [_]?trim.Frontier{null} ** types.log_options.max_members,
@@ -1155,6 +1165,7 @@ pub const Server = struct {
     fn wakeWaiters(self: *Server) void {
         self.writer_cond.broadcast(self.io);
         self.rollover_cond.broadcast(self.io);
+        self.frontier_cond.broadcast(self.io);
         if (self.write_waiter) |waiter| waiter.cond.signal(self.io);
         for (self.fences.items) |fence| fence.cond.signal(self.io);
         for (self.waiters.items) |waiter| waiter.cond.signal(self.io);
@@ -1616,6 +1627,13 @@ pub const Server = struct {
 
         if (self.node.identity.configuration_id != previous_configuration) {
             self.enterConfigurationLocked();
+        }
+
+        // Clients parked on the leader frontier wake as soon as catch-up
+        // applies something, not on the next tick.
+        if (self.node.applied_slot != self.frontier_last_applied) {
+            self.frontier_last_applied = self.node.applied_slot;
+            if (self.frontier_waiters > 0) self.frontier_cond.broadcast(self.io);
         }
 
         // Write waiter resolution.
@@ -3840,6 +3858,7 @@ pub const Server = struct {
         // One replicated write at a time; a dependent slot is never built
         // before its predecessor is chosen. Admission is first-in-first-out:
         // the releasing owner hands the gate directly to the oldest ticket.
+        const queued_tick: u64 = self.tick_count;
         if (self.writer_gate_busy or self.writer_queue_head != null) {
             var ticket = WriterTicket{};
             if (self.writer_queue_tail) |tail| {
@@ -3848,7 +3867,6 @@ pub const Server = struct {
                 self.writer_queue_head = &ticket;
             }
             self.writer_queue_tail = &ticket;
-            const queued_tick: u64 = self.tick_count;
             while (!ticket.granted) {
                 if (self.failed) {
                     self.removeWriterTicket(&ticket);
@@ -3872,6 +3890,13 @@ pub const Server = struct {
         if (self.node.membership_change_pending or self.node.log.stop_pending) {
             return error.LogSealed;
         }
+
+        // A batch's chain base is this node's applied state. Slots still
+        // undecided below the proposal frontier (inherited from the
+        // previous leader, or a trim in flight) would make it stale, so
+        // the write waits here, before any SQL runs. The mutex stays held
+        // from this check through the append, so nothing can interleave.
+        try self.awaitLeaderFrontier(Node.proposalFrontierSettled, queued_tick);
 
         self.node.ensureWriter() catch return error.Unavailable;
 
@@ -3923,6 +3948,26 @@ pub const Server = struct {
                 return result;
             },
             else => return error.Ambiguous,
+        }
+    }
+
+    /// Blocks until `settled(node)` holds on this leader. Returns
+    /// `NotLeader` if leadership moves meanwhile, `Unavailable` if the node
+    /// fails, and `OpTimeoutQueued` once the deadline measured from
+    /// `start_tick` passes: nothing has executed, so a plain retry is safe.
+    /// Called with `mutex` held; the wait releases it temporarily.
+    fn awaitLeaderFrontier(
+        self: *Server,
+        comptime settled: fn (*const Node) bool,
+        start_tick: u64,
+    ) WriteError!void {
+        self.frontier_waiters += 1;
+        defer self.frontier_waiters -= 1;
+        while (!settled(self.node)) {
+            if (self.failed) return error.Unavailable;
+            if (!self.node.isLeader()) return error.NotLeader;
+            if (self.elapsedMs(start_tick) > op_timeout_ms) return error.OpTimeoutQueued;
+            self.frontier_cond.waitUncancelable(self.io, &self.mutex);
         }
     }
 
@@ -4243,6 +4288,13 @@ pub const Server = struct {
                 "{\"ok\":false,\"error\":\"timeout\",\"queued\":true," ++
                     "\"message\":\"write queue wait expired before execution\"}",
             ),
+            // Unreachable behind the frontier wait; kept so a host path
+            // that bypasses it still gets a retryable answer.
+            error.LeaderNotReady, error.LeaderCatchingUp => try writeErrorResponse(
+                out,
+                "retry",
+                "leader is still applying inherited slots",
+            ),
             error.Unavailable => try writeErrorResponse(out, "unavailable", "node failed"),
             error.SqliteError, error.SqliteBusy => {
                 self.mutex.lockUncancelable(self.io);
@@ -4387,6 +4439,21 @@ pub const Server = struct {
             self.mutex.unlock(self.io);
             defer self.mutex.lockUncancelable(self.io);
             return self.writeNotLeader(out);
+        }
+        // A fresh leader's applied state can miss writes the previous
+        // leader acknowledged until the inherited prefix is applied; the
+        // `leader` and `linearizable` promises both cover those writes.
+        if (level != .any) {
+            self.awaitLeaderFrontier(Node.inheritedPrefixApplied, self.tick_count) catch |err| {
+                if (err != error.NotLeader) {
+                    // A read that waited too long simply retries.
+                    const mapped = if (err == error.OpTimeoutQueued) error.LeaderNotReady else err;
+                    return self.writeWriteError(mapped, out);
+                }
+                self.mutex.unlock(self.io);
+                defer self.mutex.lockUncancelable(self.io);
+                return self.writeNotLeader(out);
+            };
         }
 
         if (request.freshness_ms != null and level != .any) {
@@ -4562,7 +4629,9 @@ pub const Server = struct {
         var fence = FenceWaiter{
             .id = self.next_fence_id,
             .ballot = self.node.log.core.ballot,
-            .fence_slot = self.node.log.decidedThrough(),
+            // The fence must cover every slot chosen before this ballot,
+            // including ones this leader inherited and has not delivered.
+            .fence_slot = @max(self.node.log.decidedThrough(), self.node.log.leaderBase() - 1),
             .needed = self.node.log.core.membership.readQuorum(),
         };
         fence.noteAck(self.node.identity.node_id);

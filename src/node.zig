@@ -928,6 +928,22 @@ pub const Node = struct {
         return self.capabilities.votes;
     }
 
+    /// True once every slot this leadership inherited from earlier ballots
+    /// is decided and accounted locally. Until then the applied state can
+    /// miss writes the previous leader acknowledged, so leader-level reads
+    /// must wait. Meaningful only while this node leads.
+    pub fn inheritedPrefixApplied(self: *const Node) bool {
+        return self.applied_slot + 1 >= self.log.leaderBase();
+    }
+
+    /// True when nothing below the next proposal slot is undecided: the
+    /// inherited prefix is applied and no trim, lease, stop, or batch of
+    /// this leadership is still in flight. A batch's chain base is read
+    /// from applied state, so a write may only be captured in this state.
+    pub fn proposalFrontierSettled(self: *const Node) bool {
+        return self.applied_slot + 1 >= self.log.proposalFrontier();
+    }
+
     pub fn role(self: *const Node) roles.Role {
         return self.product_role;
     }
@@ -2741,6 +2757,14 @@ pub const Node = struct {
             self.log.isReconfigured() != null)
         {
             return error.LogSealed;
+        }
+        // The base of the captured batch is this node's applied frontier;
+        // a slot still undecided below the proposal frontier (inherited
+        // from an earlier ballot, or a trim in flight) would make that base
+        // stale in the decided log. The host waits before it gets here;
+        // this refusal happens before any SQL runs, so nothing to resync.
+        if (self.isLeader() and !self.proposalFrontierSettled()) {
+            return error.LeaderNotReady;
         }
         try self.ensureWriter();
         if (self.capture_batch_id != null) return error.WriteInFlight;
