@@ -928,6 +928,22 @@ pub const Node = struct {
         return self.capabilities.votes;
     }
 
+    /// True once every slot this leadership inherited from earlier ballots
+    /// is decided and accounted locally. Until then the applied state can
+    /// miss writes the previous leader acknowledged, so leader-level reads
+    /// must wait. Meaningful only while this node leads.
+    pub fn inheritedPrefixApplied(self: *const Node) bool {
+        return self.applied_slot + 1 >= self.log.leaderBase();
+    }
+
+    /// True when nothing below the next proposal slot is undecided: the
+    /// inherited prefix is applied and no trim, lease, stop, or batch of
+    /// this leadership is still in flight. A batch's chain base is read
+    /// from applied state, so a write may only be captured in this state.
+    pub fn proposalFrontierSettled(self: *const Node) bool {
+        return self.applied_slot + 1 >= self.log.proposalFrontier();
+    }
+
     pub fn role(self: *const Node) roles.Role {
         return self.product_role;
     }
@@ -2742,6 +2758,14 @@ pub const Node = struct {
         {
             return error.LogSealed;
         }
+        // The base of the captured batch is this node's applied frontier;
+        // a slot still undecided below the proposal frontier (inherited
+        // from an earlier ballot, or a trim in flight) would make that base
+        // stale in the decided log. The host waits before it gets here;
+        // this refusal happens before any SQL runs, so nothing to resync.
+        if (self.isLeader() and !self.proposalFrontierSettled()) {
+            return error.LeaderNotReady;
+        }
         try self.ensureWriter();
         if (self.capture_batch_id != null) return error.WriteInFlight;
         if (self.live_transaction) return error.TransactionOpen;
@@ -3563,13 +3587,7 @@ pub const Node = struct {
                         self.releaseLease(complete.lease_id);
                     },
                     .transaction_batch => |batch| {
-                        if (batch.database_id != self.identity.database_id or
-                            !std.mem.eql(u8, &batch.base_chain_hash, &self.last_chain) or
-                            batch.base_data_slot != self.last_data_slot or
-                            !command.chainValid(batch))
-                        {
-                            return error.ChainMismatch;
-                        }
+                        try self.checkChainBase(entry.slot, batch);
                         if (self.capture_batch_id) |pending| {
                             self.capture_batch_id = null;
                             if (pending != batch.batch_id) {
@@ -3618,6 +3636,41 @@ pub const Node = struct {
                 .{ .slot = entry.slot, .hash = self.history_hash };
             self.applied_slot = entry.slot;
         }
+    }
+
+    /// Verifies that a decided batch extends the chain this node has
+    /// applied. A mismatch is fatal and never repaired silently; the log
+    /// line names the failing check so an operator can tell a stale base
+    /// (ordering) from a foreign database or a corrupt descriptor.
+    fn checkChainBase(
+        self: *const Node,
+        slot: paxos.Slot,
+        batch: command.TransactionBatch,
+    ) error{ChainMismatch}!void {
+        const database_ok = batch.database_id == self.identity.database_id;
+        const chain_ok = std.mem.eql(u8, &batch.base_chain_hash, &self.last_chain);
+        const base_slot_ok = batch.base_data_slot == self.last_data_slot;
+        const self_ok = command.chainValid(batch);
+        if (database_ok and chain_ok and base_slot_ok and self_ok) return;
+        std.log.err(
+            "chain mismatch at slot {d}: batch {x:0>32} base slot {d} " ++
+                "(applied {d}) base chain {x}.. (applied {x}..) " ++
+                "database match {} descriptor self-check {}; hint: keep this " ++
+                "data directory and line for the report, replace only this " ++
+                "member by state transfer if its peers serve, and restore " ++
+                "from backup if every member reports the same slot",
+            .{
+                slot,
+                batch.batch_id,
+                batch.base_data_slot,
+                self.last_data_slot,
+                batch.base_chain_hash[0..8],
+                self.last_chain[0..8],
+                database_ok,
+                self_ok,
+            },
+        );
+        return error.ChainMismatch;
     }
 
     fn delayStorage(self: *Node) void {
@@ -3888,13 +3941,7 @@ pub const Node = struct {
                 // finished by the pending-handover path after open.
                 .noop, .read_barrier, .trim, .transfer_lease, .lease_complete => {},
                 .transaction_batch => |batch| {
-                    if (batch.database_id != self.identity.database_id or
-                        !std.mem.eql(u8, &batch.base_chain_hash, &self.last_chain) or
-                        batch.base_data_slot != self.last_data_slot or
-                        !command.chainValid(batch))
-                    {
-                        return error.ChainMismatch;
-                    }
+                    try self.checkChainBase(slot, batch);
                     const payload = self.store.load(self.gpa, batch.payload_hash) catch {
                         // A committed descriptor without payload bytes:
                         // this node must not serve.

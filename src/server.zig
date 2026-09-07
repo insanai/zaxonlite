@@ -44,6 +44,8 @@ const diagnostic = @import("diagnostic.zig");
 const durability = @import("durability.zig");
 const configuration = @import("configuration.zig");
 const registry = @import("registry.zig");
+const replacement_error = @import("replacement_error.zig");
+const leader_frontier = @import("leader_frontier.zig");
 
 const Node = node_mod.Node;
 const Log = types.Log;
@@ -282,11 +284,15 @@ pub const TestFaults = struct {
     reorder_pairs: bool = false,
     fragment_bytes: u32 = 0,
     storage_delay_ms: u64 = 0,
+    /// Holds this node's phase-two votes for that long before they leave,
+    /// so a re-proposed slot stays undecided for a known window while
+    /// elections and heartbeats run at full speed.
+    vote_delay_ms: u64 = 0,
 
     fn enabled(self: TestFaults) bool {
         return self.drop_every != 0 or self.duplicate_every != 0 or
             self.reorder_pairs or self.fragment_bytes != 0 or
-            self.storage_delay_ms != 0;
+            self.storage_delay_ms != 0 or self.vote_delay_ms != 0;
     }
 };
 
@@ -1016,6 +1022,16 @@ pub const Server = struct {
     snapshot_requested_tick: u64 = 0,
     catch_up_last_decided: paxos.Slot = 0,
     catch_up_stalled: u32 = 0,
+    /// Signalled when the applied frontier moves while a client waits for
+    /// the leader to finish applying what it inherited (issue #5).
+    frontier_cond: std.Io.Condition = .init,
+    frontier_waiters: u32 = 0,
+    frontier_last_applied: paxos.Slot = 0,
+    /// Set while parked votes are re-queued so the drain does not park
+    /// them again.
+    releasing_votes: bool = false,
+    /// Phase-two votes parked by the `vote_delay_ms` test fault.
+    held_votes: std.ArrayList(struct { envelope: Log.Envelope, release_tick: u64 }) = .empty,
     /// Latest per-peer progress reports for trim coordination (ZDS 0011).
     frontiers: [types.log_options.max_members]?trim.Frontier =
         [_]?trim.Frontier{null} ** types.log_options.max_members,
@@ -1066,6 +1082,7 @@ pub const Server = struct {
         self.member_generations.deinit(self.gpa);
         self.fences.deinit(self.gpa);
         self.waiters.deinit(self.gpa);
+        self.held_votes.deinit(self.gpa);
         self.active_connections.deinit(self.gpa);
         self.held.deinit();
         if (self.listener) |*listener| listener.deinit(self.io);
@@ -1154,6 +1171,7 @@ pub const Server = struct {
     fn wakeWaiters(self: *Server) void {
         self.writer_cond.broadcast(self.io);
         self.rollover_cond.broadcast(self.io);
+        self.frontier_cond.broadcast(self.io);
         if (self.write_waiter) |waiter| waiter.cond.signal(self.io);
         for (self.fences.items) |fence| fence.cond.signal(self.io);
         for (self.waiters.items) |waiter| waiter.cond.signal(self.io);
@@ -1617,6 +1635,13 @@ pub const Server = struct {
             self.enterConfigurationLocked();
         }
 
+        // Clients parked on the leader frontier wake as soon as catch-up
+        // applies something, not on the next tick.
+        if (self.node.applied_slot != self.frontier_last_applied) {
+            self.frontier_last_applied = self.node.applied_slot;
+            if (self.frontier_waiters > 0) self.frontier_cond.broadcast(self.io);
+        }
+
         // Write waiter resolution.
         if (self.write_waiter) |waiter| {
             if (waiter.outcome == .pending and self.node.applied_slot >= waiter.slot) {
@@ -1698,6 +1723,14 @@ pub const Server = struct {
         if (configuration_id != self.transport_configuration_id) return;
         for (self.node.outbox.items) |envelope| {
             const sender = self.senderFor(envelope.to) orelse continue;
+            const vote_delay = self.options.test_faults.vote_delay_ms;
+            if (vote_delay != 0 and envelope.message == .accepted and !self.releasing_votes) {
+                try self.held_votes.append(self.gpa, .{
+                    .envelope = envelope,
+                    .release_tick = self.tick_count + vote_delay / self.options.tick_ms,
+                });
+                continue;
+            }
             var payload_precedes_envelope = false;
             if (wire.envelopePayloadHash(envelope)) |hash| {
                 if (sender.hasPayloadAck(hash)) {
@@ -1740,6 +1773,24 @@ pub const Server = struct {
             }
         }
         self.node.outbox.clearRetainingCapacity();
+    }
+
+    /// Re-queues votes the `vote_delay_ms` fault parked once their tick
+    /// comes; the ordinary drain sends them.
+    fn releaseHeldVotes(self: *Server) void {
+        var index: usize = 0;
+        while (index < self.held_votes.items.len) {
+            if (self.held_votes.items[index].release_tick > self.tick_count) {
+                index += 1;
+                continue;
+            }
+            const held = self.held_votes.swapRemove(index);
+            self.node.outbox.append(self.gpa, held.envelope) catch {};
+        }
+        if (self.node.outbox.items.len == 0) return;
+        self.releasing_votes = true;
+        defer self.releasing_votes = false;
+        self.pump();
     }
 
     /// Streams the chosen prefix to non-voting storage nodes. These frames
@@ -1998,6 +2049,7 @@ pub const Server = struct {
                     self.failEverything();
                     continue;
                 };
+                self.releaseHeldVotes();
                 self.pump();
                 self.reportLeaderChangeLocked();
                 self.wakeWaiters();
@@ -2035,28 +2087,23 @@ pub const Server = struct {
                     }
                 }
 
-                // A member that observes a further-ahead leader asks for
-                // the decided suffix it is missing. When repeated range
-                // recovery makes no progress the gap sits below cluster
-                // retention, and only a full-image transfer closes it.
-                if (self.tick_count % 20 == 0 and !self.node.isLeader()) {
-                    if (self.node.currentLeader()) |leader| {
+                // Every 20 ticks a member that is missing decided slots asks
+                // for them: a follower from the leader it observed ahead, a
+                // leader from any peer while it still owes itself slots
+                // chosen under an earlier ballot (phase one sends the learn
+                // request once). Repeated stalls mean the gap is below
+                // retention and only a transfer closes it; installing one
+                // demotes a leader, so a caught-up voter leads instead.
+                if (self.tick_count % 20 == 0) {
+                    if (self.node.isLeader()) {
+                        if (!self.node.inheritedPrefixApplied()) {
+                            if (self.nextRecoveryPeer()) |peer| self.recoverFromPeer(peer);
+                        }
+                    } else if (self.node.currentLeader()) |leader| {
                         if (leader != self.node.identity.node_id and
                             self.observed_leader_decided > self.node.log.decidedThrough())
                         {
-                            const decided = self.node.log.decidedThrough();
-                            if (decided > self.catch_up_last_decided) {
-                                self.catch_up_last_decided = decided;
-                                self.catch_up_stalled = 0;
-                            } else {
-                                self.catch_up_stalled += 1;
-                            }
-                            if (self.catch_up_stalled >= 10) {
-                                self.catch_up_stalled = 0;
-                                self.requestSnapshot(leader);
-                            }
-                            self.node.requestCatchUp(leader) catch {};
-                            self.pump();
+                            self.recoverFromPeer(leader);
                         }
                     }
                 }
@@ -2076,6 +2123,24 @@ pub const Server = struct {
                 };
             }
         }
+    }
+
+    /// Asks `peer` for the decided suffix this node is missing; after ten
+    /// probes without progress it requests a full-image transfer instead.
+    fn recoverFromPeer(self: *Server, peer: paxos.NodeId) void {
+        const decided = self.node.log.decidedThrough();
+        if (decided > self.catch_up_last_decided) {
+            self.catch_up_last_decided = decided;
+            self.catch_up_stalled = 0;
+        } else {
+            self.catch_up_stalled += 1;
+        }
+        if (self.catch_up_stalled >= 10) {
+            self.catch_up_stalled = 0;
+            self.requestSnapshot(peer);
+        }
+        self.node.requestCatchUp(peer) catch {};
+        self.pump();
     }
 
     /// Called with the server mutex held after a protocol transition.
@@ -2536,7 +2601,7 @@ pub const Server = struct {
         }
 
         self.node.stepEnvelope(envelope) catch |err| {
-            std.log.warn("step failure: {s}", .{@errorName(err)});
+            std.log.err("step failure: {s}", .{@errorName(err)});
             self.failed = true;
             self.failEverything();
             return;
@@ -2640,7 +2705,7 @@ pub const Server = struct {
             self.held_total -= 1;
             for (entry.value.envelopes[0..entry.value.count]) |envelope| {
                 self.node.stepEnvelope(envelope) catch |err| {
-                    std.log.warn("step failure: {s}", .{@errorName(err)});
+                    std.log.err("step failure: {s}", .{@errorName(err)});
                     self.failed = true;
                     self.failEverything();
                     return;
@@ -3652,7 +3717,10 @@ pub const Server = struct {
 
         switch (outcome) {
             .not_leader => return self.writeNotLeader(out),
-            .rejected => |err| return writeReplacementError(out, err),
+            .rejected => |err| {
+                const response = replacement_error.classify(err);
+                return writeErrorResponse(out, response.code, response.message);
+            },
             .complete => |configuration_id| try out.print(
                 "{{\"ok\":true,\"operation\":{d},\"phase\":\"complete\"," ++
                     "\"configuration_id\":{d}}}",
@@ -3836,6 +3904,7 @@ pub const Server = struct {
         // One replicated write at a time; a dependent slot is never built
         // before its predecessor is chosen. Admission is first-in-first-out:
         // the releasing owner hands the gate directly to the oldest ticket.
+        const queued_tick: u64 = self.tick_count;
         if (self.writer_gate_busy or self.writer_queue_head != null) {
             var ticket = WriterTicket{};
             if (self.writer_queue_tail) |tail| {
@@ -3844,7 +3913,6 @@ pub const Server = struct {
                 self.writer_queue_head = &ticket;
             }
             self.writer_queue_tail = &ticket;
-            const queued_tick: u64 = self.tick_count;
             while (!ticket.granted) {
                 if (self.failed) {
                     self.removeWriterTicket(&ticket);
@@ -3868,6 +3936,13 @@ pub const Server = struct {
         if (self.node.membership_change_pending or self.node.log.stop_pending) {
             return error.LogSealed;
         }
+
+        // A batch's chain base is this node's applied state. Slots still
+        // undecided below the proposal frontier (inherited from the
+        // previous leader, or a trim in flight) would make it stale, so
+        // the write waits here, before any SQL runs. The mutex stays held
+        // from this check through the append, so nothing can interleave.
+        try self.awaitLeaderFrontier(Node.proposalFrontierSettled, queued_tick);
 
         self.node.ensureWriter() catch return error.Unavailable;
 
@@ -3920,6 +3995,19 @@ pub const Server = struct {
             },
             else => return error.Ambiguous,
         }
+    }
+
+    /// Blocks until `settled(node)` holds on this leader. Returns
+    /// `NotLeader` if leadership moves meanwhile, `Unavailable` if the node
+    /// fails, and `OpTimeoutQueued` once the deadline measured from
+    /// `start_tick` passes: nothing has executed, so a plain retry is safe.
+    /// Called with `mutex` held; the wait releases it temporarily.
+    fn awaitLeaderFrontier(
+        self: *Server,
+        comptime settled: fn (*const Node) bool,
+        start_tick: u64,
+    ) WriteError!void {
+        return leader_frontier.awaitReady(self, settled, start_tick, op_timeout_ms);
     }
 
     /// Releases the writer gate, handing it directly to the oldest queued
@@ -4239,6 +4327,13 @@ pub const Server = struct {
                 "{\"ok\":false,\"error\":\"timeout\",\"queued\":true," ++
                     "\"message\":\"write queue wait expired before execution\"}",
             ),
+            // Unreachable behind the frontier wait; kept so a host path
+            // that bypasses it still gets a retryable answer.
+            error.LeaderNotReady, error.LeaderCatchingUp => try writeErrorResponse(
+                out,
+                "retry",
+                "leader is still applying inherited slots",
+            ),
             error.Unavailable => try writeErrorResponse(out, "unavailable", "node failed"),
             error.SqliteError, error.SqliteBusy => {
                 self.mutex.lockUncancelable(self.io);
@@ -4383,6 +4478,21 @@ pub const Server = struct {
             self.mutex.unlock(self.io);
             defer self.mutex.lockUncancelable(self.io);
             return self.writeNotLeader(out);
+        }
+        // A fresh leader's applied state can miss writes the previous
+        // leader acknowledged until the inherited prefix is applied; the
+        // `leader` and `linearizable` promises both cover those writes.
+        if (level != .any) {
+            self.awaitLeaderFrontier(Node.inheritedPrefixApplied, self.tick_count) catch |err| {
+                if (err != error.NotLeader) {
+                    // A read that waited too long simply retries.
+                    const mapped = if (err == error.OpTimeoutQueued) error.LeaderNotReady else err;
+                    return self.writeWriteError(mapped, out);
+                }
+                self.mutex.unlock(self.io);
+                defer self.mutex.lockUncancelable(self.io);
+                return self.writeNotLeader(out);
+            };
         }
 
         if (request.freshness_ms != null and level != .any) {
@@ -4558,7 +4668,9 @@ pub const Server = struct {
         var fence = FenceWaiter{
             .id = self.next_fence_id,
             .ballot = self.node.log.core.ballot,
-            .fence_slot = self.node.log.decidedThrough(),
+            // The fence must cover every slot chosen before this ballot,
+            // including ones this leader inherited and has not delivered.
+            .fence_slot = @max(self.node.log.decidedThrough(), self.node.log.leaderBase() - 1),
             .needed = self.node.log.core.membership.readQuorum(),
         };
         fence.noteAck(self.node.identity.node_id);
@@ -5130,84 +5242,6 @@ fn writeErrorResponse(out: *Io.Writer, code: []const u8, message: []const u8) !v
     try out.writeAll("}");
 }
 
-fn writeReplacementError(out: *Io.Writer, err: anyerror) !void {
-    const response: struct { code: []const u8, message: []const u8 } = switch (err) {
-        error.StaleConfiguration => .{
-            .code = "stale_configuration",
-            .message = "The expected configuration is no longer active.",
-        },
-        error.UnknownVoter => .{
-            .code = "unknown_voter",
-            .message = "The node being replaced is not a current data voter.",
-        },
-        error.NodeIdNotFresh => .{
-            .code = "node_id_not_fresh",
-            .message = "The replacement node ID has already been allocated.",
-        },
-        error.NodeIdExhausted => .{
-            .code = "node_id_exhausted",
-            .message = "The node ID allocation fence cannot advance.",
-        },
-        error.OperationIdExhausted => .{
-            .code = "operation_id_exhausted",
-            .message = "The replacement operation ID space cannot advance.",
-        },
-        error.ConfigurationIdExhausted => .{
-            .code = "configuration_id_exhausted",
-            .message = "The configuration ID space cannot advance.",
-        },
-        error.InvalidEndpoint => .{
-            .code = "invalid_endpoint",
-            .message = "The replacement endpoint is empty, malformed, or too long.",
-        },
-        error.EndpointInUse => .{
-            .code = "endpoint_in_use",
-            .message = "Another current node already uses the replacement endpoint.",
-        },
-        error.TooFewVoters => .{
-            .code = "too_few_voters",
-            .message = "Replacing a voter would leave an unsupported voter set.",
-        },
-        error.OperationConflict => .{
-            .code = "operation_conflict",
-            .message = "This operation ID is bound to different replacement arguments.",
-        },
-        error.OperationPending => .{
-            .code = "operation_pending",
-            .message = "Another voter replacement is still pending.",
-        },
-        error.OperationHistoryExpired => .{
-            .code = "operation_history_expired",
-            .message = "This operation ID is older than the retained result history.",
-        },
-        error.CorruptPendingOperation => .{
-            .code = "corrupt_pending_operation",
-            .message = "The durable pending replacement record is unreadable.",
-        },
-        error.TransactionOpen, error.WriteInFlight => .{
-            .code = "replacement_busy",
-            .message = "A database write is still in progress.",
-        },
-        error.StorageFailed => .{
-            .code = "storage_failed",
-            .message = "Durable storage failed, so this node cannot replace a voter.",
-        },
-        error.NoDecidedRegistry => .{
-            .code = "no_registry",
-            .message = "This node does not have decided registry membership.",
-        },
-        error.RoleCannotWrite => .{
-            .code = "role_cannot_write",
-            .message = "This node role cannot coordinate a voter replacement.",
-        },
-        else => .{
-            .code = "replace_rejected",
-            .message = @errorName(err),
-        },
-    };
-    return writeErrorResponse(out, response.code, response.message);
-}
-
 fn writeSqlError(out: *Io.Writer, message: []const u8) !void {
     try out.writeAll("{\"ok\":false,\"error\":\"sql\",\"message\":");
     try writeJsonString(out, message);
@@ -5305,6 +5339,10 @@ test "connection admission is sized for a small cluster" {
     server.membership = .init(&empty_generation);
     server.options.max_connections = 0;
     try std.testing.expectEqual(@as(usize, 16), server.connectionLimit());
+}
+
+test "a settled frontier does not admit a failed node or former leader" {
+    try @import("server_frontier_test.zig").check(Node, Server, Server.awaitLeaderFrontier);
 }
 
 test "read fence counts each member once" {

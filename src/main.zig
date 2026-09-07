@@ -118,6 +118,10 @@ const usage_text =
     \\  --enable-failpoints Honor failpoint RPCs (test controllers only).
     \\  --segment-records <n>  Test-only journal segment size (64..16384);
     \\                      requires --enable-failpoints.
+    \\  --test-storage-delay-ms <n>  Test-only delay before every journal
+    \\                      barrier; requires --enable-failpoints.
+    \\  --test-vote-delay-ms <n>  Test-only hold on outgoing phase-two
+    \\                      votes; requires --enable-failpoints.
     \\  --json              Machine-readable output on stdout.
     \\  --no-color          Plain shell output even on a color terminal.
     \\  --no-history        Never write the interactive shell history file.
@@ -167,6 +171,8 @@ const Options = struct {
     retention_slots: ?u64 = null,
     journal_cap_bytes: ?u64 = null,
     segment_records: ?usize = null,
+    test_storage_delay_ms: ?u64 = null,
+    test_vote_delay_ms: ?u64 = null,
     enable_failpoints: bool = false,
     dev_psk: bool = false,
     insecure_test_tcp: bool = false,
@@ -783,6 +789,18 @@ fn serveCommand(
         }
         zaxonlite.segment.rotation_records = records;
     }
+    if ((options.test_storage_delay_ms != null or options.test_vote_delay_ms != null) and
+        !options.enable_failpoints)
+    {
+        // Deterministic takeover scenarios stretch one node's barrier or
+        // hold its votes so an inherited slot stays undecided for a known
+        // window.
+        return usageError(
+            err_out,
+            "--test-storage-delay-ms and --test-vote-delay-ms are test-only; " ++
+                "they require --enable-failpoints",
+        );
+    }
 
     return server.serve(gpa, io, .{
         .directory = data,
@@ -800,6 +818,10 @@ fn serveCommand(
         .admin_principals = options.admins.items,
         .enable_failpoints = options.enable_failpoints,
         .allow_insecure_test_tcp = options.insecure_test_tcp,
+        .test_faults = .{
+            .storage_delay_ms = options.test_storage_delay_ms orelse 0,
+            .vote_delay_ms = options.test_vote_delay_ms orelse 0,
+        },
         .mmap_size = options.mmap_size orelse 0,
         .retention_slots = options.retention_slots orelse 0,
         .journal_cap_bytes = options.journal_cap_bytes orelse
@@ -1574,6 +1596,16 @@ fn parseOptionFlag(
             return optError(err_out, "--segment-records needs a value");
         options.segment_records = std.fmt.parseInt(usize, text, 10) catch
             return optError(err_out, "--segment-records must be an integer");
+    } else if (std.mem.eql(u8, arg, "--test-storage-delay-ms")) {
+        const text = iterator.next() orelse
+            return optError(err_out, "--test-storage-delay-ms needs a value");
+        options.test_storage_delay_ms = std.fmt.parseInt(u64, text, 10) catch
+            return optError(err_out, "--test-storage-delay-ms must be an integer");
+    } else if (std.mem.eql(u8, arg, "--test-vote-delay-ms")) {
+        const text = iterator.next() orelse
+            return optError(err_out, "--test-vote-delay-ms needs a value");
+        options.test_vote_delay_ms = std.fmt.parseInt(u64, text, 10) catch
+            return optError(err_out, "--test-vote-delay-ms must be an integer");
     } else if (std.mem.eql(u8, arg, "--enable-failpoints")) {
         options.enable_failpoints = true;
     } else if (std.mem.eql(u8, arg, "--dev-psk")) {
