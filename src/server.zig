@@ -45,6 +45,7 @@ const durability = @import("durability.zig");
 const configuration = @import("configuration.zig");
 const registry = @import("registry.zig");
 const replacement_error = @import("replacement_error.zig");
+const leader_frontier = @import("leader_frontier.zig");
 
 const Node = node_mod.Node;
 const Log = types.Log;
@@ -4006,14 +4007,7 @@ pub const Server = struct {
         comptime settled: fn (*const Node) bool,
         start_tick: u64,
     ) WriteError!void {
-        self.frontier_waiters += 1;
-        defer self.frontier_waiters -= 1;
-        while (!settled(self.node)) {
-            if (self.failed) return error.Unavailable;
-            if (!self.node.isLeader()) return error.NotLeader;
-            if (self.elapsedMs(start_tick) > op_timeout_ms) return error.OpTimeoutQueued;
-            self.frontier_cond.waitUncancelable(self.io, &self.mutex);
-        }
+        return leader_frontier.awaitReady(self, settled, start_tick, op_timeout_ms);
     }
 
     /// Releases the writer gate, handing it directly to the oldest queued
@@ -5345,6 +5339,10 @@ test "connection admission is sized for a small cluster" {
     server.membership = .init(&empty_generation);
     server.options.max_connections = 0;
     try std.testing.expectEqual(@as(usize, 16), server.connectionLimit());
+}
+
+test "a settled frontier does not admit a failed node or former leader" {
+    try @import("server_frontier_test.zig").check(Node, Server, Server.awaitLeaderFrontier);
 }
 
 test "read fence counts each member once" {
