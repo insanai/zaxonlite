@@ -283,11 +283,15 @@ pub const TestFaults = struct {
     reorder_pairs: bool = false,
     fragment_bytes: u32 = 0,
     storage_delay_ms: u64 = 0,
+    /// Holds this node's phase-two votes for that long before they leave,
+    /// so a re-proposed slot stays undecided for a known window while
+    /// elections and heartbeats run at full speed.
+    vote_delay_ms: u64 = 0,
 
     fn enabled(self: TestFaults) bool {
         return self.drop_every != 0 or self.duplicate_every != 0 or
             self.reorder_pairs or self.fragment_bytes != 0 or
-            self.storage_delay_ms != 0;
+            self.storage_delay_ms != 0 or self.vote_delay_ms != 0;
     }
 };
 
@@ -1077,6 +1081,7 @@ pub const Server = struct {
         self.member_generations.deinit(self.gpa);
         self.fences.deinit(self.gpa);
         self.waiters.deinit(self.gpa);
+        self.held_votes.deinit(self.gpa);
         self.active_connections.deinit(self.gpa);
         self.held.deinit();
         if (self.listener) |*listener| listener.deinit(self.io);
@@ -1717,6 +1722,14 @@ pub const Server = struct {
         if (configuration_id != self.transport_configuration_id) return;
         for (self.node.outbox.items) |envelope| {
             const sender = self.senderFor(envelope.to) orelse continue;
+            const vote_delay = self.options.test_faults.vote_delay_ms;
+            if (vote_delay != 0 and envelope.message == .accepted and !self.releasing_votes) {
+                try self.held_votes.append(self.gpa, .{
+                    .envelope = envelope,
+                    .release_tick = self.tick_count + vote_delay / self.options.tick_ms,
+                });
+                continue;
+            }
             var payload_precedes_envelope = false;
             if (wire.envelopePayloadHash(envelope)) |hash| {
                 if (sender.hasPayloadAck(hash)) {
@@ -1759,6 +1772,24 @@ pub const Server = struct {
             }
         }
         self.node.outbox.clearRetainingCapacity();
+    }
+
+    /// Re-queues votes the `vote_delay_ms` fault parked once their tick
+    /// comes; the ordinary drain sends them.
+    fn releaseHeldVotes(self: *Server) void {
+        var index: usize = 0;
+        while (index < self.held_votes.items.len) {
+            if (self.held_votes.items[index].release_tick > self.tick_count) {
+                index += 1;
+                continue;
+            }
+            const held = self.held_votes.swapRemove(index);
+            self.node.outbox.append(self.gpa, held.envelope) catch {};
+        }
+        if (self.node.outbox.items.len == 0) return;
+        self.releasing_votes = true;
+        defer self.releasing_votes = false;
+        self.pump();
     }
 
     /// Streams the chosen prefix to non-voting storage nodes. These frames
@@ -2017,6 +2048,7 @@ pub const Server = struct {
                     self.failEverything();
                     continue;
                 };
+                self.releaseHeldVotes();
                 self.pump();
                 self.reportLeaderChangeLocked();
                 self.wakeWaiters();

@@ -7,10 +7,16 @@
 //! exactly-once session retry, a configuration change with a stopped
 //! follower (snapshot transfer), image rebuild, and total restart.
 //!
+//! A second scenario covers leadership takeover with an inherited slot
+//! still undecided: concurrent writers during the first election, then a
+//! leader crash between its own vote and the decision, with a witness whose
+//! held votes keep the re-proposed slot open while clients write at the new
+//! leader.
+//!
 //! Every wait is deadline-based on observable conditions. On failure the
 //! controller prints each node's status and recent log tail, then exits 1.
 //!
-//! Usage: cluster-test <path-to-zaxon> [runs]
+//! Usage: cluster-test <path-to-zaxon> [runs] [mandatory|takeover]
 
 const std = @import("std");
 const Io = std.Io;
@@ -26,6 +32,13 @@ const NodeProc = struct {
     directory: []const u8,
     log_path: []const u8,
     child: ?std.process.Child = null,
+    /// Votes but never campaigns or materializes; keeps a takeover
+    /// deterministic by leaving one candidate.
+    witness: bool = false,
+    /// Test-only barrier delay passed to `zaxon serve`.
+    storage_delay_ms: u64 = 0,
+    /// Test-only hold on outgoing phase-two votes.
+    vote_delay_ms: u64 = 0,
 };
 
 const Cluster = struct {
@@ -69,11 +82,26 @@ const Cluster = struct {
             if (peer.id == node.id) continue;
             const peer_text = try std.fmt.allocPrint(
                 self.gpa,
-                "{d}@127.0.0.1:{d}",
-                .{ peer.id, peer.port },
+                "{d}@127.0.0.1:{d}{s}",
+                .{ peer.id, peer.port, if (peer.witness) "/witness" else "" },
             );
             try scratch.append(self.gpa, peer_text);
             try argv.appendSlice(self.gpa, &.{ "--peer", peer_text });
+        }
+        if (node.witness) try argv.appendSlice(self.gpa, &.{ "--role", "witness" });
+        if (node.storage_delay_ms != 0) {
+            const delay_text = try std.fmt.allocPrint(
+                self.gpa,
+                "{d}",
+                .{node.storage_delay_ms},
+            );
+            try scratch.append(self.gpa, delay_text);
+            try argv.appendSlice(self.gpa, &.{ "--test-storage-delay-ms", delay_text });
+        }
+        if (node.vote_delay_ms != 0) {
+            const delay_text = try std.fmt.allocPrint(self.gpa, "{d}", .{node.vote_delay_ms});
+            try scratch.append(self.gpa, delay_text);
+            try argv.appendSlice(self.gpa, &.{ "--test-vote-delay-ms", delay_text });
         }
         try argv.append(self.gpa, "--enable-failpoints");
         try argv.append(self.gpa, "--dev-psk");
@@ -473,10 +501,20 @@ pub fn main(init: std.process.Init) !u8 {
         const text = iterator.next() orelse break :blk @as(usize, 1);
         break :blk std.fmt.parseInt(usize, text, 10) catch 1;
     };
+    // Optional third argument narrows the run to one scenario.
+    const only = iterator.next();
+    const run_mandatory = only == null or std.mem.eql(u8, only.?, "mandatory");
+    const run_takeover = only == null or std.mem.eql(u8, only.?, "takeover");
 
     for (0..runs) |run_index| {
-        std.debug.print("=== cluster run {d}/{d}\n", .{ run_index + 1, runs });
-        try runScenario(gpa, io, zaxon, run_index);
+        if (run_mandatory) {
+            std.debug.print("=== cluster run {d}/{d}\n", .{ run_index + 1, runs });
+            try runScenario(gpa, io, zaxon, run_index);
+        }
+        if (run_takeover) {
+            std.debug.print("=== takeover run {d}/{d}\n", .{ run_index + 1, runs });
+            try runTakeoverScenario(gpa, io, zaxon, run_index);
+        }
     }
     std.debug.print("cluster test: all {d} run(s) passed\n", .{runs});
     return 0;
@@ -970,4 +1008,295 @@ fn runScenario(
     step("stop cluster");
     cluster.killAll();
     std.debug.print("scenario complete\n", .{});
+}
+
+// ----------------------------------------------------------------------
+// Takeover scenario: writes during election and across a leader crash
+// ----------------------------------------------------------------------
+
+/// One client thread of the startup-contention step. Each thread walks
+/// its own endpoint order, so the three land on different nodes while
+/// the first election is still running, exactly the reporter's workload.
+const ContentionWorker = struct {
+    cluster: *Cluster,
+    endpoints: [3]Endpoint,
+    iterations: usize,
+    successes: usize = 0,
+
+    fn run(self: *ContentionWorker) void {
+        // Thread-local allocator: the controller's allocator is not shared.
+        const gpa = std.heap.page_allocator;
+        var completed: usize = 0;
+        var elapsed: u64 = 0;
+        while (completed < self.iterations and elapsed < 60_000) {
+            var result = client.callClusterWithSecret(
+                gpa,
+                self.cluster.io,
+                &self.endpoints,
+                "{\"op\":\"exec\",\"sql\":\"create table if not exists b(id integer " ++
+                    "primary key, v integer); insert into b(v) values(1);\"}",
+                true,
+                cluster_secret,
+            ) catch {
+                elapsed += 100;
+                self.cluster.io.sleep(.fromMilliseconds(100), .awake) catch {};
+                continue;
+            };
+            const parsed = std.json.parseFromSlice(
+                std.json.Value,
+                gpa,
+                result.body,
+                .{},
+            ) catch {
+                result.deinit(gpa);
+                continue;
+            };
+            const ok = isOk(&parsed);
+            parsed.deinit();
+            result.deinit(gpa);
+            completed += 1;
+            if (!ok) continue;
+            self.successes += 1;
+            var read = client.callClusterWithSecret(
+                gpa,
+                self.cluster.io,
+                &self.endpoints,
+                "{\"op\":\"query\",\"sql\":\"select count(*) from b\"," ++
+                    "\"level\":\"linearizable\"}",
+                true,
+                cluster_secret,
+            ) catch continue;
+            read.deinit(gpa);
+        }
+    }
+};
+
+fn anyLogContains(cluster: *Cluster, needle: []const u8) bool {
+    for (cluster.nodes) |node| {
+        const contents = Io.Dir.cwd().readFileAlloc(
+            cluster.io,
+            node.log_path,
+            cluster.gpa,
+            .limited(1 << 20),
+        ) catch continue;
+        defer cluster.gpa.free(contents);
+        if (std.mem.indexOf(u8, contents, needle) != null) return true;
+    }
+    return false;
+}
+
+fn expectDigestsEqual(cluster: *Cluster, first: usize, second: usize, what: []const u8) void {
+    const a = nodeDigest(cluster, cluster.endpoints[first]);
+    const b = nodeDigest(cluster, cluster.endpoints[second]);
+    if (!std.mem.eql(u8, &a.chain, &b.chain) or !std.mem.eql(u8, &a.content, &b.content)) {
+        fail(cluster, "{s}: node {d} and node {d} diverge: chain {s} vs {s}", .{
+            what,
+            cluster.nodes[first].id,
+            cluster.nodes[second].id,
+            a.chain,
+            b.chain,
+        });
+    }
+}
+
+fn runTakeoverScenario(
+    gpa: std.mem.Allocator,
+    io: Io,
+    zaxon: []const u8,
+    run_index: usize,
+) !void {
+    var random_bytes: [8]u8 = undefined;
+    io.random(&random_bytes);
+    const nonce = std.mem.readInt(u64, &random_bytes, .little);
+
+    const root = try std.fmt.allocPrint(
+        gpa,
+        ".zig-cache/tmp/zx-takeover-{x}-{d}",
+        .{ nonce, run_index },
+    );
+    defer gpa.free(root);
+    try Io.Dir.cwd().createDirPath(io, root);
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    const auth_file = try std.fmt.allocPrint(gpa, "{s}/auth.secret", .{root});
+    defer gpa.free(auth_file);
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = auth_file,
+        .data = cluster_secret,
+        .flags = .{ .permissions = @enumFromInt(0o600) },
+    });
+
+    var cluster = Cluster{
+        .gpa = gpa,
+        .io = io,
+        .zaxon = zaxon,
+        .root = root,
+        .auth_file = auth_file,
+        .nodes = undefined,
+        .endpoints = undefined,
+    };
+
+    // Nodes 1 and 2 are the only candidates; their short barrier delay
+    // makes sure a crashing leader's accept has reached its peers. Node 3
+    // votes as a witness whose phase-two votes are held, so a slot the new
+    // leader re-proposes stays undecided for about the hold while the
+    // election itself runs at full speed: the window an unguarded leader
+    // proposes into.
+    for (0..3) |index| {
+        const id: u32 = @intCast(index + 1);
+        const port = try freePort(io);
+        cluster.nodes[index] = .{
+            .id = id,
+            .port = port,
+            .directory = try std.fmt.allocPrint(gpa, "{s}/n{d}", .{ root, id }),
+            .log_path = try std.fmt.allocPrint(gpa, "{s}/n{d}.log", .{ root, id }),
+            .witness = index == 2,
+            .storage_delay_ms = if (index == 2) 0 else 100,
+            .vote_delay_ms = if (index == 2) 1500 else 0,
+        };
+        const host = std.fmt.bufPrint(
+            &cluster.host_buffers[index],
+            "127.0.0.1",
+            .{},
+        ) catch unreachable;
+        cluster.endpoints[index] = .{ .host = host, .port = port };
+    }
+    defer for (cluster.nodes) |node| {
+        gpa.free(node.directory);
+        gpa.free(node.log_path);
+    };
+    defer cluster.killAll();
+
+    step("start two data voters and a slow witness");
+    for (0..3) |index| try cluster.spawnNode(index, false);
+
+    step("three clients write concurrently through the first election");
+    var workers: [3]ContentionWorker = undefined;
+    for (&workers, 0..) |*worker, offset| {
+        worker.* = .{ .cluster = &cluster, .endpoints = undefined, .iterations = 12 };
+        for (0..3) |k| worker.endpoints[k] = cluster.endpoints[(k + offset) % 3];
+    }
+    var threads: [3]std.Thread = undefined;
+    for (&workers, &threads) |*worker, *thread| {
+        thread.* = try std.Thread.spawn(.{}, ContentionWorker.run, .{worker});
+    }
+    for (&threads) |*thread| thread.join();
+    var acknowledged: usize = 0;
+    for (workers) |worker| acknowledged += worker.successes;
+    if (acknowledged == 0) fail(&cluster, "no concurrent write was acknowledged", .{});
+    if (anyLogContains(&cluster, "ChainMismatch")) {
+        fail(&cluster, "ChainMismatch during concurrent startup writes", .{});
+    }
+    {
+        const body = mustCall(
+            &cluster,
+            "{\"op\":\"query\",\"sql\":\"select count(*) from b\"," ++
+                "\"level\":\"linearizable\"}",
+            15_000,
+        );
+        defer cluster.gpa.free(body);
+        const rows = firstCell(&cluster, body);
+        if (rows < @as(i64, @intCast(acknowledged))) {
+            fail(&cluster, "{d} writes acknowledged but {d} rows visible", .{
+                acknowledged,
+                rows,
+            });
+        }
+    }
+
+    step("seed table t and wait for both data voters to apply it");
+    execSql(&cluster, "create table t(a integer primary key, b text)", 15_000);
+    execSql(&cluster, "insert into t(b) values ('seed')", 15_000);
+    {
+        const status_body = mustCall(&cluster, "{\"op\":\"status\"}", 10_000);
+        const parsed = parse(&cluster, status_body);
+        const target_applied = fieldInt(&parsed, "applied_slot") orelse 0;
+        parsed.deinit();
+        cluster.gpa.free(status_body);
+        for (0..2) |index| {
+            waitFor(
+                &cluster,
+                cluster.endpoints[index],
+                appliedAtLeast,
+                target_applied,
+                30_000,
+                "applied slot",
+            );
+        }
+    }
+    expectDigestsEqual(&cluster, 0, 1, "before takeover");
+
+    step("arm the leader to die after its own vote, before the decision");
+    const old_leader = leaderIndex(&cluster);
+    if (old_leader == 2) fail(&cluster, "the witness must never lead", .{});
+    {
+        const body = rpcTry(
+            &cluster,
+            cluster.endpoints[old_leader],
+            "{\"op\":\"failpoint\",\"name\":\"after_accept_sync\"}",
+        ) orelse fail(&cluster, "failpoint rpc failed", .{});
+        cluster.gpa.free(body);
+    }
+
+    step("submit a write the crash leaves accepted but undecided");
+    if (rpcTry(
+        &cluster,
+        cluster.endpoints[old_leader],
+        "{\"op\":\"exec\",\"sql\":\"insert into t(b) values ('inflight')\"}",
+    )) |body| {
+        cluster.gpa.free(body);
+    }
+    cluster.waitNodeExit(old_leader);
+
+    step("write at the new leader while the inherited slot is still open");
+    const start = std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds;
+    execSql(&cluster, "insert into t(b) values ('after')", 30_000);
+    const waited_ms = @divTrunc(
+        std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds - start,
+        std.time.ns_per_ms,
+    );
+    std.debug.print("first write after takeover took {d} ms\n", .{waited_ms});
+    if (anyLogContains(&cluster, "ChainMismatch")) {
+        fail(&cluster, "ChainMismatch after takeover", .{});
+    }
+
+    step("the recovered write and the new write are both visible once");
+    for ([_][]const u8{ "inflight", "after" }) |marker| {
+        var request: std.Io.Writer.Allocating = .init(gpa);
+        defer request.deinit();
+        request.writer.print(
+            "{{\"op\":\"query\",\"sql\":\"select count(*) from t where b = '{s}'\"," ++
+                "\"level\":\"linearizable\"}}",
+            .{marker},
+        ) catch unreachable;
+        const body = mustCall(&cluster, request.written(), 15_000);
+        defer cluster.gpa.free(body);
+        const count = firstCell(&cluster, body);
+        if (count != 1) fail(&cluster, "row '{s}' visible {d} times", .{ marker, count });
+    }
+
+    step("restart the crashed leader and compare the data voters");
+    try cluster.spawnNode(old_leader, false);
+    {
+        const status_body = mustCall(&cluster, "{\"op\":\"status\"}", 10_000);
+        const parsed = parse(&cluster, status_body);
+        const target_applied = fieldInt(&parsed, "applied_slot") orelse 0;
+        parsed.deinit();
+        cluster.gpa.free(status_body);
+        waitFor(
+            &cluster,
+            cluster.endpoints[old_leader],
+            appliedAtLeast,
+            target_applied,
+            30_000,
+            "catch-up after restart",
+        );
+    }
+    if (anyLogContains(&cluster, "ChainMismatch")) {
+        fail(&cluster, "ChainMismatch during replay after restart", .{});
+    }
+    expectDigestsEqual(&cluster, 0, 1, "after takeover");
+
+    step("stop cluster");
+    cluster.killAll();
+    std.debug.print("takeover scenario complete\n", .{});
 }
