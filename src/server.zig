@@ -2054,28 +2054,23 @@ pub const Server = struct {
                     }
                 }
 
-                // A member that observes a further-ahead leader asks for
-                // the decided suffix it is missing. When repeated range
-                // recovery makes no progress the gap sits below cluster
-                // retention, and only a full-image transfer closes it.
-                if (self.tick_count % 20 == 0 and !self.node.isLeader()) {
-                    if (self.node.currentLeader()) |leader| {
+                // Every 20 ticks a member that is missing decided slots asks
+                // for them: a follower from the leader it observed ahead, a
+                // leader from any peer while it still owes itself slots
+                // chosen under an earlier ballot (phase one sends the learn
+                // request once). Repeated stalls mean the gap is below
+                // retention and only a transfer closes it; installing one
+                // demotes a leader, so a caught-up voter leads instead.
+                if (self.tick_count % 20 == 0) {
+                    if (self.node.isLeader()) {
+                        if (!self.node.inheritedPrefixApplied()) {
+                            if (self.nextRecoveryPeer()) |peer| self.recoverFromPeer(peer);
+                        }
+                    } else if (self.node.currentLeader()) |leader| {
                         if (leader != self.node.identity.node_id and
                             self.observed_leader_decided > self.node.log.decidedThrough())
                         {
-                            const decided = self.node.log.decidedThrough();
-                            if (decided > self.catch_up_last_decided) {
-                                self.catch_up_last_decided = decided;
-                                self.catch_up_stalled = 0;
-                            } else {
-                                self.catch_up_stalled += 1;
-                            }
-                            if (self.catch_up_stalled >= 10) {
-                                self.catch_up_stalled = 0;
-                                self.requestSnapshot(leader);
-                            }
-                            self.node.requestCatchUp(leader) catch {};
-                            self.pump();
+                            self.recoverFromPeer(leader);
                         }
                     }
                 }
@@ -2095,6 +2090,24 @@ pub const Server = struct {
                 };
             }
         }
+    }
+
+    /// Asks `peer` for the decided suffix this node is missing; after ten
+    /// probes without progress it requests a full-image transfer instead.
+    fn recoverFromPeer(self: *Server, peer: paxos.NodeId) void {
+        const decided = self.node.log.decidedThrough();
+        if (decided > self.catch_up_last_decided) {
+            self.catch_up_last_decided = decided;
+            self.catch_up_stalled = 0;
+        } else {
+            self.catch_up_stalled += 1;
+        }
+        if (self.catch_up_stalled >= 10) {
+            self.catch_up_stalled = 0;
+            self.requestSnapshot(peer);
+        }
+        self.node.requestCatchUp(peer) catch {};
+        self.pump();
     }
 
     /// Called with the server mutex held after a protocol transition.
