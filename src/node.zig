@@ -3587,13 +3587,7 @@ pub const Node = struct {
                         self.releaseLease(complete.lease_id);
                     },
                     .transaction_batch => |batch| {
-                        if (batch.database_id != self.identity.database_id or
-                            !std.mem.eql(u8, &batch.base_chain_hash, &self.last_chain) or
-                            batch.base_data_slot != self.last_data_slot or
-                            !command.chainValid(batch))
-                        {
-                            return error.ChainMismatch;
-                        }
+                        try self.checkChainBase(entry.slot, batch);
                         if (self.capture_batch_id) |pending| {
                             self.capture_batch_id = null;
                             if (pending != batch.batch_id) {
@@ -3642,6 +3636,38 @@ pub const Node = struct {
                 .{ .slot = entry.slot, .hash = self.history_hash };
             self.applied_slot = entry.slot;
         }
+    }
+
+    /// Verifies that a decided batch extends the chain this node has
+    /// applied. A mismatch is fatal and never repaired silently; the log
+    /// line names the failing check so an operator can tell a stale base
+    /// (ordering) from a foreign database or a corrupt descriptor.
+    fn checkChainBase(
+        self: *const Node,
+        slot: paxos.Slot,
+        batch: command.TransactionBatch,
+    ) error{ChainMismatch}!void {
+        const database_ok = batch.database_id == self.identity.database_id;
+        const chain_ok = std.mem.eql(u8, &batch.base_chain_hash, &self.last_chain);
+        const base_slot_ok = batch.base_data_slot == self.last_data_slot;
+        const self_ok = command.chainValid(batch);
+        if (database_ok and chain_ok and base_slot_ok and self_ok) return;
+        std.log.err(
+            "chain mismatch at slot {d}: batch {x:0>32} base slot {d} " ++
+                "(applied {d}) base chain {x}.. (applied {x}..) " ++
+                "database match {} descriptor self-check {}",
+            .{
+                slot,
+                batch.batch_id,
+                batch.base_data_slot,
+                self.last_data_slot,
+                batch.base_chain_hash[0..8],
+                self.last_chain[0..8],
+                database_ok,
+                self_ok,
+            },
+        );
+        return error.ChainMismatch;
     }
 
     fn delayStorage(self: *Node) void {
@@ -3912,13 +3938,7 @@ pub const Node = struct {
                 // finished by the pending-handover path after open.
                 .noop, .read_barrier, .trim, .transfer_lease, .lease_complete => {},
                 .transaction_batch => |batch| {
-                    if (batch.database_id != self.identity.database_id or
-                        !std.mem.eql(u8, &batch.base_chain_hash, &self.last_chain) or
-                        batch.base_data_slot != self.last_data_slot or
-                        !command.chainValid(batch))
-                    {
-                        return error.ChainMismatch;
-                    }
+                    try self.checkChainBase(slot, batch);
                     const payload = self.store.load(self.gpa, batch.payload_hash) catch {
                         // A committed descriptor without payload bytes:
                         // this node must not serve.

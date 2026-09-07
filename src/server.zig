@@ -2568,7 +2568,7 @@ pub const Server = struct {
         }
 
         self.node.stepEnvelope(envelope) catch |err| {
-            std.log.warn("step failure: {s}", .{@errorName(err)});
+            std.log.err("step failure: {s}", .{@errorName(err)});
             self.failed = true;
             self.failEverything();
             return;
@@ -2672,7 +2672,7 @@ pub const Server = struct {
             self.held_total -= 1;
             for (entry.value.envelopes[0..entry.value.count]) |envelope| {
                 self.node.stepEnvelope(envelope) catch |err| {
-                    std.log.warn("step failure: {s}", .{@errorName(err)});
+                    std.log.err("step failure: {s}", .{@errorName(err)});
                     self.failed = true;
                     self.failEverything();
                     return;
