@@ -120,72 +120,122 @@ fn printStatusPlain(status: zaxonlite.node.Status, out: *std.Io.Writer) !void {
     });
 }
 
+const remote_hints = [_]struct { code: []const u8, hint: []const u8 }{
+    .{
+        .code = "not_leader",
+        .hint = "Retry the advertised leader or restore a voter quorum.",
+    },
+    .{
+        .code = "retry",
+        .hint = "Retry the same request shortly; the leader is still catching up or changed.",
+    },
+    .{
+        .code = "timeout",
+        .hint = "Retry; a queued timeout never executed, otherwise use an idempotent session.",
+    },
+    .{
+        .code = "ambiguous",
+        .hint = "Retry through an idempotent session so an applied write is not repeated.",
+    },
+    .{
+        .code = "unavailable",
+        .hint = "Retry another member and read this node's log for the failure.",
+    },
+    .{
+        .code = "stale",
+        .hint = "Wait for learner catch-up, relax freshness, or query the leader.",
+    },
+    .{
+        .code = "sql",
+        .hint = "Correct the SQL statement; use exec for statements that write.",
+    },
+    .{
+        .code = "session",
+        .hint = "Retry only the latest sequence in the same unexpired session.",
+    },
+    .{
+        .code = "stale_configuration",
+        .hint = "Read membership status and retry with its configuration ID.",
+    },
+    .{
+        .code = "unknown_voter",
+        .hint = "Read membership status and choose one listed data voter.",
+    },
+    .{
+        .code = "node_id_not_fresh",
+        .hint = "Choose a node ID above highest_allocated_node_id.",
+    },
+    .{
+        .code = "node_id_exhausted",
+        .hint = "No further voter replacement is safe for this database.",
+    },
+    .{
+        .code = "operation_id_exhausted",
+        .hint = "No further voter replacement is safe for this database.",
+    },
+    .{
+        .code = "configuration_id_exhausted",
+        .hint = "No further voter replacement is safe for this database.",
+    },
+    .{
+        .code = "invalid_endpoint",
+        .hint = "Use a printable host:port endpoint within the documented length bound.",
+    },
+    .{
+        .code = "endpoint_in_use",
+        .hint = "Choose an endpoint that is not assigned to a current node.",
+    },
+    .{
+        .code = "too_few_voters",
+        .hint = "Restore at least three healthy voters before replacing one.",
+    },
+    .{
+        .code = "operation_conflict",
+        .hint = "Reuse the exact original arguments or submit a newer operation ID.",
+    },
+    .{
+        .code = "operation_pending",
+        .hint = "Query membership status and wait for the pending operation to finish.",
+    },
+    .{
+        .code = "operation_history_expired",
+        .hint = "Read membership status, then submit a new operation ID.",
+    },
+    .{
+        .code = "corrupt_pending_operation",
+        .hint = "Stop the node and restore its membership metadata from a verified backup.",
+    },
+    .{
+        .code = "replacement_busy",
+        .hint = "Wait for the current write to finish, then retry the same operation.",
+    },
+    .{
+        .code = "storage_failed",
+        .hint = "Repair durable storage and restart the node before retrying.",
+    },
+    .{
+        .code = "no_registry",
+        .hint = "Run voter replacement only on a registry-backed network cluster.",
+    },
+    .{
+        .code = "role_cannot_write",
+        .hint = "Retry the data-voter leader advertised by node status.",
+    },
+};
+
 pub fn remoteHint(code: []const u8) []const u8 {
-    if (std.mem.eql(u8, code, "not_leader")) {
-        return "Retry the advertised leader or restore a voter quorum.";
-    }
-    if (std.mem.eql(u8, code, "stale")) {
-        return "Wait for learner catch-up, relax freshness, or query the leader.";
-    }
-    if (std.mem.eql(u8, code, "sql")) {
-        return "Correct the SQL statement; use exec for statements that write.";
-    }
-    if (std.mem.eql(u8, code, "session")) {
-        return "Retry only the latest sequence in the same unexpired session.";
-    }
-    if (std.mem.eql(u8, code, "stale_configuration")) {
-        return "Read membership status and retry with its configuration ID.";
-    }
-    if (std.mem.eql(u8, code, "unknown_voter")) {
-        return "Read membership status and choose one listed data voter.";
-    }
-    if (std.mem.eql(u8, code, "node_id_not_fresh")) {
-        return "Choose a node ID above highest_allocated_node_id.";
-    }
-    if (std.mem.eql(u8, code, "node_id_exhausted") or
-        std.mem.eql(u8, code, "operation_id_exhausted") or
-        std.mem.eql(u8, code, "configuration_id_exhausted"))
-    {
-        return "No further voter replacement is safe for this database.";
-    }
-    if (std.mem.eql(u8, code, "invalid_endpoint")) {
-        return "Use a printable host:port endpoint within the documented length bound.";
-    }
-    if (std.mem.eql(u8, code, "endpoint_in_use")) {
-        return "Choose an endpoint that is not assigned to a current node.";
-    }
-    if (std.mem.eql(u8, code, "too_few_voters")) {
-        return "Restore at least three healthy voters before replacing one.";
-    }
-    if (std.mem.eql(u8, code, "operation_conflict")) {
-        return "Reuse the exact original arguments or submit a newer operation ID.";
-    }
-    if (std.mem.eql(u8, code, "operation_pending")) {
-        return "Query membership status and wait for the pending operation to finish.";
-    }
-    if (std.mem.eql(u8, code, "operation_history_expired")) {
-        return "Read membership status, then submit a new operation ID.";
-    }
-    if (std.mem.eql(u8, code, "corrupt_pending_operation")) {
-        return "Stop the node and restore its membership metadata from a verified backup.";
-    }
-    if (std.mem.eql(u8, code, "replacement_busy")) {
-        return "Wait for the current write to finish, then retry the same operation.";
-    }
-    if (std.mem.eql(u8, code, "storage_failed")) {
-        return "Repair durable storage and restart the node before retrying.";
-    }
-    if (std.mem.eql(u8, code, "no_registry")) {
-        return "Run voter replacement only on a registry-backed network cluster.";
-    }
-    if (std.mem.eql(u8, code, "role_cannot_write")) {
-        return "Retry the data-voter leader advertised by node status.";
+    for (remote_hints) |entry| {
+        if (std.mem.eql(u8, entry.code, code)) return entry.hint;
     }
     return "Inspect node status and retry only when the reported condition is resolved.";
 }
 
 test "replacement errors have specific operator hints" {
     const codes = [_][]const u8{
+        "retry",
+        "timeout",
+        "ambiguous",
+        "unavailable",
         "stale_configuration",
         "node_id_not_fresh",
         "operation_conflict",

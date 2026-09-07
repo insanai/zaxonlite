@@ -3655,7 +3655,10 @@ pub const Node = struct {
         std.log.err(
             "chain mismatch at slot {d}: batch {x:0>32} base slot {d} " ++
                 "(applied {d}) base chain {x}.. (applied {x}..) " ++
-                "database match {} descriptor self-check {}",
+                "database match {} descriptor self-check {}; hint: keep this " ++
+                "data directory and line for the report, replace only this " ++
+                "member by state transfer if its peers serve, and restore " ++
+                "from backup if every member reports the same slot",
             .{
                 slot,
                 batch.batch_id,
