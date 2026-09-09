@@ -6,7 +6,7 @@
 # and test the installed artifacts before a separate job can publish them.
 #
 # Cut a release by pushing the version declared in build.zig.zon:
-#   git tag v0.6.0 && git push origin v0.6.0
+#   git tag v0.6.2 && git push origin v0.6.2
 # Before tagging, bump `.version` in build.zig.zon and the library version
 # string so `zaxon version` reports the tag.
 #
@@ -416,9 +416,18 @@ jobs:
         with:
           files: release/*
           body: |
-            zaxonlite 0.6.0 introduces lifetime-global Paxos slots, a bounded
-            reusable consensus window, continuous segmented-journal trimming,
-            durable state anchors, and beyond-retention replica transfer.
+            Zaxonlite 0.6.2 fixes shutdown with pending consensus operations,
+            interrupts stalled peer authentication, and bounds client connection
+            establishment and embedded startup with monotonic deadlines.
+            Requests are no longer automatically replayed after transmission
+            begins; uncertain writes require session-based retries.
+
+            Retained journal reads now validate sealed segments and stop before
+            their trailers, fixing false corruption during resynchronization,
+            recovery, range catch-up, and integrity checks after rotation.
+
+            Paxos, Zaxonlite, the CLI UI, Python SDK, and books are aligned on
+            0.6.2. Wire protocol 9 and journal format 2 are unchanged from 0.6.1.
 
             This release includes self-contained `zaxon` CLI archives and
             CPython 3.12+ Stable ABI wheels for Linux x86-64, macOS, and
