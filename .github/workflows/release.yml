@@ -422,6 +422,10 @@ jobs:
             Requests are no longer automatically replayed after transmission
             begins; uncertain writes require session-based retries.
 
+            macOS TCP and Unix connections avoid Zig 0.16's interrupted-connect
+            panic, including certificate enrollment, while preserving deadlines
+            and blocking stream behavior after connection establishment.
+
             Retained journal reads now validate sealed segments and stop before
             their trailers, fixing false corruption during resynchronization,
             recovery, range catch-up, and integrity checks after rotation.
