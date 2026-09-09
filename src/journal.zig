@@ -360,7 +360,9 @@ pub const Journal = struct {
                     const entry = self.journal.segments.items[self.segment_index];
                     var name_buffer: [20]u8 = undefined;
                     const name = segmentName(&name_buffer, entry.first_slot);
-                    self.reader = segment.Reader.open(
+                    // Manifest entries are sealed: validate their digest and
+                    // stop at the records boundary, before the trailer.
+                    self.reader = segment.Reader.openSealed(
                         self.journal.io,
                         self.journal.dir,
                         name,
@@ -806,4 +808,69 @@ test "a trim anchor inside a retained segment survives reopening" {
     try testing.expectEqual(anchor, reopened.trimmed_through);
     try testing.expectEqual(retained_first, reopened.retainedFirstSlot());
     try testing.expect(durable.committedAt(2 * segment.capacity_records + 10) != null);
+}
+
+test "retained iteration crosses sealed trailers and reaches the active segment" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var journal = try Journal.create(io, testing.allocator, tmp.dir, 42);
+    defer journal.close();
+    try journal.appendWrites(&.{ testWrite(1), testWrite(2) });
+    try journal.rotate();
+    try journal.appendWrites(&.{ testWrite(3), testWrite(4) });
+    try journal.rotate();
+    try journal.appendWrites(&.{testWrite(5)});
+    try journal.sync();
+
+    try expectRetainedSlots(&journal, 1, 5);
+    try expectRetainedSlots(&journal, 3, 5);
+    const Sink = struct {
+        next: u64 = 2,
+        fn accept(self: *@This(), slot: u64, value: types.Entry) !void {
+            try testing.expectEqual(self.next, slot);
+            try testing.expectEqualDeep(testWrite(slot).commit.value, value);
+            self.next += 1;
+        }
+    };
+    var sink = Sink{};
+    try journal.serveRange(2, 3, &sink, Sink.accept);
+    try testing.expectEqual(@as(u64, 5), sink.next);
+
+    journal.noteTrimAnchor(1, 2, [_]u8{7} ** 32);
+    try testing.expect(try journal.trimThrough(2));
+    try expectRetainedSlots(&journal, 3, 5);
+}
+
+fn expectRetainedSlots(journal: *Journal, first: u64, last: u64) !void {
+    var it = try journal.iterate(first);
+    defer it.close();
+    var expected = first;
+    while (try it.next()) |write| {
+        try testing.expectEqualDeep(testWrite(expected), write);
+        expected += 1;
+    }
+    try testing.expectEqual(last + 1, expected);
+}
+
+test "retained iteration rejects a damaged sealed digest before yielding records" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var journal = try Journal.create(io, testing.allocator, tmp.dir, 42);
+    defer journal.close();
+    try journal.appendWrites(&.{ testWrite(1), testWrite(2) });
+    try journal.rotate();
+    const file = try journal.dir.openFile(io, "0000000000000001.zxj", .{ .mode = .read_write });
+    defer file.close(io);
+    // The digest is immediately before the four-byte trailer length. Record
+    // CRCs remain valid, so only sealed-segment validation catches this damage.
+    const offset = try file.length(io) - 5;
+    var byte: [1]u8 = undefined;
+    try testing.expectEqual(@as(usize, 1), try file.readPositionalAll(io, &byte, offset));
+    byte[0] ^= 1;
+    try file.writePositionalAll(io, &byte, offset);
+    var it = try journal.iterate(1);
+    defer it.close();
+    try testing.expectError(error.CorruptJournal, it.next());
 }

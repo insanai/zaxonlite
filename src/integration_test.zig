@@ -228,7 +228,10 @@ test "a data directory cannot silently change learner role" {
     );
 }
 
-test "journal is authoritative: materialized image rebuilds from scratch" {
+test "journal is authoritative: materialized image rebuilds across sealed segments" {
+    const saved_rotation = zaxonlite.segment.rotation_records;
+    zaxonlite.segment.rotation_records = 4;
+    defer zaxonlite.segment.rotation_records = saved_rotation;
     const gpa = testing.allocator;
     var test_dir = try TestDir.init(gpa);
     defer test_dir.deinit(gpa);
@@ -242,6 +245,11 @@ test "journal is authoritative: materialized image rebuilds from scratch" {
         _ = try node.exec("insert into items(v) values ('tea'), ('coffee'), ('water')");
         _ = try node.exec("update items set v = v || '!' where id = 2");
         _ = try node.exec("delete from items where id = 3");
+        try testing.expect(node.journal.segments.items.len > 0);
+        // Leadership loss rebuilds in-process; restart below exercises the
+        // same retained iterator after the materialized image has been lost.
+        try node.resyncImage();
+        try testing.expectEqual(@as(i64, 2), try countItems(node));
     }
 
     // Destroy the materialized SQLite image; only journal + payloads remain.
