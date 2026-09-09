@@ -1,6 +1,8 @@
 //! Monotonic connection deadlines and scoped cancellation of blocking TLS I/O.
 const std = @import("std");
 const Io = std.Io;
+const builtin = @import("builtin");
+const macos = @import("net_connect_macos.zig");
 
 pub fn after(io: Io, milliseconds: u64) Io.Clock.Timestamp {
     return .{
@@ -26,13 +28,19 @@ pub fn connectIp(io: Io, address: Io.net.IpAddress, deadline: ?Io.Clock.Timestam
     return connectUntil(io, dialIp, .{ io, address }, deadline);
 }
 
-fn dialIp(io: Io, address: Io.net.IpAddress) Io.net.IpAddress.ConnectError!Io.net.Stream {
+fn dialIp(io: Io, address: Io.net.IpAddress) anyerror!Io.net.Stream {
+    if (builtin.os.tag == .macos) return macos.connectIp(io, address);
     return address.connect(io, .{ .mode = .stream });
 }
 
 pub fn connectUnix(io: Io, path: []const u8, deadline: ?Io.Clock.Timestamp) !Io.net.Stream {
     const address = try Io.net.UnixAddress.init(path);
-    return connectUntil(io, Io.net.UnixAddress.connect, .{ &address, io }, deadline);
+    return connectUntil(io, dialUnix, .{ io, &address }, deadline);
+}
+
+fn dialUnix(io: Io, address: *const Io.net.UnixAddress) anyerror!Io.net.Stream {
+    if (builtin.os.tag == .macos) return macos.connectUnix(io, address);
+    return address.connect(io);
 }
 
 /// Zig 0.16 Threaded panics on TCP ConnectOptions.timeout; Unix connect has
