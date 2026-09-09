@@ -24,6 +24,7 @@ extern "c" fn renameatx_np(
 const tls = @import("tls.zig");
 const wire = @import("wire.zig");
 const client = @import("client.zig");
+const deadlines = @import("net_deadline.zig");
 const durability = @import("durability.zig");
 const configuration = @import("configuration.zig");
 
@@ -387,7 +388,7 @@ pub fn requestCertificate(
     var context = try tls.Context.initEnrollmentClient(bundle.ca_pem);
     defer context.deinit();
     const address = try std.Io.net.IpAddress.parse(endpoint.host, endpoint.port);
-    var stream = try address.connect(io, .{ .mode = .stream });
+    var stream = try deadlines.connectIp(io, address, null);
     defer stream.close(io);
     var read_buffer: [64 * 1024]u8 = undefined;
     var write_buffer: [64 * 1024]u8 = undefined;
