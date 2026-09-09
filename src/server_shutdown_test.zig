@@ -6,6 +6,7 @@ const deadlines = @import("net_deadline.zig");
 const waits = @import("server_waiters.zig");
 
 pub fn check(comptime Server: type, comptime api: anytype) !void {
+    try checkShutdownGrace(Server, api.shutdown);
     const Harness = struct {
         server: *Server,
         mode: enum { writer, frontier, applied, pending, fence },
@@ -154,4 +155,60 @@ fn awaitFence(server: anytype) !void {
     try server.fences.append(server.gpa, &fence);
     defer server.fences.clearRetainingCapacity();
     try fence.awaitQuorum(server, 0, 10_000);
+}
+
+/// A slow scheduler and a spurious wakeup must not extend the RPC grace period.
+/// Virtual time keeps this regression independent of the host's scheduling load.
+const GraceClock = struct {
+    elapsed: i96 = 0,
+    sleeps: usize = 0,
+    waits: usize = 0,
+
+    fn now(context: ?*anyopaque, _: Io.Clock) Io.Timestamp {
+        const self: *GraceClock = @ptrCast(@alignCast(context.?));
+        return .{ .nanoseconds = self.elapsed };
+    }
+
+    fn sleep(context: ?*anyopaque, _: Io.Timeout) Io.Cancelable!void {
+        const self: *GraceClock = @ptrCast(@alignCast(context.?));
+        self.sleeps += 1;
+        self.elapsed += 10 * std.time.ns_per_ms;
+    }
+
+    fn wait(context: ?*anyopaque, _: *const u32, _: u32, timeout: Io.Timeout) Io.Cancelable!void {
+        const self: *GraceClock = @ptrCast(@alignCast(context.?));
+        // Every retry must retain the same absolute deadline, including after
+        // the first, deliberately spurious wakeup.
+        std.debug.assert(timeout == .deadline);
+        std.debug.assert(timeout.deadline.clock == .awake);
+        std.debug.assert(timeout.deadline.raw.nanoseconds == 250 * std.time.ns_per_ms);
+        self.waits += 1;
+        if (self.waits > 1) self.elapsed = 300 * std.time.ns_per_ms;
+    }
+};
+
+fn checkShutdownGrace(comptime Server: type, comptime shutdown: anytype) !void {
+    var vtable = std.testing.io.vtable.*;
+    vtable.now = GraceClock.now;
+    vtable.sleep = GraceClock.sleep;
+    vtable.futexWait = GraceClock.wait;
+    for (0..3) |mode| {
+        var clock = GraceClock{};
+        var server = Server{
+            .gpa = std.testing.allocator,
+            .io = .{ .vtable = &vtable, .userdata = &clock },
+            .node = undefined,
+            .options = .{ .directory = "", .node_id = 1 },
+            .membership = undefined,
+            .transport_configuration_id = 1,
+            .held = undefined,
+            .shutdown_flag = .init(true),
+            .stop_response_requested = mode != 0,
+            .stop_response_sent = if (mode == 2) .is_set else .unset,
+        };
+        shutdown(&server);
+        try std.testing.expectEqual(@as(usize, 0), clock.sleeps);
+        try std.testing.expectEqual(@as(usize, if (mode == 1) 2 else 0), clock.waits);
+        try std.testing.expect(clock.elapsed <= 300 * std.time.ns_per_ms);
+    }
 }
