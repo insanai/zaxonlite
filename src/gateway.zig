@@ -8,6 +8,7 @@ const std = @import("std");
 const Io = std.Io;
 const client = @import("client.zig");
 const diagnostic = @import("diagnostic.zig");
+const deadlines = @import("net_deadline.zig");
 
 pub const Options = struct {
     listen_host: []const u8 = "127.0.0.1",
@@ -47,13 +48,17 @@ pub fn serve(
         try err_out.flush();
         return 4;
     };
-    defer listener.deinit(io);
+    var listener_open = true;
+    defer if (listener_open) listener.deinit(io);
     var runtime = Runtime{ .gpa = gpa, .io = io };
     defer runtime.deinit();
 
     var next: usize = 0;
     var exit_code: u8 = 0;
     while (true) {
+        if (options.shutdown_flag) |flag| {
+            if (flag.load(.acquire)) break;
+        }
         const inbound = listener.accept(io) catch |err| switch (err) {
             error.ConnectionAborted => continue,
             else => {
@@ -69,6 +74,8 @@ pub fn serve(
         }
         next = handleInboundConnection(gpa, io, &runtime, inbound, options, next);
     }
+    listener.deinit(io);
+    listener_open = false;
     runtime.shutdown();
     runtime.wait();
     return exit_code;
@@ -86,7 +93,7 @@ fn handleInboundConnection(
         inbound.close(io);
         return next;
     };
-    if (!runtime.tryStarted(inbound, options.max_connections)) {
+    if (!runtime.tryStarted(inbound, options.max_connections, true)) {
         gpa.destroy(context);
         inbound.close(io);
         return next;
@@ -131,10 +138,12 @@ const Proxy = struct {
 
     fn run(self: *Proxy) void {
         defer self.gpa.destroy(self);
-        defer self.owner.finished(self.inbound);
         defer self.inbound.close(self.io);
+        defer self.owner.finished(self.inbound);
         var outbound = self.connect() orelse return;
         defer outbound.close(self.io);
+        if (!self.owner.tryStarted(outbound, 0, false)) return;
+        defer self.owner.finished(outbound);
 
         var upload = Copy{
             .io = self.io,
@@ -154,23 +163,32 @@ const Proxy = struct {
     fn connect(self: *Proxy) ?std.Io.net.Stream {
         var offset: usize = 0;
         while (offset < self.backends.len) : (offset += 1) {
+            if (self.owner.isStopping()) return null;
             const backend = self.backends[(self.first + offset) % self.backends.len];
             const address = std.Io.net.IpAddress.parse(
                 backend.host,
                 backend.port,
             ) catch continue;
-            return address.connect(self.io, .{ .mode = .stream }) catch continue;
+            return deadlines.connectIp(
+                self.io,
+                address,
+                deadlines.after(self.io, 1000),
+            ) catch continue;
         }
         return null;
     }
 };
 
 const Runtime = struct {
+    const Tracked = struct { stream: Io.net.Stream, inbound: bool };
+
     gpa: std.mem.Allocator,
     io: Io,
     mutex: std.Io.Mutex = .init,
     cond: std.Io.Condition = .init,
-    active: std.ArrayList(std.Io.net.Stream) = .empty,
+    active: std.ArrayList(Tracked) = .empty,
+    inbound_count: usize = 0,
+    stopping: bool = false,
 
     fn deinit(self: *Runtime) void {
         self.active.deinit(self.gpa);
@@ -180,18 +198,21 @@ const Runtime = struct {
         self: *Runtime,
         stream: std.Io.net.Stream,
         limit: usize,
+        inbound: bool,
     ) bool {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        if (self.active.items.len >= limit) return false;
-        self.active.append(self.gpa, stream) catch return false;
+        if (self.stopping or (inbound and self.inbound_count >= limit)) return false;
+        self.active.append(self.gpa, .{ .stream = stream, .inbound = inbound }) catch return false;
+        if (inbound) self.inbound_count += 1;
         return true;
     }
 
     fn finished(self: *Runtime, stream: std.Io.net.Stream) void {
         self.mutex.lockUncancelable(self.io);
         for (self.active.items, 0..) |candidate, index| {
-            if (candidate.socket.handle == stream.socket.handle) {
+            if (candidate.stream.socket.handle == stream.socket.handle) {
+                if (candidate.inbound) self.inbound_count -= 1;
                 _ = self.active.swapRemove(index);
                 break;
             }
@@ -200,11 +221,18 @@ const Runtime = struct {
         self.mutex.unlock(self.io);
     }
 
+    fn isStopping(self: *Runtime) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.stopping;
+    }
+
     fn shutdown(self: *Runtime) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        for (self.active.items) |stream| {
-            stream.shutdown(self.io, .both) catch {};
+        self.stopping = true;
+        for (self.active.items) |tracked| {
+            tracked.stream.shutdown(self.io, .both) catch {};
         }
     }
 

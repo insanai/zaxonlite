@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const Io = std.Io;
+const deadlines = @import("net_deadline.zig");
 const client = @import("client.zig");
 const node_mod = @import("node.zig");
 const server = @import("server.zig");
@@ -165,7 +166,10 @@ pub const Embedded = struct {
         self.finished = .init(false);
         self.exit_code = .init(255);
         self.thread = try std.Thread.spawn(.{}, runServer, .{self});
-        errdefer self.thread.join();
+        errdefer {
+            self.requestStop();
+            self.thread.join();
+        }
         try self.waitUntilListening(options.startup_timeout_ms);
         return self;
     }
@@ -202,6 +206,7 @@ pub const Embedded = struct {
 
         self.serve_options = .{
             .directory = directory,
+            .shutdown_flag = &self.gateway_shutdown,
             .node_id = options.node_id,
             .listen_host = own.host,
             .listen_port = own.port,
@@ -327,39 +332,41 @@ pub const Embedded = struct {
     }
 
     fn waitUntilListening(self: *Embedded, timeout_ms: u64) !void {
-        var elapsed_ms: u64 = 0;
-        while (elapsed_ms <= timeout_ms) : (elapsed_ms += 25) {
+        const deadline = deadlines.after(self.io, timeout_ms);
+        while (!deadlines.expired(self.io, deadline)) {
             if (self.finished.load(.acquire)) return error.ServerStartupFailed;
-            if (self.gateway_mode) {
-                const address = std.Io.net.IpAddress.parse(
-                    self.self_endpoint.host,
-                    self.self_endpoint.port,
-                ) catch return error.InvalidEndpoint;
-                var stream = address.connect(self.io, .{ .mode = .stream }) catch {
-                    self.io.sleep(.fromMilliseconds(25), .awake) catch {};
-                    continue;
-                };
-                stream.close(self.io);
-                return;
-            }
-            const connection = client.Connection.openWithTransport(
-                self.gpa,
-                self.io,
-                self.self_endpoint,
-                self.transport(),
-            ) catch {
-                self.io.sleep(.fromMilliseconds(25), .awake) catch {};
-                continue;
-            };
-            const response = connection.call("{\"op\":\"status\"}") catch {
-                connection.close();
-                continue;
-            };
-            self.gpa.free(response);
-            connection.close();
-            return;
+            if (self.probeListening(deadline)) return;
+            const retry = deadlines.after(self.io, 25);
+            const until = if (retry.raw.nanoseconds < deadline.raw.nanoseconds) retry else deadline;
+            until.wait(self.io) catch {};
         }
         return error.ServerStartupTimeout;
+    }
+
+    fn probeListening(self: *Embedded, deadline: Io.Clock.Timestamp) bool {
+        if (self.gateway_mode) {
+            const address = std.Io.net.IpAddress.parse(
+                self.self_endpoint.host,
+                self.self_endpoint.port,
+            ) catch return false;
+            const stream = deadlines.connectIp(self.io, address, deadline) catch return false;
+            stream.close(self.io);
+            return !deadlines.expired(self.io, deadline);
+        }
+        const connection = client.Connection.openWithTransportDeadline(
+            self.gpa,
+            self.io,
+            self.self_endpoint,
+            self.transport(),
+            deadline,
+        ) catch return false;
+        defer connection.close();
+        const response = connection.callWithDeadline(
+            "{\"op\":\"status\"}",
+            deadline,
+        ) catch return false;
+        self.gpa.free(response);
+        return !deadlines.expired(self.io, deadline);
     }
 
     fn runServer(self: *Embedded) void {
@@ -390,45 +397,30 @@ pub const Embedded = struct {
         };
     }
 
+    fn requestStop(self: *Embedded) void {
+        self.gateway_shutdown.store(true, .release);
+        if (!self.gateway_mode or self.finished.load(.acquire)) return;
+        const address = std.Io.net.IpAddress.parse(
+            self.self_endpoint.host,
+            self.self_endpoint.port,
+        ) catch return;
+        const stream = deadlines.connectIp(
+            self.io,
+            address,
+            deadlines.after(self.io, 1000),
+        ) catch return;
+        stream.close(self.io);
+    }
+
     /// Requests a server stop, joins the background thread, and frees the
     /// facade and everything it copied; `self` is invalid afterwards. There
     /// is nothing to flush here: every acknowledged write was already synced
     /// before its reply, and a request still in flight when `close` runs may
     /// or may not have committed — its caller must treat the outcome as
-    /// unknown. Never returns an error; a node that cannot be reached for a
-    /// clean stop is joined after its own exit.
+    /// unknown. Signals the local lifecycle directly, without dialing or
+    /// authenticating a control connection, then joins the server.
     pub fn close(self: *Embedded) void {
-        if (!self.finished.load(.acquire)) {
-            if (self.gateway_mode) {
-                self.gateway_shutdown.store(true, .release);
-                const address = std.Io.net.IpAddress.parse(
-                    self.self_endpoint.host,
-                    self.self_endpoint.port,
-                ) catch null;
-                if (address) |value| {
-                    var stream = value.connect(self.io, .{ .mode = .stream }) catch null;
-                    if (stream) |*open_stream| open_stream.close(self.io);
-                }
-                self.thread.join();
-                self.cluster.deinit();
-                if (self.tls_client) |*context| context.deinit();
-                self.arena.deinit();
-                const gpa = self.gpa;
-                gpa.destroy(self);
-                return;
-            }
-            if (client.Connection.openWithTransport(
-                self.gpa,
-                self.io,
-                self.self_endpoint,
-                self.transport(),
-            )) |connection| {
-                if (connection.call("{\"op\":\"stop\"}")) |body| {
-                    self.gpa.free(body);
-                } else |_| {}
-                connection.close();
-            } else |_| {}
-        }
+        self.requestStop();
         self.thread.join();
         self.cluster.deinit();
         if (self.tls_client) |*context| context.deinit();

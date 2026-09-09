@@ -438,6 +438,19 @@ pub fn build(b: *std.Build) void {
     );
     fault_cluster_step.dependOn(&run_fault_cluster_test.step);
 
+    const shutdown_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/shutdown_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zaxonlite", .module = zaxonlite }},
+        }),
+    });
+    const run_shutdown_tests = b.addRunArtifact(shutdown_tests);
+    const shutdown_step = b.step("test-shutdown", "Run shutdown and client deadline regressions");
+    shutdown_step.dependOn(&run_shutdown_tests.step);
+    test_step.dependOn(&run_shutdown_tests.step);
+
     // CLI contract test: drives the installed zaxon binary end to end.
     const cli_test = b.addExecutable(.{
         .name = "zaxon-cli-test",
@@ -618,6 +631,7 @@ pub fn build(b: *std.Build) void {
     // Compile-only gate: the ReleaseFast binaries otherwise build only
     // inside the benchmark run steps.
     const check_step = b.step("check", "Compile every binary without running");
+    check_step.dependOn(&shutdown_tests.step);
     check_step.dependOn(&zaxon.step);
     check_step.dependOn(&zaxon_fast.step);
     check_step.dependOn(&cluster_bench_exe.step);

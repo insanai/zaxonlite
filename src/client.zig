@@ -8,11 +8,14 @@ const wire = @import("wire.zig");
 const transport_auth = @import("transport_auth.zig");
 const tls = @import("tls.zig");
 const durability = @import("durability.zig");
+const deadlines = @import("net_deadline.zig");
 
 /// How a client authenticates its connections: the PSK secret, a mutual
 /// TLS identity, both (the PSK handshake then runs inside TLS), or
 /// neither for a local Unix-domain socket or failpoint-gated tests.
 pub const Transport = struct {
+    /// Total socket/TLS/hello/PSK establishment budget. Null disables; zero expires.
+    connect_timeout_ms: ?u64 = 10_000,
     secret: ?[]const u8 = null,
     tls: ?*const tls.Context = null,
 };
@@ -77,7 +80,18 @@ pub const Connection = struct {
         endpoint: Endpoint,
         transport: Transport,
     ) !*Connection {
-        return openWithTransportCancelable(gpa, io, endpoint, transport, null);
+        return openWithTransportCancelable(gpa, io, endpoint, transport, null, null);
+    }
+
+    /// Uses the earlier of the caller's monotonic deadline and the transport budget.
+    pub fn openWithTransportDeadline(
+        gpa: std.mem.Allocator,
+        io: Io,
+        endpoint: Endpoint,
+        transport: Transport,
+        deadline: Io.Clock.Timestamp,
+    ) !*Connection {
+        return openWithTransportCancelable(gpa, io, endpoint, transport, null, deadline);
     }
 
     fn openWithTransportCancelable(
@@ -86,7 +100,15 @@ pub const Connection = struct {
         endpoint: Endpoint,
         transport: Transport,
         cancellation: ?*Cancellation,
+        outer_deadline: ?Io.Clock.Timestamp,
     ) !*Connection {
+        const deadline = deadlines.budget(io, transport.connect_timeout_ms, outer_deadline);
+        if (deadline) |end| {
+            if (deadlines.expired(io, end)) return error.Timeout;
+        }
+        if (cancellation) |state| {
+            if (state.isRequested(io)) return error.Canceled;
+        }
         const self = try gpa.create(Connection);
         errdefer gpa.destroy(self);
         const read_buffer = try gpa.alloc(u8, 64 * 1024);
@@ -95,19 +117,21 @@ pub const Connection = struct {
         errdefer gpa.free(write_buffer);
 
         var stream = if (endpoint.unix_path) |path| blk: {
-            const address = try std.Io.net.UnixAddress.init(path);
-            break :blk try address.connect(io);
+            break :blk try deadlines.connectUnix(io, path, deadline);
         } else blk: {
             const address = try std.Io.net.IpAddress.parse(
                 endpoint.host,
                 endpoint.port,
             );
-            break :blk try address.connect(io, .{ .mode = .stream });
+            break :blk try deadlines.connectIp(io, address, deadline);
         };
         errdefer stream.close(io);
         if (cancellation) |state| try state.register(io, stream);
         defer if (cancellation) |state| state.unregister(io, stream);
 
+        var watch = deadlines.SocketWatch{ .io = io, .stream = stream, .deadline = deadline };
+        try watch.start();
+        defer _ = watch.finish();
         self.* = .{
             .gpa = gpa,
             .io = io,
@@ -117,26 +141,42 @@ pub const Connection = struct {
             .read_buffer = read_buffer,
             .write_buffer = write_buffer,
         };
-        if (transport.tls) |context| {
-            self.tls_stream = try initTlsStream(
-                gpa,
-                context,
-                stream,
-                read_buffer,
-                write_buffer,
-                endpoint,
-            );
-        } else {
-            self.reader = self.stream.reader(io, self.read_buffer);
-            self.writer = self.stream.writer(io, self.write_buffer);
-        }
         errdefer if (self.tls_stream) |tls_stream| {
+            stream.shutdown(io, .both) catch {};
             tls_stream.deinit();
             gpa.destroy(tls_stream);
         };
-
-        try performClientHandshake(self, transport);
+        self.establish(endpoint, transport) catch |err| {
+            const timed_out = watch.finish();
+            if (cancellation) |state| {
+                if (state.isRequested(io)) return error.Canceled;
+            }
+            if (timed_out) return error.Timeout;
+            return err;
+        };
+        const timed_out = watch.finish();
+        if (cancellation) |state| {
+            try state.finishOpen(io, stream);
+        }
+        if (timed_out) return error.Timeout;
         return self;
+    }
+
+    fn establish(self: *Connection, endpoint: Endpoint, transport: Transport) !void {
+        if (transport.tls) |context| {
+            self.tls_stream = try initTlsStream(
+                self.gpa,
+                context,
+                self.stream,
+                self.read_buffer,
+                self.write_buffer,
+                endpoint,
+            );
+        } else {
+            self.reader = self.stream.reader(self.io, self.read_buffer);
+            self.writer = self.stream.writer(self.io, self.write_buffer);
+        }
+        try performClientHandshake(self, transport);
     }
 
     fn initTlsStream(
@@ -196,6 +236,7 @@ pub const Connection = struct {
     }
 
     pub fn close(self: *Connection) void {
+        self.stream.shutdown(self.io, .both) catch {};
         if (self.tls_stream) |tls_stream| {
             tls_stream.deinit();
             self.gpa.destroy(tls_stream);
@@ -216,6 +257,34 @@ pub const Connection = struct {
             return error.InvalidFrame;
         }
         return frame.body;
+    }
+
+    /// A timed-out exchange invalidates this connection. Close it; the request
+    /// may already have executed, so expiry does not make replay safe.
+    pub fn callWithDeadline(
+        self: *Connection,
+        request: []const u8,
+        deadline: Io.Clock.Timestamp,
+    ) ![]u8 {
+        var watch = deadlines.SocketWatch{
+            .io = self.io,
+            .stream = self.stream,
+            .deadline = deadline,
+        };
+        watch.start() catch |err| {
+            self.stream.shutdown(self.io, .both) catch {};
+            return err;
+        };
+        defer _ = watch.finish();
+        const body = self.call(request) catch |err| {
+            if (watch.finish()) return error.Timeout;
+            return err;
+        };
+        if (watch.finish()) {
+            self.gpa.free(body);
+            return error.Timeout;
+        }
+        return body;
     }
 
     fn writeRequest(self: *Connection, request: []const u8) !void {
@@ -456,6 +525,7 @@ pub const ClusterConnection = struct {
             endpoint,
             self.transport,
             &self.cancellation,
+            null,
         );
         self.endpoint = endpoint;
     }
@@ -502,7 +572,6 @@ pub const ClusterConnection = struct {
         var redirect: ?Endpoint = null;
         var attempt: usize = 0;
         const max_attempts = 12;
-
         while (attempt < max_attempts) : (attempt += 1) {
             if (self.connection == null) {
                 const endpoint = redirect orelse blk: {
@@ -526,8 +595,9 @@ pub const ClusterConnection = struct {
                 if (err == error.Canceled or self.cancellation.isRequested(self.io)) {
                     return error.Canceled;
                 }
-                try self.retryDelay(.fromMilliseconds(150));
-                continue;
+                // A partial write or lost response leaves execution uncertain.
+                // Only explicit redirects (below) establish that replay is safe.
+                return err;
             };
             if (!require_leader) return self.result(body, endpoint);
 
@@ -646,6 +716,16 @@ const Cancellation = struct {
             std.debug.assert(active.socket.handle == stream.socket.handle);
             self.stream = null;
         }
+    }
+
+    /// Completion and cancellation serialize on the socket's registration.
+    /// Once removed, a later cancel cannot abort the connection we return.
+    fn finishOpen(self: *Cancellation, io: Io, stream: Io.net.Stream) error{Canceled}!void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        std.debug.assert(self.stream.?.socket.handle == stream.socket.handle);
+        self.stream = null;
+        if (self.requested) return error.Canceled;
     }
 
     fn request(self: *Cancellation, io: Io) void {

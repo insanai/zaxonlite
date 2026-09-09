@@ -16,6 +16,7 @@ pub fn check(comptime Node: type, comptime Server: type, comptime await_frontier
     server.node = &node;
     server.frontier_waiters = 0;
     server.failed = true;
+    server.shutdown_flag = .init(false);
     try std.testing.expectError(
         error.Unavailable,
         await_frontier(&server, Settled.check, 0),
@@ -28,5 +29,10 @@ pub fn check(comptime Node: type, comptime Server: type, comptime await_frontier
     );
     node.log.core.role = .leader;
     try await_frontier(&server, Settled.check, 0);
+    server.shutdown_flag.store(true, .release);
+    try std.testing.expectError(
+        error.Unavailable,
+        await_frontier(&server, Settled.check, 0),
+    );
     try std.testing.expectEqual(@as(u32, 0), server.frontier_waiters);
 }

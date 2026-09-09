@@ -80,6 +80,29 @@ thing about operating zaxonlite, remember this one.
 - A crash matrix that kills real processes at chosen write-path points and
   proves recovery, plus fuzzing, soak, and network-fault suites.
 
+## Connection deadlines and shutdown
+
+Client connection establishment has a ten-second total budget, including the
+socket connection, TLS, and PSK authentication. Zig callers can configure
+`client.Transport.connect_timeout_ms`; `null` disables the budget and zero
+expires immediately. `Connection.openWithTransportDeadline` accepts an outer
+`std.Io.Clock.Timestamp` on the `.awake` clock and uses the earlier deadline.
+`Connection.callWithDeadline` bounds a request and its response; after timeout,
+close that connection. Ordinary RPCs and backup streams retain their existing
+operation-duration behavior.
+
+The cluster client tries another seed after a connection failure and follows
+verified leader redirects. Once request transmission begins, a transport error
+is returned without automatically resending the request: a lost reply does not
+mean a write failed. Use session IDs and sequences to retry uncertain writes
+idempotently.
+
+`Embedded.open` applies `startup_timeout_ms` to the entire readiness probe,
+including authentication and the status response. `Embedded.close` signals the
+local server directly and joins it; shutdown cancels consensus waits without
+requiring further Paxos ticks. An in-flight write may still have committed.
+Callers must finish using an embedded object before destroying it.
+
 ## Quick start
 
 One durable local node, authorized by owner-only socket permissions:

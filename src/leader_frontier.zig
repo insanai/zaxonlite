@@ -11,7 +11,7 @@ pub fn awaitReady(
     while (true) {
         // A wake can both settle the frontier and demote or fail the
         // node. Recheck admission before accepting the settled state.
-        if (server.failed) return error.Unavailable;
+        if (server.failed or server.shutdown_flag.load(.acquire)) return error.Unavailable;
         if (!server.node.isLeader()) return error.NotLeader;
         if (settled(server.node)) return;
         const elapsed_ms = (server.tick_count -| start_tick) * server.options.tick_ms;

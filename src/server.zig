@@ -46,6 +46,7 @@ const configuration = @import("configuration.zig");
 const registry = @import("registry.zig");
 const replacement_error = @import("replacement_error.zig");
 const leader_frontier = @import("leader_frontier.zig");
+const deadlines = @import("net_deadline.zig");
 
 const Node = node_mod.Node;
 const Log = types.Log;
@@ -246,6 +247,8 @@ pub const ServeOptions = struct {
     /// authentication before the server closes it. 0 disables the
     /// deadline (tests with deterministic schedules use that).
     handshake_timeout_ms: u64 = 10_000,
+    /// Embedding-owned stop request. The ticker observes it even after failure.
+    shutdown_flag: ?*std.atomic.Value(bool) = null,
     /// Established connections that receive no frame for this long are
     /// closed. Peer heartbeats keep healthy cluster links active. Zero
     /// disables the bound for a deterministic test schedule.
@@ -704,6 +707,12 @@ pub fn serve(
         .context = &server,
         .run = drainPreDurableOutbox,
     });
+    errdefer {
+        server.shutdown();
+        for (server.senders.items) |sender| {
+            if (sender.spawned) sender.thread.join();
+        }
+    }
     try server.spawnSenders();
     const ticker = try std.Thread.spawn(.{}, Server.tickLoop, .{&server});
 
@@ -736,10 +745,12 @@ pub fn serve(
     }
 
     std.log.info("node {d}: shutting down", .{options.node_id});
+    server.listener.?.deinit(io);
+    server.listener = null;
     server.shutdown();
     ticker.join();
     for (server.senders.items) |sender| {
-        sender.thread.join();
+        if (sender.spawned) sender.thread.join();
     }
     server.waitForHandlers();
     std.log.info("node {d}: stopped", .{options.node_id});
@@ -876,81 +887,11 @@ const Held = struct {
     from: paxos.NodeId = 0,
 };
 
-const WriteOutcome = enum { pending, committed, conflict };
-
-const WriteWaiter = struct {
-    slot: paxos.Slot,
-    batch_id: u128,
-    outcome: WriteOutcome = .pending,
-    cond: std.Io.Condition = .init,
-};
-
-const FenceWaiter = struct {
-    id: u64,
-    ballot: paxos.Ballot,
-    fence_slot: paxos.Slot,
-    acked: [types.log_options.max_members]paxos.NodeId =
-        [_]paxos.NodeId{0} ** types.log_options.max_members,
-    ack_count: usize = 0,
-    needed: usize,
-    failed: bool = false,
-    done: bool = false,
-    cond: std.Io.Condition = .init,
-
-    fn noteAck(self: *FenceWaiter, member: paxos.NodeId) void {
-        for (self.acked[0..self.ack_count]) |seen| {
-            if (seen == member) return;
-        }
-        if (self.ack_count >= self.acked.len) return;
-        self.acked[self.ack_count] = member;
-        self.ack_count += 1;
-    }
-};
-
-const HistoryProbeWaiter = struct {
-    nonce: u64,
-    slot: paxos.Slot,
-    hash: [32]u8,
-    /// Voters whose vouch counts toward the read quorum. Only distinct
-    /// IDs drawn from this set count; the transfer sender is one of them.
-    voters: [types.log_options.max_members]paxos.NodeId =
-        [_]paxos.NodeId{0} ** types.log_options.max_members,
-    voter_count: u16 = 0,
-    acked: [types.log_options.max_members]paxos.NodeId =
-        [_]paxos.NodeId{0} ** types.log_options.max_members,
-    ack_count: usize = 0,
-    needed: usize,
-
-    fn isVoter(self: *const HistoryProbeWaiter, member: paxos.NodeId) bool {
-        for (self.voters[0..self.voter_count]) |voter| {
-            if (voter == member) return true;
-        }
-        return false;
-    }
-
-    fn noteAck(self: *HistoryProbeWaiter, member: paxos.NodeId) void {
-        if (!self.isVoter(member)) return;
-        for (self.acked[0..self.ack_count]) |seen| {
-            if (seen == member) return;
-        }
-        if (self.ack_count >= self.acked.len) return;
-        self.acked[self.ack_count] = member;
-        self.ack_count += 1;
-    }
-};
-
-const WaitWaiter = struct {
-    min_applied: paxos.Slot,
-    need_leader: bool,
-    done: bool = false,
-    cond: std.Io.Condition = .init,
-
-    fn satisfied(self: *const WaitWaiter, node: *Node) bool {
-        if (node.applied_slot < self.min_applied) return false;
-        if (self.need_leader and node.currentLeader() == null) return false;
-        return true;
-    }
-};
+const wait_types = @import("server_waiters.zig");
+const WriteWaiter = wait_types.WriteWaiter;
+const FenceWaiter = wait_types.FenceWaiter;
+const HistoryProbeWaiter = wait_types.HistoryProbeWaiter;
+const WaitWaiter = wait_types.WaitWaiter;
 
 pub const Server = struct {
     gpa: std.mem.Allocator,
@@ -1182,12 +1123,15 @@ pub const Server = struct {
     /// leaves the thread blocked forever. Connecting to our own listener
     /// and hanging up wakes it everywhere: the admission gate refuses the
     /// connection during shutdown and the serve loop re-checks the flag
-    /// before the next accept. The listener itself is closed by `deinit`
-    /// after the serve loop exits, so no thread races the descriptor.
+    /// before the next accept. The serve thread closes the listener before
+    /// draining handlers, so no other thread races its descriptor.
     fn wakeAcceptLoop(self: *Server) void {
         if (self.options.listen_unix) |path| {
-            const address = std.Io.net.UnixAddress.init(path) catch return;
-            var stream = address.connect(self.io) catch return;
+            const stream = deadlines.connectUnix(
+                self.io,
+                path,
+                deadlines.after(self.io, 1000),
+            ) catch return;
             stream.close(self.io);
             return;
         }
@@ -1195,13 +1139,28 @@ pub const Server = struct {
             self.options.listen_host,
             self.options.listen_port,
         ) catch return;
-        var stream = address.connect(self.io, .{ .mode = .stream }) catch return;
+        const stream = deadlines.connectIp(
+            self.io,
+            address,
+            deadlines.after(self.io, 1000),
+        ) catch return;
         stream.close(self.io);
     }
 
+    fn requestShutdown(self: *Server) void {
+        self.mutex.lockUncancelable(self.io);
+        const already_requested = self.shutdown_flag.swap(true, .acq_rel);
+        self.wakeWaiters();
+        self.mutex.unlock(self.io);
+        if (!already_requested) self.wakeAcceptLoop();
+    }
+
     fn shutdown(self: *Server) void {
-        const client_requested = self.shutdown_flag.load(.acquire);
+        const client_requested = self.isShutdown();
+        self.mutex.lockUncancelable(self.io);
         self.shutdown_flag.store(true, .release);
+        self.wakeWaiters();
+        self.mutex.unlock(self.io);
         if (client_requested) {
             var attempts: usize = 0;
             while (!self.stop_response_sent.load(.acquire) and attempts < 250) {
@@ -1213,12 +1172,10 @@ pub const Server = struct {
         for (self.active_connections.items) |connection| {
             connection.stream.shutdown(self.io, .both) catch {};
         }
-        self.mutex.unlock(self.io);
         for (self.senders.items) |sender| {
-            sender.mutex.lockUncancelable(self.io);
-            sender.cond.broadcast(self.io);
-            sender.mutex.unlock(self.io);
+            sender.requestStop();
         }
+        self.mutex.unlock(self.io);
     }
 
     /// Admission limit for concurrent connections. The default is sized
@@ -1311,6 +1268,10 @@ pub const Server = struct {
     /// without `mutex` held; sender threads take that mutex themselves.
     fn rebuildTransport(self: *Server) !void {
         self.mutex.lockUncancelable(self.io);
+        if (self.isShutdown()) {
+            self.mutex.unlock(self.io);
+            return;
+        }
         const decided = self.node.decidedRegistry() orelse {
             self.mutex.unlock(self.io);
             return;
@@ -1388,12 +1349,11 @@ pub const Server = struct {
         failpoint.hit("after_transport_teardown");
 
         self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.isShutdown()) return;
         if (self.installation == .installed) self.installation = .active;
-        self.mutex.unlock(self.io);
         try self.spawnSenders();
-        self.mutex.lockUncancelable(self.io);
         self.pump();
-        self.mutex.unlock(self.io);
         failpoint.hit("after_transport_swap");
         std.log.info(
             "node {d}: transport rebuilt for configuration {d}",
@@ -1695,6 +1655,7 @@ pub const Server = struct {
     }
 
     fn failEverything(self: *Server) void {
+        self.wakeWaiters();
         if (self.write_waiter) |waiter| {
             if (waiter.outcome == .pending) waiter.outcome = .conflict;
             waiter.cond.signal(self.io);
@@ -2026,12 +1987,18 @@ pub const Server = struct {
     fn tickLoop(self: *Server) void {
         while (!self.isShutdown()) {
             self.io.sleep(.fromMilliseconds(@intCast(self.options.tick_ms)), .awake) catch {};
+            if (self.options.shutdown_flag) |flag| {
+                if (flag.load(.acquire)) self.requestShutdown();
+            }
             var transport_stale = false;
             {
                 self.mutex.lockUncancelable(self.io);
                 defer self.mutex.unlock(self.io);
-                if (self.failed) continue;
+                if (self.isShutdown()) break;
                 self.tick_count += 1;
+                self.wakeWaiters();
+                self.closeExpiredConnections();
+                if (self.failed) continue;
                 if (self.options.revocation_file != null and
                     self.tick_count % 40 == 0)
                 {
@@ -2052,8 +2019,6 @@ pub const Server = struct {
                 self.releaseHeldVotes();
                 self.pump();
                 self.reportLeaderChangeLocked();
-                self.wakeWaiters();
-                self.closeExpiredConnections();
 
                 // A joining replacement fetches the decided registry it
                 // was enrolled against before it can participate.
@@ -3175,7 +3140,7 @@ pub const Server = struct {
             const body = frame.body;
             defer self.gpa.free(body);
 
-            if (isBackupRequest(self.gpa, body)) {
+            if (isOperation(self.gpa, body, "backup")) {
                 try self.streamBackup(writer, authenticated);
                 continue;
             }
@@ -3196,7 +3161,9 @@ pub const Server = struct {
             }
             try writer.flush();
             if (self.isShutdown()) {
-                self.stop_response_sent.store(true, .release);
+                if (isOperation(self.gpa, body, "stop")) {
+                    self.stop_response_sent.store(true, .release);
+                }
                 return;
             }
         }
@@ -3368,6 +3335,9 @@ pub const Server = struct {
         };
         defer parsed.deinit();
         const request = parsed.value;
+        if (self.isShutdown() and !std.mem.eql(u8, request.op, "stop")) {
+            return writeErrorResponse(out, "unavailable", "node shutting down");
+        }
 
         if (std.mem.eql(u8, request.op, "status")) {
             return self.opStatus(out);
@@ -3404,8 +3374,7 @@ pub const Server = struct {
         } else if (std.mem.eql(u8, request.op, "failpoint")) {
             return self.opFailpoint(request, out);
         } else if (std.mem.eql(u8, request.op, "stop")) {
-            self.shutdown_flag.store(true, .release);
-            self.wakeAcceptLoop();
+            self.requestShutdown();
             return out.writeAll("{\"ok\":true}");
         }
         return writeErrorResponse(out, "bad_request", "unknown op");
@@ -3899,7 +3868,7 @@ pub const Server = struct {
     ) anyerror!ExecOutcome {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        if (self.failed) return error.Unavailable;
+        if (self.failed or self.isShutdown()) return error.Unavailable;
 
         // One replicated write at a time; a dependent slot is never built
         // before its predecessor is chosen. Admission is first-in-first-out:
@@ -3914,7 +3883,7 @@ pub const Server = struct {
             }
             self.writer_queue_tail = &ticket;
             while (!ticket.granted) {
-                if (self.failed) {
+                if (self.failed or self.isShutdown()) {
                     self.removeWriterTicket(&ticket);
                     return error.Unavailable;
                 }
@@ -3928,6 +3897,7 @@ pub const Server = struct {
             self.writer_gate_busy = true;
         }
         defer self.releaseWriterGate();
+        if (self.failed or self.isShutdown()) return error.Unavailable;
 
         if (!self.node.isLeader()) return error.NotLeader;
 
@@ -3979,22 +3949,13 @@ pub const Server = struct {
             },
         };
         self.write_waiter = &waiter;
+        defer if (self.write_waiter == &waiter) {
+            self.write_waiter = null;
+        };
         self.pump();
-        const start_tick = self.tick_count;
-        while (waiter.outcome == .pending) {
-            if (self.elapsedMs(start_tick) > op_timeout_ms) {
-                if (self.write_waiter == &waiter) self.write_waiter = null;
-                return error.OpTimeout;
-            }
-            waiter.cond.waitUncancelable(self.io, &self.mutex);
-        }
-        switch (waiter.outcome) {
-            .committed => {
-                failpoint.hit("before_client_reply");
-                return result;
-            },
-            else => return error.Ambiguous,
-        }
+        try waiter.awaitOutcome(self, self.tick_count, op_timeout_ms);
+        failpoint.hit("before_client_reply");
+        return result;
     }
 
     /// Blocks until `settled(node)` holds on this leader. Returns
@@ -4334,7 +4295,7 @@ pub const Server = struct {
                 "retry",
                 "leader is still applying inherited slots",
             ),
-            error.Unavailable => try writeErrorResponse(out, "unavailable", "node failed"),
+            error.Unavailable => try writeErrorResponse(out, "unavailable", "node unavailable"),
             error.SqliteError, error.SqliteBusy => {
                 self.mutex.lockUncancelable(self.io);
                 var message_buffer: [512]u8 = undefined;
@@ -4472,7 +4433,9 @@ pub const Server = struct {
 
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        if (self.failed) return writeErrorResponse(out, "unavailable", "node failed");
+        if (self.failed or self.isShutdown()) {
+            return writeErrorResponse(out, "unavailable", "node unavailable");
+        }
 
         if (level != .any and !self.node.isLeader()) {
             self.mutex.unlock(self.io);
@@ -4524,6 +4487,11 @@ pub const Server = struct {
 
         if (level == .linearizable and !self.node.single) {
             self.awaitReadFence() catch |err| switch (err) {
+                error.Unavailable => return writeErrorResponse(
+                    out,
+                    "unavailable",
+                    "node unavailable",
+                ),
                 error.ReadFenceTimeout => return writeErrorResponse(
                     out,
                     "timeout",
@@ -4665,6 +4633,7 @@ pub const Server = struct {
     /// Confirms this exact Paxos ballot with a distinct-member read quorum.
     /// The server mutex must be held; condition waits release it temporarily.
     fn awaitReadFence(self: *Server) !void {
+        if (self.failed or self.isShutdown()) return error.Unavailable;
         var fence = FenceWaiter{
             .id = self.next_fence_id,
             .ballot = self.node.log.core.ballot,
@@ -4676,6 +4645,7 @@ pub const Server = struct {
         fence.noteAck(self.node.identity.node_id);
         self.next_fence_id += 1;
         try self.fences.append(self.gpa, &fence);
+        defer self.removeFence(&fence);
 
         var request_buffer: [wire.FenceRequest.encoded_size]u8 = undefined;
         const encoded = (wire.FenceRequest{
@@ -4689,15 +4659,7 @@ pub const Server = struct {
         }
         self.pump();
 
-        const start_tick = self.tick_count;
-        while (!fence.done) {
-            if (self.elapsedMs(start_tick) > op_timeout_ms) {
-                self.removeFence(&fence);
-                return error.ReadFenceTimeout;
-            }
-            fence.cond.waitUncancelable(self.io, &self.mutex);
-        }
-        if (fence.failed) return error.ReadFenceLeadershipChanged;
+        try fence.awaitQuorum(self, self.tick_count, op_timeout_ms);
     }
 
     fn removeFence(self: *Server, fence: *FenceWaiter) void {
@@ -4743,35 +4705,32 @@ pub const Server = struct {
 
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        if (waiter.satisfied(self.node)) {
-            return self.writeWaitResponse(out);
+        if (self.failed or self.isShutdown()) {
+            return writeErrorResponse(out, "unavailable", "node unavailable");
         }
+        if (waiter.satisfied(self.node)) return self.writeWaitResponse(out);
         try self.waiters.append(self.gpa, &waiter);
+        defer self.removeWaiter(&waiter);
         const start_tick = self.tick_count;
-        while (!waiter.done) {
-            waiter.cond.waitUncancelable(self.io, &self.mutex);
-            if (waiter.done) break;
-            if (waiter.satisfied(self.node)) {
-                waiter.done = true;
-                for (self.waiters.items, 0..) |candidate, index| {
-                    if (candidate == &waiter) {
-                        _ = self.waiters.swapRemove(index);
-                        break;
-                    }
-                }
-                break;
+        while (true) {
+            if (self.failed or self.isShutdown()) {
+                return writeErrorResponse(out, "unavailable", "node unavailable");
             }
+            if (waiter.satisfied(self.node)) return self.writeWaitResponse(out);
             if (self.elapsedMs(start_tick) >= timeout_ms) {
-                for (self.waiters.items, 0..) |candidate, index| {
-                    if (candidate == &waiter) {
-                        _ = self.waiters.swapRemove(index);
-                        break;
-                    }
-                }
                 return writeErrorResponse(out, "timeout", "condition not reached");
             }
+            waiter.cond.waitUncancelable(self.io, &self.mutex);
         }
-        return self.writeWaitResponse(out);
+    }
+
+    fn removeWaiter(self: *Server, waiter: *WaitWaiter) void {
+        for (self.waiters.items, 0..) |candidate, index| {
+            if (candidate == waiter) {
+                _ = self.waiters.swapRemove(index);
+                return;
+            }
+        }
     }
 
     fn writeWaitResponse(self: *Server, out: *Io.Writer) !void {
@@ -5065,18 +5024,37 @@ const PeerSender = struct {
                 self.peer.host,
                 self.peer.port,
             ) catch return;
-            var stream = address.connect(io, .{ .mode = .stream }) catch {
+            var stream = deadlines.connectIp(io, address, deadlines.after(io, 1000)) catch {
                 io.sleep(.fromMilliseconds(200), .awake) catch {};
                 continue;
             };
             defer stream.close(io);
+            self.mutex.lockUncancelable(io);
+            if (self.shouldStop()) {
+                self.mutex.unlock(io);
+                return;
+            }
+            self.active_stream = stream;
+            self.mutex.unlock(io);
+            defer {
+                self.mutex.lockUncancelable(io);
+                self.active_stream = null;
+                self.connected = false;
+                self.cond.broadcast(io);
+                self.mutex.unlock(io);
+            }
+            // TLS teardown must not block emitting close_notify after a stopped send.
+            defer stream.shutdown(io, .both) catch {};
             var read_buffer: [64 * 1024]u8 = undefined;
             var write_buffer: [64 * 1024]u8 = undefined;
             var net_reader: std.Io.net.Stream.Reader = undefined;
             var net_writer: std.Io.net.Stream.Writer = undefined;
             var tls_stream: tls.Stream = undefined;
             var tls_active = false;
-            defer if (tls_active) tls_stream.deinit();
+            defer if (tls_active) {
+                stream.shutdown(io, .both) catch {};
+                tls_stream.deinit();
+            };
             const reader: *Io.Reader, const writer: *Io.Writer = blk: {
                 if (self.server.tls_client) |*context| {
                     tls_stream = tls.Stream.connect(
@@ -5137,8 +5115,11 @@ const PeerSender = struct {
             if (self.server.peerRevoked(self.peer.id)) continue;
 
             self.mutex.lockUncancelable(io);
+            if (self.shouldStop()) {
+                self.mutex.unlock(io);
+                return;
+            }
             self.connected = true;
-            self.active_stream = stream;
             self.stored_payloads.clearRetainingCapacity();
             for (self.gated.items) |item| self.server.gpa.free(item.frame);
             self.gated.clearRetainingCapacity();
@@ -5201,7 +5182,6 @@ const PeerSender = struct {
 
             self.mutex.lockUncancelable(io);
             self.connected = false;
-            self.active_stream = null;
             for (self.queue.items) |frame| self.server.gpa.free(frame);
             self.queue.clearRetainingCapacity();
             self.queue_bytes = 0;
@@ -5248,13 +5228,13 @@ fn writeSqlError(out: *Io.Writer, message: []const u8) !void {
     try out.writeAll("}");
 }
 
-fn isBackupRequest(gpa: std.mem.Allocator, body: []const u8) bool {
+fn isOperation(gpa: std.mem.Allocator, body: []const u8, op: []const u8) bool {
     const Operation = struct { op: []const u8 = "" };
     const parsed = std.json.parseFromSlice(Operation, gpa, body, .{
         .ignore_unknown_fields = true,
     }) catch return false;
     defer parsed.deinit();
-    return std.mem.eql(u8, parsed.value.op, "backup");
+    return std.mem.eql(u8, parsed.value.op, op);
 }
 
 pub fn writeJsonString(out: *Io.Writer, text: []const u8) !void {
@@ -5343,6 +5323,17 @@ test "connection admission is sized for a small cluster" {
 
 test "a settled frontier does not admit a failed node or former leader" {
     try @import("server_frontier_test.zig").check(Node, Server, Server.awaitLeaderFrontier);
+}
+
+test "shutdown and failure cancel parked host operations without protocol ticks" {
+    try @import("server_shutdown_test.zig").check(Server, .{
+        .write = Server.runWrite,
+        .frontier = Server.awaitLeaderFrontier,
+        .wait = Server.opWait,
+        .fail = Server.failEverything,
+        .wake = Server.wakeWaiters,
+        .release = Server.releaseWriterGate,
+    });
 }
 
 test "read fence counts each member once" {
