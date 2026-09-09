@@ -980,7 +980,8 @@ pub const Server = struct {
     tick_count: u64 = 0,
     failed: bool = false,
     shutdown_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    stop_response_sent: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    stop_response_requested: bool = false, // Protected by mutex; only the first stop wins.
+    stop_response_sent: Io.Event = .unset,
     handler_count: usize = 0,
     handler_cond: std.Io.Condition = .init,
     active_connections: std.ArrayList(TrackedConnection) = .empty,
@@ -1147,26 +1148,28 @@ pub const Server = struct {
         stream.close(self.io);
     }
 
-    fn requestShutdown(self: *Server) void {
+    fn requestShutdown(self: *Server, source: enum { local, rpc }) void {
         self.mutex.lockUncancelable(self.io);
         const already_requested = self.shutdown_flag.swap(true, .acq_rel);
+        if (!already_requested) self.stop_response_requested = source == .rpc;
         self.wakeWaiters();
         self.mutex.unlock(self.io);
         if (!already_requested) self.wakeAcceptLoop();
     }
 
     fn shutdown(self: *Server) void {
-        const client_requested = self.isShutdown();
         self.mutex.lockUncancelable(self.io);
         self.shutdown_flag.store(true, .release);
+        const response_pending = self.stop_response_requested;
         self.wakeWaiters();
         self.mutex.unlock(self.io);
-        if (client_requested) {
-            var attempts: usize = 0;
-            while (!self.stop_response_sent.load(.acquire) and attempts < 250) {
-                self.io.sleep(.fromMilliseconds(1), .awake) catch {};
-                attempts += 1;
-            }
+        // Only RPC shutdown has a reply to flush. A sleep count is not a deadline:
+        // scheduler delays can stretch each nominal millisecond substantially.
+        const end = deadlines.after(self.io, 250);
+        while (response_pending and !self.stop_response_sent.isSet() and
+            !deadlines.expired(self.io, end))
+        {
+            self.stop_response_sent.waitTimeout(self.io, .{ .deadline = end }) catch {};
         }
         self.mutex.lockUncancelable(self.io);
         for (self.active_connections.items) |connection| {
@@ -1988,7 +1991,7 @@ pub const Server = struct {
         while (!self.isShutdown()) {
             self.io.sleep(.fromMilliseconds(@intCast(self.options.tick_ms)), .awake) catch {};
             if (self.options.shutdown_flag) |flag| {
-                if (flag.load(.acquire)) self.requestShutdown();
+                if (flag.load(.acquire)) self.requestShutdown(.local);
             }
             var transport_stale = false;
             {
@@ -3162,7 +3165,7 @@ pub const Server = struct {
             try writer.flush();
             if (self.isShutdown()) {
                 if (isOperation(self.gpa, body, "stop")) {
-                    self.stop_response_sent.store(true, .release);
+                    self.stop_response_sent.set(self.io);
                 }
                 return;
             }
@@ -3374,7 +3377,7 @@ pub const Server = struct {
         } else if (std.mem.eql(u8, request.op, "failpoint")) {
             return self.opFailpoint(request, out);
         } else if (std.mem.eql(u8, request.op, "stop")) {
-            self.requestShutdown();
+            self.requestShutdown(.rpc);
             return out.writeAll("{\"ok\":true}");
         }
         return writeErrorResponse(out, "bad_request", "unknown op");
@@ -5333,6 +5336,7 @@ test "shutdown and failure cancel parked host operations without protocol ticks"
         .fail = Server.failEverything,
         .wake = Server.wakeWaiters,
         .release = Server.releaseWriterGate,
+        .shutdown = Server.shutdown,
     });
 }
 
