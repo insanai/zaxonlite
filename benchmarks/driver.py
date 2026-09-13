@@ -11,6 +11,8 @@ import statistics
 import struct
 import time
 
+ZAXON_WIRE_PROTOCOL = 10
+
 
 def percentile(ordered, fraction):
     index = max(0, min(len(ordered) - 1, math.ceil(len(ordered) * fraction) - 1))
@@ -53,7 +55,7 @@ class Zaxon:
         raw = socket.create_connection((host, int(port)), timeout=10)
         self.socket = self.tls.wrap_socket(
             raw, server_hostname=f"zaxon-node-{index + 1}")
-        hello = struct.pack("<HB", 9, 1)
+        hello = struct.pack("<HB", ZAXON_WIRE_PROTOCOL, 1)
         hello += struct.pack("<I", 0) + bytes(16) + struct.pack("<Q", 0)
         self.send_frame(1, hello)
 
