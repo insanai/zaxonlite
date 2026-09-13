@@ -99,11 +99,9 @@ test "fresh later-configuration voter requires an enrollment JOIN descriptor" {
     defer test_dir.deinit(gpa);
     const dir = try test_dir.nodeDir(gpa);
     defer gpa.free(dir);
-    try std.Io.Dir.cwd().createDirPath(testing.io, dir);
-    const identity_path = try std.fmt.allocPrint(gpa, "{s}/IDENTITY", .{dir});
-    defer gpa.free(identity_path);
-    try std.Io.Dir.cwd().writeFile(testing.io, .{
-        .sub_path = identity_path,
+    try test_dir.tmp.dir.createDirPath(testing.io, "node");
+    try test_dir.tmp.dir.writeFile(testing.io, .{
+        .sub_path = "node/identity",
         .data = "format=3\nnode_id=1\n" ++
             "database_id=00000000000000000000000000000001\n" ++
             "configuration_id=2\nrole=data-voter\n",
