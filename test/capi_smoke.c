@@ -409,6 +409,11 @@ int main(int argc, char **argv) {
           zaxonlite_cluster_open(&cluster_options, &cluster) == 0 &&
               cluster != NULL);
     if (cluster != NULL) {
+        char cluster_failure[128];
+        CHECK("cluster facade healthy state",
+              zaxonlite_cluster_state(cluster, cluster_failure,
+                                      sizeof cluster_failure) == 0 &&
+                  cluster_failure[0] == '\0');
         CHECK("cluster facade exec",
               zaxonlite_cluster_exec(
                   cluster, "create table facade(value text)", &changes) == 0);

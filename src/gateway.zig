@@ -20,6 +20,9 @@ pub const Options = struct {
     /// Optional embedding-owned graceful shutdown signal. Setting it and
     /// connecting once to the listener wakes the accept loop.
     shutdown_flag: ?*std.atomic.Value(bool) = null,
+    /// Optional embedding-owned first-failure publication.
+    failure_name_buffer: ?*[128]u8 = null,
+    failure_name_len: ?*std.atomic.Value(u8) = null,
 };
 
 pub fn serve(
@@ -39,6 +42,7 @@ pub fn serve(
         options.listen_port,
     ) catch return report(err_out, "invalid gateway listen address");
     var listener = address.listen(io, .{ .reuse_address = true }) catch |err| {
+        publishFailure(options, err);
         try diagnostic.write(
             err_out,
             "gateway listen failed",
@@ -62,6 +66,7 @@ pub fn serve(
         const inbound = listener.accept(io) catch |err| switch (err) {
             error.ConnectionAborted => continue,
             else => {
+                publishFailure(options, err);
                 exit_code = 4;
                 break;
             },
@@ -79,6 +84,16 @@ pub fn serve(
     runtime.shutdown();
     runtime.wait();
     return exit_code;
+}
+
+fn publishFailure(options: Options, err: anyerror) void {
+    const buffer = options.failure_name_buffer orelse return;
+    const published = options.failure_name_len orelse return;
+    if (published.load(.acquire) != 0) return;
+    const name = @errorName(err);
+    const len: u8 = @intCast(@min(name.len, buffer.len));
+    @memcpy(buffer[0..len], name[0..len]);
+    published.store(len, .release);
 }
 
 fn handleInboundConnection(

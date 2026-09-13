@@ -104,6 +104,7 @@ pub const Embedded = struct {
     pub const LocalServerState = union(enum) {
         healthy,
         stopping,
+        stopped: u8,
         failed: []const u8,
     };
 
@@ -239,6 +240,8 @@ pub const Embedded = struct {
             .listen_port = own.port,
             .backends = backends[0..backend_count],
             .shutdown_flag = &self.gateway_shutdown,
+            .failure_name_buffer = &self.failure_name_buffer,
+            .failure_name_len = &self.failure_name_len,
         };
         self.gateway_mode = own_role == .gateway;
         self.endpoints = endpoints;
@@ -389,16 +392,30 @@ pub const Embedded = struct {
                 self.io,
                 self.gateway_options,
                 &discarding.writer,
-            ) catch 4
+            ) catch |err| blk: {
+                self.publishFailureName(err);
+                break :blk 4;
+            }
         else
             server.serve(
                 self.gpa,
                 self.io,
                 self.serve_options,
                 &discarding.writer,
-            ) catch 4;
+            ) catch |err| blk: {
+                self.publishFailureName(err);
+                break :blk 4;
+            };
         self.exit_code.store(code, .release);
         self.finished.store(true, .release);
+    }
+
+    fn publishFailureName(self: *Embedded, err: anyerror) void {
+        if (self.failure_name_len.load(.acquire) != 0) return;
+        const name = @errorName(err);
+        const len: u8 = @intCast(@min(name.len, self.failure_name_buffer.len));
+        @memcpy(self.failure_name_buffer[0..len], name[0..len]);
+        self.failure_name_len.store(len, .release);
     }
 
     fn transport(self: *Embedded) client.Transport {
@@ -431,8 +448,10 @@ pub const Embedded = struct {
         if (failure_len != 0) {
             return .{ .failed = self.failure_name_buffer[0..failure_len] };
         }
-        if (self.finished.load(.acquire) and self.exit_code.load(.acquire) == 4) {
-            return .{ .failed = "LocalNodeFailed" };
+        if (self.finished.load(.acquire)) {
+            const code = self.exit_code.load(.acquire);
+            if (code == 4) return .{ .failed = "LocalNodeFailed" };
+            return .{ .stopped = code };
         }
         if (self.gateway_shutdown.load(.acquire)) return .stopping;
         return .healthy;
@@ -441,6 +460,7 @@ pub const Embedded = struct {
     fn requireLocalHealthy(self: *const Embedded) !void {
         switch (self.localServerState()) {
             .failed => return error.LocalNodeFailed,
+            .stopped => return error.LocalNodeStopped,
             .healthy, .stopping => {},
         }
     }
@@ -600,6 +620,15 @@ test "local server state exposes the first failure without peer routing" {
     embedded.gateway_shutdown.store(true, .release);
     try std.testing.expect(embedded.localServerState() == .stopping);
     embedded.gateway_shutdown.store(false, .release);
+
+    embedded.finished.store(true, .release);
+    embedded.exit_code.store(0, .release);
+    switch (embedded.localServerState()) {
+        .stopped => |code| try std.testing.expectEqual(@as(u8, 0), code),
+        else => return error.TestExpectedStopped,
+    }
+    try std.testing.expectError(error.LocalNodeStopped, embedded.requireLocalHealthy());
+    embedded.finished.store(false, .release);
 
     const failure = "TrimRegression";
     @memcpy(embedded.failure_name_buffer[0..failure.len], failure);

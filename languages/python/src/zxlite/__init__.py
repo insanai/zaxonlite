@@ -34,7 +34,7 @@ from .dbapi import (
     threadsafety,
 )
 from .rows import Row
-from .server import Member, Server, start_server
+from .server import Member, Server, ServerState, start_server
 
 __version__ = "0.7.0"
 
@@ -76,6 +76,7 @@ __all__ = [
     "RemoteConnection",
     "Row",
     "Server",
+    "ServerState",
     "Warning",
     "__version__",
     "apilevel",

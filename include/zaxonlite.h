@@ -146,6 +146,10 @@ typedef struct zaxonlite_cluster_options_v2 {
 int zaxonlite_cluster_open_v2(const zaxonlite_cluster_options_v2 *options,
                               zaxonlite_cluster **out_handle);
 void zaxonlite_cluster_close(zaxonlite_cluster *handle);
+/* Local member lifecycle: 0 healthy, 1 stopping, 2 stopped, 4 failed.
+ * On failure, out_failure receives the first error name when space permits. */
+int zaxonlite_cluster_state(zaxonlite_cluster *handle, char *out_failure,
+                            size_t out_len);
 int zaxonlite_cluster_exec(zaxonlite_cluster *handle, const char *sql,
                            int64_t *changes_out);
 int zaxonlite_cluster_query_json(zaxonlite_cluster *handle, const char *sql,

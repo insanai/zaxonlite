@@ -1239,6 +1239,65 @@ zx_cluster_close(PyObject *self, PyObject *args)
     Py_RETURN_NONE;
 }
 
+static PyObject *
+zx_cluster_state(PyObject *self, PyObject *args)
+{
+    (void)self;
+    PyObject *capsule;
+    if (!PyArg_ParseTuple(args, "O:cluster_state", &capsule)) {
+        return NULL;
+    }
+    ClusterBox *box = PyCapsule_GetPointer(capsule, cluster_capsule_name);
+    if (box == NULL) {
+        return NULL;
+    }
+    if (box->handle == NULL) {
+        return Py_BuildValue("(is)", 2, "");
+    }
+    char failure[128];
+    failure[0] = '\0';
+    int state = zaxonlite_cluster_state(box->handle, failure, sizeof(failure));
+    return Py_BuildValue("(is)", state, failure);
+}
+
+static PyObject *
+zx_cluster_call(PyObject *self, PyObject *args)
+{
+    (void)self;
+    PyObject *capsule;
+    const char *request;
+    int require_leader;
+    if (!PyArg_ParseTuple(args, "Osp:cluster_call", &capsule, &request,
+                          &require_leader)) {
+        return NULL;
+    }
+    ClusterBox *box = PyCapsule_GetPointer(capsule, cluster_capsule_name);
+    if (box == NULL) {
+        return NULL;
+    }
+    if (box->handle == NULL) {
+        raise_zx_error(4, 7, "local cluster member is stopped");
+        return NULL;
+    }
+    char *response = NULL;
+    int rc;
+    Py_BEGIN_ALLOW_THREADS
+    rc = zaxonlite_cluster_call_json(box->handle, request,
+                                     require_leader != 0, &response);
+    Py_END_ALLOW_THREADS
+    if (rc != 0) {
+        const char *message = zaxonlite_cluster_last_error(box->handle);
+        raise_zx_error(rc, handleless_category(rc),
+                       (message != NULL && message[0] != '\0')
+                           ? message
+                           : "cluster call failed");
+        return NULL;
+    }
+    PyObject *result = PyUnicode_FromString(response != NULL ? response : "");
+    zaxonlite_free(response);
+    return result;
+}
+
 /* --- external remote client ------------------------------------------ */
 
 static PyObject *
@@ -1907,6 +1966,10 @@ static PyMethodDef zx_methods[] = {
      " -> cluster capsule"},
     {"cluster_close", zx_cluster_close, METH_VARARGS,
      "cluster_close(capsule)\n\nStop the member and join its thread."},
+    {"cluster_state", zx_cluster_state, METH_VARARGS,
+     "cluster_state(capsule) -> (state, failure)\n\nRead local lifecycle state."},
+    {"cluster_call", zx_cluster_call, METH_VARARGS,
+     "cluster_call(capsule, request, leader) -> str\n\nIssue one hosted-member RPC."},
     {"remote_open", zx_remote_open, METH_VARARGS,
      "remote_open(seeds, tls_ca, tls_cert, tls_key, auth_file, allow_psk,"
      " pool_size, connect_timeout_ms, operation_timeout_ms,"
