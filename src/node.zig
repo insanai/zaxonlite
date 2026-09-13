@@ -852,11 +852,13 @@ pub const Node = struct {
         // A materializing voter that joins an existing cluster with no
         // applied state must not lead: catch-up and snapshot escalation
         // run against the leader, so winning the election would starve
-        // its own recovery forever. It still votes; campaigning resumes
-        // once any state is applied.
+        // its own recovery forever. The server also suppresses its Paxos
+        // envelopes until transfer installs and clears the durable JOIN.
         const fresh_voter = capabilities.campaigns and capabilities.materializes and
             identity.configuration_id > 1;
-        self.join_campaign_hold = fresh_voter and (join != null or self.applied_slot == 0);
+        if (fresh_voter and join == null and self.applied_slot == 0)
+            return error.JoinDescriptorRequired;
+        self.join_campaign_hold = fresh_voter and join != null;
         self.log.core.setCampaignEnabled(capabilities.campaigns and !self.join_campaign_hold);
         if (single and capabilities.campaigns) {
             // Volatile leadership: campaign on every open. A one-member
@@ -989,8 +991,6 @@ pub const Node = struct {
         // alone. It must first install a survivor's post-handover anchor;
         // range recovery is safe for the suffix after that base.
         if (self.join_descriptor != null) return;
-        if (self.join_campaign_hold and self.applied_slot == 0 and
-            self.identity.configuration_id > 1) return;
         try self.log.requestCatchUp(peer, self.applied_slot + 1, self.effects);
         try self.consumeEffects();
     }
@@ -2414,7 +2414,7 @@ pub const Node = struct {
         // A stateless continuation of a joined configuration must not
         // lead (a joiner opens at configuration 1 and only learns its
         // real configuration from the fetched registry, so this is
-        // where the hold is decided); it lifts once anything applies.
+        // where the hold is decided); it lifts after transfer clears JOIN.
         self.join_campaign_hold = self.capabilities.campaigns and
             self.capabilities.materializes and
             self.identity.configuration_id > 1 and

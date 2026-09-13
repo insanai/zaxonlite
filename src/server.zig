@@ -39,6 +39,7 @@ const payload_store_mod = @import("payload_store.zig");
 const enrollment = @import("enrollment.zig");
 const failpoint = @import("failpoint.zig");
 const status_json = @import("status_json.zig");
+const server_open_hint = @import("server_open_hint.zig");
 const roles = @import("roles.zig");
 const diagnostic = @import("diagnostic.zig");
 const durability = @import("durability.zig");
@@ -433,26 +434,11 @@ pub fn serve(
         .retention_slots = options.retention_slots,
         .journal_cap_bytes = options.journal_cap_bytes,
     }) catch |err| {
-        const hint = if (err == error.StateUnavailable)
-            "The image or anchor no longer reaches retained history. " ++
-                "v1 repairs a damaged voter by replacement: enroll a new " ++
-                "node and replace this one (ZDS 0008); the frozen " ++
-                "conservative trim keeps every slot the successor needs."
-        else if (err == error.UnsupportedIdentityVersion or
-            err == error.UnsupportedManifestVersion or
-            err == error.UnsupportedSegmentVersion or
-            err == error.UnsupportedTrimVersion)
-            "This data directory was written by zaxonlite 0.6.x. 0.7.0 " ++
-                "changed the journal, manifest, TRIM, and identity formats " ++
-                "with no migration; stop every member, delete each member's " ++
-                "data directory, and recreate the cluster together."
-        else
-            "Check the role-pinned identity and durable files before retrying.";
         try diagnostic.write(
             err_out,
             "node open failed",
             @errorName(err),
-            hint,
+            server_open_hint.forError(err),
         );
         try err_out.flush();
         return 4;
@@ -5299,6 +5285,7 @@ test "shutdown and failure cancel parked host operations without protocol ticks"
         .wake = Server.wakeWaiters,
         .release = Server.releaseWriterGate,
         .shutdown = Server.shutdown,
+        .close = Server.noteHandlerClosing,
     });
 }
 

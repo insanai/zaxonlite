@@ -93,6 +93,37 @@ test "node persists across close and reopen" {
     }
 }
 
+test "fresh later-configuration voter requires an enrollment JOIN descriptor" {
+    const gpa = testing.allocator;
+    var test_dir = try TestDir.init(gpa);
+    defer test_dir.deinit(gpa);
+    const dir = try test_dir.nodeDir(gpa);
+    defer gpa.free(dir);
+    try std.Io.Dir.cwd().createDirPath(testing.io, dir);
+    const identity_path = try std.fmt.allocPrint(gpa, "{s}/IDENTITY", .{dir});
+    defer gpa.free(identity_path);
+    try std.Io.Dir.cwd().writeFile(testing.io, .{
+        .sub_path = identity_path,
+        .data = "format=3\nnode_id=1\n" ++
+            "database_id=00000000000000000000000000000001\n" ++
+            "configuration_id=2\nrole=data-voter\n",
+    });
+    const member = try zaxonlite.registry.NodeRecord.init(
+        1,
+        .data_voter,
+        "127.0.0.1:1",
+    );
+    try testing.expectError(
+        error.JoinDescriptorRequired,
+        Node.open(gpa, testing.io, .{
+            .directory = dir,
+            .node_id = 1,
+            .database_id = 1,
+            .registry_nodes = &.{member},
+        }),
+    );
+}
+
 test "prepared explicit transaction is one durable replicated transition" {
     const gpa = testing.allocator;
     var test_dir = try TestDir.init(gpa);
