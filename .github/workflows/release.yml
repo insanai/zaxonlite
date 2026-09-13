@@ -416,22 +416,23 @@ jobs:
         with:
           files: release/*
           body: |
-            Zaxonlite 0.6.2 fixes shutdown with pending consensus operations,
-            interrupts stalled peer authentication, and bounds client connection
-            establishment and embedded startup with monotonic deadlines.
-            Requests are no longer automatically replayed after transmission
-            begins; uncertain writes require session-based retries.
+            Zaxonlite 0.7.0 fixes insanai/zaxonlite#10 by serializing background
+            trim proposals behind the settled applied frontier and identifying
+            each trim by its chosen global Paxos slot. This prevents repeated
+            pumps from creating conflicting trim decisions while an earlier trim
+            is still undecided.
 
-            macOS TCP and Unix connections avoid Zig 0.16's interrupted-connect
-            panic, including certificate enrollment, while preserving deadlines
-            and blocking stream behavior after connection establishment.
+            Terminal storage divergence now fails loudly and locally: status
+            reports the failure, blocked callers wake, the server prints one
+            diagnostic, and the process exits with exit code 4. Embedded, C, and
+            Python hosts can inspect the local member state.
 
-            Retained journal reads now validate sealed segments and stop before
-            their trailers, fixing false corruption during resynchronization,
-            recovery, range catch-up, and integrity checks after rotation.
-
-            Paxos, Zaxonlite, the CLI UI, Python SDK, and books are aligned on
-            0.6.2. Wire protocol 9 and journal format 2 are unchanged from 0.6.1.
+            **Breaking upgrade:** 0.7.0 uses wire protocol 10, segmented journal
+            and manifest format 3, TRIM format 2, and identity format 3. There is
+            no migration or rolling-upgrade path from 0.6.x. Stop every member,
+            delete every member's complete data directory, and recreate the
+            cluster with all members running 0.7.0. Do not mix 0.6.x and 0.7.0
+            peers or reuse selected files from an old data directory.
 
             This release includes self-contained `zaxon` CLI archives and
             CPython 3.12+ Stable ABI wheels for Linux x86-64, macOS, and
