@@ -20,6 +20,7 @@
 //! restart it is the local authority for both.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
@@ -32,6 +33,12 @@ const magic: u32 = 0x5254585a; // "ZXTR" in file byte order.
 const version: u16 = 2;
 
 pub const file_name = "TRIM";
+
+/// Test-only control for paths whose required error diagnostics would make
+/// Zig's test runner fail an otherwise expected invariant test.
+pub const test_options = if (builtin.is_test) struct {
+    pub var suppress_adoption_log = false;
+} else struct {};
 
 /// Concurrent transfer leases are bounded; one repair or replacement at a
 /// time is the product shape, with headroom.
@@ -231,6 +238,7 @@ fn logAdoption(
     decision_slot: u64,
     record: command.TrimRecord,
 ) void {
+    if (builtin.is_test and test_options.suppress_adoption_log) return;
     std.log.err(
         "trim {s}: decision={d} adopted=({d},{d}," ++
             "{x:0>2}{x:0>2}{x:0>2}{x:0>2}) record=({d}," ++
