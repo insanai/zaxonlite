@@ -528,7 +528,7 @@ pub const Node = struct {
     /// active transfer leases capping deletion (ZDS 0011).
     trim_state: trim.State = .{},
     /// Chosen-trim generation the payload sweep last ran for.
-    swept_trim_id: u64 = 0,
+    swept_trim_decision_slot: u64 = 0,
     /// Recent chosen transaction batches, kept so a write waiter can be
     /// resolved even after the core window released the slot's cell.
     recent_batches: [64]RecentBatch = [_]RecentBatch{.{}} ** 64,
@@ -785,7 +785,7 @@ pub const Node = struct {
         if (try trim.load(io, self.journal.dir)) |stored| {
             self.trim_state = stored;
             self.journal.noteTrimAnchor(
-                stored.trim_id,
+                stored.decision_slot,
                 stored.through_slot,
                 stored.history_hash,
             );
@@ -796,7 +796,7 @@ pub const Node = struct {
         // that already licensed deletion. Twins under one id, or a journal
         // ahead of the file, mean corruption and fail closed.
         const replayed = durable.anchor;
-        if (self.trim_state.trim_id == replayed.trim_id) {
+        if (self.trim_state.decision_slot == replayed.trim_id) {
             if (replayed.trim_id != 0 and
                 (self.trim_state.through_slot != replayed.chosen_trim_slot or
                     !std.mem.eql(
@@ -807,9 +807,9 @@ pub const Node = struct {
             {
                 return error.TrimRegression;
             }
-        } else if (self.trim_state.trim_id > replayed.trim_id) {
+        } else if (self.trim_state.decision_slot > replayed.trim_id) {
             try durable.apply(.{ .trim_anchor = .{
-                .trim_id = self.trim_state.trim_id,
+                .trim_id = self.trim_state.decision_slot,
                 .chosen_trim_slot = self.trim_state.through_slot,
                 .history_hash = self.trim_state.history_hash,
             } });
@@ -984,6 +984,15 @@ pub const Node = struct {
 
     /// Requests decided entries this node is missing from `peer`.
     pub fn requestCatchUp(self: *Node, peer: paxos.NodeId) !void {
+        // A fresh voter joining a later configuration cannot reconstruct
+        // old entries' configuration-bound history leaves from entries
+        // alone. It must first install a survivor's post-handover anchor;
+        // range recovery is safe for the suffix after that base.
+        if (self.join_campaign_hold and self.applied_slot == 0 and
+            self.identity.configuration_id > 1)
+        {
+            return;
+        }
         try self.log.requestCatchUp(peer, self.applied_slot + 1, self.effects);
         try self.consumeEffects();
     }
@@ -1762,22 +1771,29 @@ pub const Node = struct {
     /// from the minimum durable-state frontier of every data replica.
     pub fn proposeTrim(self: *Node, candidate: trim.Candidate) !void {
         if (self.fatal_storage_error) return error.StorageFailed;
+        if (!self.proposalFrontierSettled()) return;
+        if (candidate.through_slot <= self.trim_state.through_slot) return;
+        const expected_slot = self.log.proposalFrontier();
         const record = command.TrimRecord{
-            .trim_id = self.trim_state.trim_id + 1,
             .through_slot = candidate.through_slot,
             .history_hash = candidate.history_hash,
             .configuration_id = self.identity.configuration_id,
             .policy = 0,
         };
-        _ = try self.log.append(.{ .trim = record }, self.effects);
+        const proposal_slot = try self.log.append(.{ .trim = record }, self.effects);
+        std.debug.assert(proposal_slot == expected_slot);
         try self.consumeEffects();
     }
 
     /// Adopts a chosen trim record: validates it against the durable trim
     /// state, persists the TRIM file, installs the core anchor, and
     /// leaves physical reclamation to the next pump.
-    fn adoptChosenTrim(self: *Node, record: command.TrimRecord) !void {
-        switch (trim.classify(&self.trim_state, record)) {
+    fn adoptChosenTrim(
+        self: *Node,
+        decision_slot: paxos.Slot,
+        record: command.TrimRecord,
+    ) !void {
+        switch (trim.classify(&self.trim_state, decision_slot, record)) {
             .ignore => return,
             .corrupt => {
                 self.fatal_storage_error = true;
@@ -1785,20 +1801,26 @@ pub const Node = struct {
             },
             .adopt => {},
         }
-        self.trim_state.trim_id = record.trim_id;
+        self.trim_state.decision_slot = decision_slot;
         self.trim_state.through_slot = record.through_slot;
         self.trim_state.history_hash = record.history_hash;
         self.trim_state.configuration_id = record.configuration_id;
         failpoint.hit("before_trim_file");
-        try trim.store(self.io, self.journal.dir, self.trim_state);
+        trim.store(self.io, self.journal.dir, self.trim_state) catch |err| {
+            self.fatal_storage_error = true;
+            return err;
+        };
         failpoint.hit("after_trim_file");
-        try self.log.installChosenTrim(.{
-            .trim_id = record.trim_id,
+        self.log.installChosenTrim(.{
+            .trim_id = decision_slot,
             .chosen_trim_slot = record.through_slot,
             .history_hash = record.history_hash,
-        }, self.effects);
+        }, self.effects) catch |err| {
+            self.fatal_storage_error = true;
+            return err;
+        };
         self.journal.noteTrimAnchor(
-            record.trim_id,
+            decision_slot,
             record.through_slot,
             record.history_hash,
         );
@@ -1806,7 +1828,7 @@ pub const Node = struct {
 
     /// Records a chosen transfer lease; deletion is capped at its base
     /// until completion, whatever happens to the sender.
-    fn trackLease(self: *Node, lease: command.TransferLease) void {
+    fn trackLease(self: *Node, lease: command.TransferLease) !void {
         for (self.trim_state.leases[0..self.trim_state.lease_count]) |held| {
             if (held.lease_id == lease.lease_id) return;
         }
@@ -1823,12 +1845,13 @@ pub const Node = struct {
             .expiry_ticks_left = lease.expires_after_leader_ticks,
         };
         self.trim_state.lease_count += 1;
-        trim.store(self.io, self.journal.dir, self.trim_state) catch {
+        trim.store(self.io, self.journal.dir, self.trim_state) catch |err| {
             self.fatal_storage_error = true;
+            return err;
         };
     }
 
-    fn releaseLease(self: *Node, lease_id: u64) void {
+    fn releaseLease(self: *Node, lease_id: u64) !void {
         var index: u8 = 0;
         while (index < self.trim_state.lease_count) : (index += 1) {
             if (self.trim_state.leases[index].lease_id == lease_id) break;
@@ -1836,8 +1859,9 @@ pub const Node = struct {
         self.trim_state.lease_count -= 1;
         self.trim_state.leases[index] =
             self.trim_state.leases[self.trim_state.lease_count];
-        trim.store(self.io, self.journal.dir, self.trim_state) catch {
+        trim.store(self.io, self.journal.dir, self.trim_state) catch |err| {
             self.fatal_storage_error = true;
+            return err;
         };
     }
 
@@ -1872,9 +1896,9 @@ pub const Node = struct {
         // The payload sweep streams the whole retained journal, so it
         // runs when history was removed or the chosen trim advanced —
         // never on every pump.
-        if (removed or self.trim_state.trim_id > self.swept_trim_id) {
+        if (removed or self.trim_state.decision_slot > self.swept_trim_decision_slot) {
             try self.sweepPayloads();
-            self.swept_trim_id = self.trim_state.trim_id;
+            self.swept_trim_decision_slot = self.trim_state.decision_slot;
         }
     }
 
@@ -2310,6 +2334,14 @@ pub const Node = struct {
         self.decided_registry = next;
         try self.adoptDecidedMembers();
         try self.continueOnConfiguration(stop_slot);
+        // Publish a base carrying the new configuration identity even when
+        // the stop changed no SQLite pages. A later replacement installs
+        // this exact history anchor before requesting the retained suffix.
+        if (self.capabilities.materializes and
+            self.applied_slot > self.durable_state_slot)
+        {
+            try self.createStateAnchor();
+        }
 
         if (try self.pendingOperation()) |pending| {
             if (parsed.seed) |seed| {
@@ -3570,21 +3602,21 @@ pub const Node = struct {
                             self.capture_batch_id = null;
                             self.needs_resync = true;
                         }
-                        try self.adoptChosenTrim(record);
+                        try self.adoptChosenTrim(entry.slot, record);
                     },
                     .transfer_lease => |lease| {
                         if (self.capture_batch_id != null) {
                             self.capture_batch_id = null;
                             self.needs_resync = true;
                         }
-                        self.trackLease(lease);
+                        try self.trackLease(lease);
                     },
                     .lease_complete => |complete| {
                         if (self.capture_batch_id != null) {
                             self.capture_batch_id = null;
                             self.needs_resync = true;
                         }
-                        self.releaseLease(complete.lease_id);
+                        try self.releaseLease(complete.lease_id);
                     },
                     .transaction_batch => |batch| {
                         try self.checkChainBase(entry.slot, batch);
@@ -3688,6 +3720,12 @@ pub const Node = struct {
 
     pub fn storageFailed(self: *const Node) bool {
         return self.fatal_storage_error;
+    }
+
+    /// Irreversibly disables the local protocol participant after a host
+    /// invariant or durability failure. Recovery requires a fresh Node.
+    pub fn markFailed(self: *Node) void {
+        self.fatal_storage_error = true;
     }
 
     /// Applies one committed payload offline to the materialized image.
@@ -4226,18 +4264,15 @@ fn loadOrCreateIdentity(
     defer gpa.free(bytes);
 
     const format = manifestValue(bytes, "format") orelse return error.CorruptIdentity;
-    if (!std.mem.eql(u8, format, "1") and !std.mem.eql(u8, format, "2")) {
-        return error.CorruptIdentity;
-    }
+    if (!std.mem.eql(u8, format, "3")) return error.UnsupportedIdentityVersion;
     const node_text = manifestValue(bytes, "node_id") orelse return error.CorruptIdentity;
     const database_text = manifestValue(bytes, "database_id") orelse return error.CorruptIdentity;
     const configuration_text = manifestValue(bytes, "configuration_id") orelse
         return error.CorruptIdentity;
-    const persisted_role = if (std.mem.eql(u8, format, "2")) blk: {
-        const role_text = manifestValue(bytes, "role") orelse
-            return error.CorruptIdentity;
-        break :blk roles.Role.parse(role_text) catch return error.CorruptIdentity;
-    } else roles.Role.data_voter;
+    const role_text = manifestValue(bytes, "role") orelse
+        return error.CorruptIdentity;
+    const persisted_role = roles.Role.parse(role_text) catch
+        return error.CorruptIdentity;
 
     const identity = Identity{
         .node_id = std.fmt.parseInt(paxos.NodeId, node_text, 10) catch
@@ -4260,7 +4295,7 @@ fn writeIdentity(io: Io, dir: Io.Dir, identity: Identity) !void {
     var buffer: [256]u8 = undefined;
     const contents = std.fmt.bufPrint(
         &buffer,
-        \\format=2
+        \\format=3
         \\node_id={d}
         \\database_id={x:0>32}
         \\configuration_id={d}
@@ -4296,6 +4331,23 @@ fn atomicWriteFile(io: Io, dir: Io.Dir, name: []const u8, contents: []const u8) 
     try durability.syncFile(io, atomic.file);
     try atomic.replace(io);
     try durability.syncPathnameTransition(io, dir, name);
+}
+
+test "identity format 2 is explicitly unsupported" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try atomicWriteFile(
+        io,
+        tmp.dir,
+        identity_file_name,
+        "format=2\nnode_id=1\ndatabase_id=00000000000000000000000000000001\n" ++
+            "configuration_id=1\nrole=data-voter\n",
+    );
+    try std.testing.expectError(
+        error.UnsupportedIdentityVersion,
+        loadOrCreateIdentity(std.testing.allocator, io, tmp.dir, 1, 1, .data_voter),
+    );
 }
 
 /// Makes removal durable on every supported platform. Renaming to a live
