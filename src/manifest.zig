@@ -330,7 +330,11 @@ test "journal v2 manifest is explicitly unsupported" {
     var bytes: [fixed_size + checksum_size]u8 = undefined;
     _ = try file.readPositionalAll(io, &bytes, 0);
     std.mem.writeInt(u32, bytes[0..4], previous_magic, .little);
-    Sha256.hash(bytes[0 .. bytes.len - checksum_size], bytes[bytes.len - checksum_size ..][0..32], .{});
+    Sha256.hash(
+        bytes[0 .. bytes.len - checksum_size],
+        bytes[bytes.len - checksum_size ..][0..32],
+        .{},
+    );
     try file.writePositionalAll(io, &bytes, 0);
     try testing.expectError(
         error.UnsupportedManifestVersion,

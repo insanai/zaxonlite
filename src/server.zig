@@ -47,16 +47,15 @@ const registry = @import("registry.zig");
 const replacement_error = @import("replacement_error.zig");
 const leader_frontier = @import("leader_frontier.zig");
 const deadlines = @import("net_deadline.zig");
+const server_options = @import("server_options.zig");
 
 const Node = node_mod.Node;
 const Log = types.Log;
 
-pub const PeerAddress = struct {
-    id: paxos.NodeId,
-    host: []const u8,
-    port: u16,
-    role: roles.Role = .data_voter,
-};
+pub const PeerAddress = server_options.PeerAddress;
+pub const ServeOptions = server_options.ServeOptions;
+pub const TestFaults = server_options.TestFaults;
+pub const deriveDatabaseId = server_options.deriveDatabaseId;
 
 /// Bounded copy of one administrator principal name.
 pub const AdminName = struct {
@@ -193,116 +192,6 @@ fn buildMemberGeneration(
     return generation;
 }
 
-pub const ServeOptions = struct {
-    directory: []const u8,
-    node_id: paxos.NodeId,
-    listen_host: []const u8 = "127.0.0.1",
-    listen_port: u16 = 0,
-    /// Unix-domain socket path for single-node local service. When set,
-    /// the server listens here instead of TCP and relies on the socket's
-    /// filesystem permissions for local authorization. Configured peers
-    /// are rejected: cluster links require network transport.
-    listen_unix: ?[]const u8 = null,
-    /// Permission bits applied to the socket path immediately after
-    /// binding. Owner-only by default; widen to 0o660 for group access.
-    listen_unix_mode: u16 = 0o600,
-    /// Runtime node registry, including this node. Empty means one local
-    /// data voter. Only data voters and witnesses enter Paxos membership.
-    members: []const PeerAddress = &.{},
-    /// Shared database identity; derived from the member list when null.
-    database_id: ?u128 = null,
-    /// Shared transport secret loaded by the host from a protected provider.
-    /// When present, mutual PSK authentication and per-frame integrity run
-    /// inside the mandatory production TLS channel.
-    auth_secret: ?[]const u8 = null,
-    /// Explicit local-development transport: PSK authentication and frame
-    /// integrity without TLS, accepted only when the listener and every peer
-    /// use the numeric loopback address. This has no confidentiality or
-    /// per-node identity and must not be exposed beyond one machine.
-    allow_psk_only_loopback: bool = false,
-    /// Optional mutual TLS 1.3 identity for every TCP connection: this
-    /// node's certificate/key and the cluster CA. Peer certificates must
-    /// chain to the CA and name `zaxon-node-<id>` matching their hello.
-    tls: ?tls.Config = null,
-    /// Optional cluster CA private key used only to redeem one-time
-    /// enrollment tokens and sign node CSRs. When absent, the listener keeps
-    /// strict handshake-level mTLS and exposes no enrollment operation.
-    enrollment_ca_key: ?[]const u8 = null,
-    /// Optional operator-managed denylist. Each non-comment line is one
-    /// configured node ID. Reloads close live inbound and outbound links.
-    revocation_file: ?[]const u8 = null,
-    /// Administrator names authorized for privileged membership
-    /// operations, matched against `zaxon-admin-<name>` client
-    /// certificates. Empty denies every privileged request.
-    admin_principals: []const []const u8 = &.{},
-    /// Explicit escape hatch for deterministic local test harnesses. It is
-    /// rejected unless failpoints are enabled and is never a production
-    /// transport mode.
-    allow_insecure_test_tcp: bool = false,
-    /// Maximum concurrently served connections (peers, clients, and
-    /// transfer streams together). 0 derives a small-cluster default from
-    /// the member registry; admission never grows past the limit.
-    max_connections: usize = 0,
-    /// Milliseconds an accepted connection may spend completing hello and
-    /// authentication before the server closes it. 0 disables the
-    /// deadline (tests with deterministic schedules use that).
-    handshake_timeout_ms: u64 = 10_000,
-    /// Embedding-owned stop request. The ticker observes it even after failure.
-    shutdown_flag: ?*std.atomic.Value(bool) = null,
-    /// Optional embedding-owned first-failure publication. The server writes
-    /// the bytes before publishing the nonzero length with release ordering.
-    failure_name_buffer: ?*[128]u8 = null,
-    failure_name_len: ?*std.atomic.Value(u8) = null,
-    /// Established connections that receive no frame for this long are
-    /// closed. Peer heartbeats keep healthy cluster links active. Zero
-    /// disables the bound for a deterministic test schedule.
-    idle_timeout_ms: u64 = 300_000,
-    /// Inbound connections concurrently authenticated as one configured
-    /// peer. Two permits a reconnect to overlap a dying old socket.
-    max_connections_per_peer: usize = 2,
-    /// Upper bound for one declared snapshot or backup transfer.
-    max_transfer_bytes: u64 = wire.max_transfer_bytes,
-    /// Remote query result caps. Embedded Node calls remain unlimited unless
-    /// their caller explicitly supplies QueryLimits.
-    max_query_rows: usize = 10_000,
-    max_query_bytes: usize = 16 * 1024 * 1024,
-    /// Approximate SQLite VM instruction budget; 0 explicitly disables it.
-    max_query_vm_steps: u64 = 10_000_000,
-    /// SQLite-managed mapped-I/O limit for every node connection. Zero
-    /// disables mmap; nonzero is an explicit operator opt-in bounded at
-    /// 1 GiB (ZDS 0009).
-    mmap_size: u64 = 0,
-    /// Retention horizon in slots below the chosen trim (ZDS 0011).
-    retention_slots: u64 = 0,
-    /// Hard ceiling over journal plus retained payload bytes,
-    /// refusing writes at the ZDS 0011 Q2 default; zero disables.
-    journal_cap_bytes: u64 = 64 * 1024 * 1024 * 1024,
-    /// Honor `failpoint` RPCs (test controllers only).
-    enable_failpoints: bool = false,
-    tick_ms: u64 = 25,
-    /// Deterministic test-only adverse schedules. Rejected unless
-    /// `enable_failpoints` is also true.
-    test_faults: TestFaults = .{},
-};
-
-pub const TestFaults = struct {
-    drop_every: u32 = 0,
-    duplicate_every: u32 = 0,
-    reorder_pairs: bool = false,
-    fragment_bytes: u32 = 0,
-    storage_delay_ms: u64 = 0,
-    /// Holds this node's phase-two votes for that long before they leave,
-    /// so a re-proposed slot stays undecided for a known window while
-    /// elections and heartbeats run at full speed.
-    vote_delay_ms: u64 = 0,
-
-    fn enabled(self: TestFaults) bool {
-        return self.drop_every != 0 or self.duplicate_every != 0 or
-            self.reorder_pairs or self.fragment_bytes != 0 or
-            self.storage_delay_ms != 0 or self.vote_delay_ms != 0;
-    }
-};
-
 /// Milliseconds a client operation may wait before reporting a timeout.
 const op_timeout_ms: u64 = 10_000;
 const held_hash_limit = 64;
@@ -311,30 +200,6 @@ const sender_queue_limit = 4096;
 const sender_queue_byte_limit: usize = 128 * 1024 * 1024;
 const snapshot_chunk_bytes: usize = 1024 * 1024;
 const max_revoked_nodes: usize = 4 * types.log_options.max_members;
-
-/// Derives a deterministic shared database identity from the member list.
-pub fn deriveDatabaseId(members: []const PeerAddress, cluster_id: ?[]const u8) u128 {
-    var ids: [types.log_options.max_members]paxos.NodeId = undefined;
-    var count: usize = 0;
-    for (members) |member| {
-        if (!member.role.capabilities().votes) continue;
-        if (count == ids.len) break;
-        ids[count] = member.id;
-        count += 1;
-    }
-    std.mem.sort(paxos.NodeId, ids[0..count], {}, std.sort.asc(paxos.NodeId));
-    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update("zaxonlite.cluster.v1");
-    for (ids[0..count]) |id| {
-        var bytes: [4]u8 = undefined;
-        std.mem.writeInt(u32, &bytes, id, .little);
-        hasher.update(&bytes);
-    }
-    if (cluster_id) |text| hasher.update(text);
-    var digest: [32]u8 = undefined;
-    hasher.final(&digest);
-    return std.mem.readInt(u128, digest[0..16], .little);
-}
 
 pub fn serve(
     gpa: std.mem.Allocator,
@@ -572,6 +437,14 @@ pub fn serve(
                 "v1 repairs a damaged voter by replacement: enroll a new " ++
                 "node and replace this one (ZDS 0008); the frozen " ++
                 "conservative trim keeps every slot the successor needs."
+        else if (err == error.UnsupportedIdentityVersion or
+            err == error.UnsupportedManifestVersion or
+            err == error.UnsupportedSegmentVersion or
+            err == error.UnsupportedTrimVersion)
+            "This data directory was written by zaxonlite 0.6.x. 0.7.0 " ++
+                "changed the journal, manifest, TRIM, and identity formats " ++
+                "with no migration; stop every member, delete each member's " ++
+                "data directory, and recreate the cluster together."
         else
             "Check the role-pinned identity and durable files before retrying.";
         try diagnostic.write(
@@ -757,6 +630,16 @@ pub fn serve(
         if (sender.spawned) sender.thread.join();
     }
     server.waitForHandlers();
+    if (server.first_failure) |err| {
+        const hint = if (err == error.TrimRegression)
+            "Inspect the TRIM file and the journal trim anchors; a diverged " ++
+                "history at one slot needs replacement (ZDS 0008)."
+        else
+            "Read this node's log for the first failure; restart after the " ++
+                "durable files are repaired.";
+        try diagnostic.write(err_out, "node failed", @errorName(err), hint);
+        try err_out.flush();
+    }
     std.log.info("node {d}: stopped", .{options.node_id});
     return if (server.failed) 4 else 0;
 }
@@ -1182,20 +1065,18 @@ pub const Server = struct {
             self.stop_response_sent.waitTimeout(self.io, .{ .deadline = end }) catch {};
         }
         self.mutex.lockUncancelable(self.io);
-        const connections = self.gpa.alloc(
-            TrackedConnection,
-            self.active_connections.items.len,
-        ) catch @panic("out of memory while stopping server");
         self.connection_interrupting = true;
-        if (connections.len > 0) {
-            @memcpy(connections, self.active_connections.items);
-        }
-        self.mutex.unlock(self.io);
-        defer self.gpa.free(connections);
-        for (connections) |connection| {
+        // Handler removal waits while interruption owns the list, and shutdown
+        // admission is already closed. Copy one descriptor at a time so this
+        // terminal path neither allocates nor performs socket I/O under mutex.
+        const connection_count = self.active_connections.items.len;
+        var connection_index: usize = 0;
+        while (connection_index < connection_count) : (connection_index += 1) {
+            const connection = self.active_connections.items[connection_index];
+            self.mutex.unlock(self.io);
             connection.stream.shutdown(self.io, .both) catch {};
+            self.mutex.lockUncancelable(self.io);
         }
-        self.mutex.lockUncancelable(self.io);
         self.connection_interrupting = false;
         self.handler_cond.broadcast(self.io);
         self.mutex.unlock(self.io);
@@ -1544,7 +1425,6 @@ pub const Server = struct {
 
     fn pump(self: *Server) void {
         self.pumpFallible() catch |err| {
-            std.log.err("node host failure: {s}", .{@errorName(err)});
             self.failLocked(err);
         };
     }
@@ -1555,6 +1435,12 @@ pub const Server = struct {
     fn failLocked(self: *Server, err: anyerror) void {
         if (self.first_failure != null) return;
         self.first_failure = err;
+        if (!builtin.is_test) {
+            std.log.err(
+                "node {d} failed: {s}",
+                .{ self.node.identity.node_id, @errorName(err) },
+            );
+        }
         if (self.options.failure_name_buffer) |buffer| {
             const name = @errorName(err);
             const len: u8 = @intCast(@min(name.len, buffer.len));
@@ -1617,9 +1503,14 @@ pub const Server = struct {
             try self.maybeProposeTrim();
         }
 
-        // Physical reclamation below the adopted trim, off the commit path.
+        // Physical reclamation is off the commit path and retries on the next
+        // pump. A failed unlink must not turn an otherwise healthy replica
+        // into a terminal consensus failure.
         if (!self.retired) {
-            try self.node.reclaim();
+            self.node.reclaim() catch |err| std.log.warn(
+                "reclamation failed: {s}",
+                .{@errorName(err)},
+            );
         }
 
         // A decided membership stop completes here: the survivor installs
@@ -2072,7 +1963,6 @@ pub const Server = struct {
                     self.evictRevokedLocked();
                 }
                 self.node.tickProtocol() catch |err| {
-                    std.log.err("tick failure: {s}", .{@errorName(err)});
                     self.failLocked(err);
                     continue;
                 };
@@ -2626,7 +2516,6 @@ pub const Server = struct {
         }
 
         self.node.stepEnvelope(envelope) catch |err| {
-            std.log.err("step failure: {s}", .{@errorName(err)});
             self.failLocked(err);
             return;
         };
@@ -2709,7 +2598,6 @@ pub const Server = struct {
         defer self.mutex.unlock(self.io);
         if (self.failed) return;
         _ = self.node.store.put(payload) catch |err| {
-            std.log.warn("payload store failure: {s}", .{@errorName(err)});
             self.failLocked(err);
             return;
         };
@@ -2728,7 +2616,6 @@ pub const Server = struct {
             self.held_total -= 1;
             for (entry.value.envelopes[0..entry.value.count]) |envelope| {
                 self.node.stepEnvelope(envelope) catch |err| {
-                    std.log.err("step failure: {s}", .{@errorName(err)});
                     self.failLocked(err);
                     return;
                 };
@@ -4840,6 +4727,7 @@ pub const Server = struct {
             return writeErrorResponse(out, "unavailable", "node failed");
         }
         self.node.createStateAnchor() catch |err| {
+            if (self.node.storageFailed()) self.failLocked(err);
             return writeErrorResponse(out, "internal", @errorName(err));
         };
         return out.print(
@@ -5207,7 +5095,6 @@ const PeerSender = struct {
                     self.peer.role.capabilities().votes)
                 {
                     self.server.node.peerReconnected(self.peer.id) catch |err| {
-                        std.log.err("reconnect repair failed: {s}", .{@errorName(err)});
                         self.server.failLocked(err);
                     };
                 }

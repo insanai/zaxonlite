@@ -25,6 +25,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const command = @import("command.zig");
 const durability = @import("durability.zig");
+const failpoint = @import("failpoint.zig");
 const paxos = @import("paxos");
 
 const magic: u32 = 0x5254585a; // "ZXTR" in file byte order.
@@ -145,10 +146,19 @@ pub fn deleteFloor(
     return floor;
 }
 
-/// Validates a chosen trim record against the durable state. A replayed
-/// or duplicate lower trim is ignored; a same-ID record with a different
-/// anchor is corruption and must stop the node.
-pub const Adoption = enum { adopt, ignore, corrupt };
+/// Classifies a chosen trim against the already durable anchor. Exact replay
+/// is idempotent. Older decisions and later decisions that authorize no more
+/// deletion are safe to ignore: retaining more history cannot violate a
+/// GlobalTrim invariant, and recovery's page-image replay treats maintenance
+/// commands the same way. A decision-slot twin or a different history at the
+/// same trim frontier is durable-history divergence and remains fatal.
+pub const Adoption = enum {
+    adopt,
+    ignore_replay,
+    ignore_stale,
+    ignore_duplicate,
+    diverged,
+};
 
 pub fn classify(
     state: *const State,
@@ -159,11 +169,117 @@ pub fn classify(
         const same = record.through_slot == state.through_slot and
             record.configuration_id == state.configuration_id and
             std.mem.eql(u8, &record.history_hash, &state.history_hash);
-        return if (same) .ignore else .corrupt;
+        return if (same) .ignore_replay else .diverged;
     }
-    if (decision_slot < state.decision_slot) return .ignore;
-    if (record.through_slot <= state.through_slot) return .corrupt;
+    if (decision_slot < state.decision_slot) return .ignore_stale;
+    if (record.through_slot < state.through_slot) return .ignore_stale;
+    if (record.through_slot == state.through_slot) {
+        const same_history = record.configuration_id == state.configuration_id and
+            std.mem.eql(u8, &record.history_hash, &state.history_hash);
+        return if (same_history) .ignore_duplicate else .diverged;
+    }
     return .adopt;
+}
+
+/// Applies the classified trim outcome to a node host. Keeping the transition
+/// beside `classify` makes the safe-ignore and fatal-divergence cases share one
+/// policy boundary; `node.zig` supplies the durable stores and Paxos adapter.
+pub fn adoptChosen(node: anytype, decision_slot: u64, record: command.TrimRecord) !void {
+    const adoption = classify(&node.trim_state, decision_slot, record);
+    switch (adoption) {
+        .ignore_replay => return,
+        .ignore_stale, .ignore_duplicate => {
+            logAdoption(node.trim_state, adoption, decision_slot, record);
+            node.trim_ignored_count +|= 1;
+            return;
+        },
+        .diverged => {
+            logAdoption(node.trim_state, adoption, decision_slot, record);
+            node.fatal_storage_error = true;
+            return error.TrimRegression;
+        },
+        .adopt => {},
+    }
+    node.trim_state.decision_slot = decision_slot;
+    node.trim_state.through_slot = record.through_slot;
+    node.trim_state.history_hash = record.history_hash;
+    node.trim_state.configuration_id = record.configuration_id;
+    failpoint.hit("before_trim_file");
+    store(node.io, node.journal.dir, node.trim_state) catch |err| {
+        node.fatal_storage_error = true;
+        return err;
+    };
+    failpoint.hit("after_trim_file");
+    node.log.installChosenTrim(.{
+        .trim_id = decision_slot,
+        .chosen_trim_slot = record.through_slot,
+        .history_hash = record.history_hash,
+    }, node.effects) catch |err| {
+        node.fatal_storage_error = true;
+        return err;
+    };
+    node.journal.noteTrimAnchor(
+        decision_slot,
+        record.through_slot,
+        record.history_hash,
+    );
+}
+
+fn logAdoption(
+    state: State,
+    adoption: Adoption,
+    decision_slot: u64,
+    record: command.TrimRecord,
+) void {
+    std.log.err(
+        "trim {s}: decision={d} adopted=({d},{d}," ++
+            "{x:0>2}{x:0>2}{x:0>2}{x:0>2}) record=({d}," ++
+            "{x:0>2}{x:0>2}{x:0>2}{x:0>2})",
+        .{
+            @tagName(adoption),     decision_slot,
+            state.decision_slot,    state.through_slot,
+            state.history_hash[0],  state.history_hash[1],
+            state.history_hash[2],  state.history_hash[3],
+            record.through_slot,    record.history_hash[0],
+            record.history_hash[1], record.history_hash[2],
+            record.history_hash[3],
+        },
+    );
+}
+
+/// Persists a newly chosen transfer lease. Capacity overflow is a
+/// deterministic no-op; the sender's pinned image remains the safety owner.
+pub fn trackLease(node: anytype, lease: command.TransferLease) !void {
+    for (node.trim_state.leasesSlice()) |held| {
+        if (held.lease_id == lease.lease_id) return;
+    }
+    if (node.trim_state.lease_count >= max_leases) return;
+    node.trim_state.leases[node.trim_state.lease_count] = .{
+        .lease_id = lease.lease_id,
+        .receiver_id = lease.receiver_id,
+        .base_slot = lease.base_slot,
+        .expiry_ticks_left = lease.expires_after_leader_ticks,
+    };
+    node.trim_state.lease_count += 1;
+    store(node.io, node.journal.dir, node.trim_state) catch |err| {
+        node.fatal_storage_error = true;
+        return err;
+    };
+}
+
+/// Removes and persists a chosen transfer lease, or does nothing when replay
+/// has already removed it.
+pub fn releaseLease(node: anytype, lease_id: u64) !void {
+    var index: u8 = 0;
+    while (index < node.trim_state.lease_count) : (index += 1) {
+        if (node.trim_state.leases[index].lease_id == lease_id) break;
+    } else return;
+    node.trim_state.lease_count -= 1;
+    node.trim_state.leases[index] = node.trim_state.leases[node.trim_state.lease_count];
+    store(node.io, node.journal.dir, node.trim_state) catch |err| {
+        node.fatal_storage_error = true;
+        return err;
+    };
 }
 
 const record_size = 4 + 2 + 2 + 8 + 8 + 32 + 8 + 1 +
@@ -325,7 +441,7 @@ test "the delete floor honors trim, local state, retention, and leases" {
     );
 }
 
-test "trim adoption is idempotent and a conflicting anchor is corruption" {
+test "trim adoption distinguishes replay stale duplicate and divergence" {
     const state = State{
         .decision_slot = 20,
         .through_slot = 100,
@@ -338,11 +454,11 @@ test "trim adoption is idempotent and a conflicting anchor is corruption" {
         .configuration_id = 1,
         .policy = 0,
     };
-    try testing.expectEqual(Adoption.ignore, classify(&state, 20, same));
+    try testing.expectEqual(Adoption.ignore_replay, classify(&state, 20, same));
 
     var conflicting = same;
     conflicting.history_hash = [_]u8{9} ** 32;
-    try testing.expectEqual(Adoption.corrupt, classify(&state, 20, conflicting));
+    try testing.expectEqual(Adoption.diverged, classify(&state, 20, conflicting));
 
     var newer = same;
     newer.through_slot = 150;
@@ -350,15 +466,22 @@ test "trim adoption is idempotent and a conflicting anchor is corruption" {
 
     var regressing = newer;
     regressing.through_slot = 50;
-    try testing.expectEqual(Adoption.corrupt, classify(&state, 30, regressing));
+    try testing.expectEqual(Adoption.ignore_stale, classify(&state, 30, regressing));
 
     var nonadvancing = newer;
     nonadvancing.through_slot = state.through_slot;
-    try testing.expectEqual(Adoption.corrupt, classify(&state, 30, nonadvancing));
+    try testing.expectEqual(Adoption.ignore_duplicate, classify(&state, 30, nonadvancing));
+
+    nonadvancing.history_hash = [_]u8{9} ** 32;
+    try testing.expectEqual(Adoption.diverged, classify(&state, 30, nonadvancing));
+
+    nonadvancing = same;
+    nonadvancing.configuration_id = 2;
+    try testing.expectEqual(Adoption.diverged, classify(&state, 30, nonadvancing));
 
     var older = same;
     older.through_slot = 40;
-    try testing.expectEqual(Adoption.ignore, classify(&state, 10, older));
+    try testing.expectEqual(Adoption.ignore_stale, classify(&state, 10, older));
 }
 
 test "the durable trim record round trips and fails closed on corruption" {

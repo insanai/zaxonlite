@@ -150,7 +150,9 @@ pub const Status = struct {
     applied_slot: paxos.Slot,
     durable_state_slot: paxos.Slot,
     memory_floor: paxos.Slot,
+    trim_decision_slot: paxos.Slot,
     chosen_trim_slot: paxos.Slot,
+    trim_ignored: u64,
     retained_first_slot: paxos.Slot,
     journal_records: u64,
     journal_segment_count: u64,
@@ -574,6 +576,7 @@ pub const Node = struct {
     /// stop voting and serving; continuing after a failed fsync would violate
     /// the effects contract.
     fatal_storage_error: bool = false,
+    trim_ignored_count: u64 = 0,
     test_storage_delay_ms: u64 = 0,
     /// Operator-selected mapped-I/O limit applied to every connection.
     mmap_size: u64 = 0,
@@ -1596,7 +1599,9 @@ pub const Node = struct {
             .applied_slot = self.applied_slot,
             .durable_state_slot = self.durable_state_slot,
             .memory_floor = self.log.memoryFloor(),
+            .trim_decision_slot = self.trim_state.decision_slot,
             .chosen_trim_slot = self.log.trimAnchor().chosen_trim_slot,
+            .trim_ignored = self.trim_ignored_count,
             .retained_first_slot = self.journal.retainedFirstSlot(),
             .journal_records = self.journal.next_sequence - 1,
             .journal_segment_count = journal_stats.segment_count,
@@ -1785,84 +1790,28 @@ pub const Node = struct {
         try self.consumeEffects();
     }
 
-    /// Adopts a chosen trim record: validates it against the durable trim
-    /// state, persists the TRIM file, installs the core anchor, and
-    /// leaves physical reclamation to the next pump.
+    /// Adopts a chosen trim record. Exact replay is idempotent; stale or
+    /// duplicate decisions are diagnosed and skipped because they cannot
+    /// authorize deletion beyond the durable anchor. A decision-slot twin or
+    /// conflicting history at the same frontier is durable-history divergence.
+    /// A real advance persists TRIM, installs the core anchor, and leaves
+    /// physical reclamation to the next pump.
     fn adoptChosenTrim(
         self: *Node,
         decision_slot: paxos.Slot,
         record: command.TrimRecord,
     ) !void {
-        switch (trim.classify(&self.trim_state, decision_slot, record)) {
-            .ignore => return,
-            .corrupt => {
-                self.fatal_storage_error = true;
-                return error.TrimRegression;
-            },
-            .adopt => {},
-        }
-        self.trim_state.decision_slot = decision_slot;
-        self.trim_state.through_slot = record.through_slot;
-        self.trim_state.history_hash = record.history_hash;
-        self.trim_state.configuration_id = record.configuration_id;
-        failpoint.hit("before_trim_file");
-        trim.store(self.io, self.journal.dir, self.trim_state) catch |err| {
-            self.fatal_storage_error = true;
-            return err;
-        };
-        failpoint.hit("after_trim_file");
-        self.log.installChosenTrim(.{
-            .trim_id = decision_slot,
-            .chosen_trim_slot = record.through_slot,
-            .history_hash = record.history_hash,
-        }, self.effects) catch |err| {
-            self.fatal_storage_error = true;
-            return err;
-        };
-        self.journal.noteTrimAnchor(
-            decision_slot,
-            record.through_slot,
-            record.history_hash,
-        );
+        return trim.adoptChosen(self, decision_slot, record);
     }
 
     /// Records a chosen transfer lease; deletion is capped at its base
     /// until completion, whatever happens to the sender.
     fn trackLease(self: *Node, lease: command.TransferLease) !void {
-        for (self.trim_state.leases[0..self.trim_state.lease_count]) |held| {
-            if (held.lease_id == lease.lease_id) return;
-        }
-        // Admission is deterministic: every replica applies the same
-        // chosen lease sequence against the same fixed table, so a lease
-        // past capacity is dropped identically everywhere and simply does
-        // not cap trimming; the sender's pinned image copy, not the
-        // lease, is what keeps a running transfer safe (ZDS 0011).
-        if (self.trim_state.lease_count >= trim.max_leases) return;
-        self.trim_state.leases[self.trim_state.lease_count] = .{
-            .lease_id = lease.lease_id,
-            .receiver_id = lease.receiver_id,
-            .base_slot = lease.base_slot,
-            .expiry_ticks_left = lease.expires_after_leader_ticks,
-        };
-        self.trim_state.lease_count += 1;
-        trim.store(self.io, self.journal.dir, self.trim_state) catch |err| {
-            self.fatal_storage_error = true;
-            return err;
-        };
+        return trim.trackLease(self, lease);
     }
 
     fn releaseLease(self: *Node, lease_id: u64) !void {
-        var index: u8 = 0;
-        while (index < self.trim_state.lease_count) : (index += 1) {
-            if (self.trim_state.leases[index].lease_id == lease_id) break;
-        } else return;
-        self.trim_state.lease_count -= 1;
-        self.trim_state.leases[index] =
-            self.trim_state.leases[self.trim_state.lease_count];
-        trim.store(self.io, self.journal.dir, self.trim_state) catch |err| {
-            self.fatal_storage_error = true;
-            return err;
-        };
+        return trim.releaseLease(self, lease_id);
     }
 
     /// Physically reclaims journal segments and payload objects below the

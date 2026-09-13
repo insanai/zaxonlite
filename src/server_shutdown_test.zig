@@ -126,18 +126,22 @@ fn checkOne(
         const expected = if (mode == .pending) error.Ambiguous else error.Unavailable;
         try std.testing.expectEqual(@as(?anyerror, expected), worker.result);
     }
-    try std.testing.expect(server.write_waiter == null);
-    try std.testing.expectEqual(@as(usize, 0), server.fences.items.len);
-    try std.testing.expect(server.writer_queue_head == null);
-    try std.testing.expect(server.writer_queue_tail == null);
-    try std.testing.expectEqual(@as(u32, 0), server.frontier_waiters);
-    try std.testing.expectEqual(@as(usize, 0), server.waiters.items.len);
+    try expectDrained(&server);
     try std.testing.expectEqual(@as(u64, 0), server.tick_count);
     if (failure) {
         try std.testing.expectEqual(error.TestHostFailure, server.first_failure.?);
         try std.testing.expect(node.storageFailed());
         try std.testing.expect(server.fatal_shutdown_requested);
     }
+}
+
+fn expectDrained(server: anytype) !void {
+    try std.testing.expect(server.write_waiter == null);
+    try std.testing.expectEqual(@as(usize, 0), server.fences.items.len);
+    try std.testing.expect(server.writer_queue_head == null);
+    try std.testing.expect(server.writer_queue_tail == null);
+    try std.testing.expectEqual(@as(u32, 0), server.frontier_waiters);
+    try std.testing.expectEqual(@as(usize, 0), server.waiters.items.len);
 }
 
 fn awaitPending(server: anytype) !void {
@@ -198,7 +202,7 @@ fn checkShutdownGrace(comptime Server: type, comptime shutdown: anytype) !void {
     vtable.now = GraceClock.now;
     vtable.sleep = GraceClock.sleep;
     vtable.futexWait = GraceClock.wait;
-    for (0..3) |mode| {
+    for (0..4) |mode| {
         var clock = GraceClock{};
         var server = Server{
             .gpa = std.testing.allocator,
@@ -209,6 +213,7 @@ fn checkShutdownGrace(comptime Server: type, comptime shutdown: anytype) !void {
             .transport_configuration_id = 1,
             .held = undefined,
             .shutdown_flag = .init(true),
+            .failed = mode == 3,
             .stop_response_requested = mode != 0,
             .stop_response_sent = if (mode == 2) .is_set else .unset,
         };

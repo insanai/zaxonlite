@@ -533,6 +533,7 @@ test "a state anchor bounds recovery and survives image loss" {
         // The one-member configuration trims itself to the fresh anchor;
         // the trim entry itself occupies the slot after the anchor.
         try testing.expectEqual(node.durable_state_slot + 1, node.applied_slot);
+        try testing.expectEqual(node.applied_slot, node.trim_state.decision_slot);
         try testing.expectEqual(node.durable_state_slot, node.trim_state.through_slot);
         try testing.expectEqual(
             node.trim_state.through_slot,
