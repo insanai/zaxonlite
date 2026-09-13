@@ -10,6 +10,11 @@ pub fn forError(err: anyerror) []const u8 {
             "JOIN descriptor. Re-enroll it from the decided replacement; do " ++
             "not copy or synthesize membership files (ZDS 0008).";
     }
+    if (err == error.JoinRequiresDataVoter) {
+        return "A JOIN descriptor is valid only for an enrolled replacement " ++
+            "data-voter. Remove this data directory and enroll the decided " ++
+            "replacement again with role data-voter (ZDS 0008).";
+    }
     if (err == error.UnsupportedIdentityVersion or
         err == error.UnsupportedManifestVersion or
         err == error.UnsupportedSegmentVersion or
@@ -29,5 +34,14 @@ test "a later-configuration voter without JOIN gets a recovery hint" {
         u8,
         forError(error.JoinDescriptorRequired),
         "Re-enroll",
+    ) != null);
+}
+
+test "a JOIN descriptor on another role gets a recovery hint" {
+    const std = @import("std");
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        forError(error.JoinRequiresDataVoter),
+        "data-voter",
     ) != null);
 }

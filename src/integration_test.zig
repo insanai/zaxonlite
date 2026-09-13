@@ -124,6 +124,36 @@ test "fresh later-configuration voter requires an enrollment JOIN descriptor" {
     );
 }
 
+test "an enrollment JOIN descriptor requires the data-voter role" {
+    const gpa = testing.allocator;
+    var test_dir = try TestDir.init(gpa);
+    defer test_dir.deinit(gpa);
+    const dir = try test_dir.nodeDir(gpa);
+    defer gpa.free(dir);
+    try zaxonlite.node.writeJoinDescriptor(testing.io, dir, .{
+        .database_id = 1,
+        .configuration_id = 2,
+        .registry_digest = [_]u8{0x5a} ** 32,
+    });
+    const voter = try zaxonlite.registry.NodeRecord.init(
+        1,
+        .data_voter,
+        "127.0.0.1:1",
+    );
+
+    try testing.expectError(
+        error.JoinRequiresDataVoter,
+        Node.open(gpa, testing.io, .{
+            .directory = dir,
+            .node_id = 4,
+            .database_id = 1,
+            .role = .read_replica,
+            .members = &.{1},
+            .registry_nodes = &.{voter},
+        }),
+    );
+}
+
 test "prepared explicit transaction is one durable replicated transition" {
     const gpa = testing.allocator;
     var test_dir = try TestDir.init(gpa);

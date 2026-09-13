@@ -647,6 +647,7 @@ pub const Node = struct {
         // database identity it must adopt instead of deriving one from its
         // flags, and the registry digest it will fetch and verify.
         const join = try readJoinDescriptor(gpa, io, dir);
+        if (join != null and options.role != .data_voter) return error.JoinRequiresDataVoter;
 
         // The database identity derived from bootstrap flags applies only
         // while no registry exists; afterwards the decided registry carries
