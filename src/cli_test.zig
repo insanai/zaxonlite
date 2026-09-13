@@ -1188,7 +1188,9 @@ pub fn main(init: std.process.Init) !u8 {
                 .argv = argv.items,
                 .stdin = .ignore,
                 .stdout = .ignore,
-                .stderr = .ignore,
+                // Preserve election/transport diagnostics if readiness or
+                // the redirected write fails on a shared runner.
+                .stderr = .inherit,
             });
         }
 
@@ -1241,7 +1243,47 @@ pub fn main(init: std.process.Init) !u8 {
                     }
                 }
             }
-            if (leader_id != 0) break;
+            if (leader_id != 0) {
+                // A leader hint from one seed is not cluster readiness. Wait
+                // for every endpoint to agree and the elected node to lead
+                // with connected quorum before testing a single-shot write.
+                var ready = true;
+                for (redirect_listen, 0..) |endpoint, index| {
+                    var status = try runCli(gpa, io, &.{
+                        "status",     "--connect", endpoint,
+                        "--tls-cert", client_cert, "--tls-key",
+                        client_key,   "--tls-ca",  ca,
+                        "--json",
+                    }, null);
+                    defer status.deinit(gpa);
+                    const snapshot = std.json.parseFromSlice(
+                        std.json.Value,
+                        gpa,
+                        status.stdout,
+                        .{},
+                    ) catch {
+                        ready = false;
+                        continue;
+                    };
+                    defer snapshot.deinit();
+                    if (status.code != 0 or snapshot.value != .object) {
+                        ready = false;
+                        continue;
+                    }
+                    const object = snapshot.value.object;
+                    const hint = object.get("leader") orelse .null;
+                    const role = object.get("role") orelse .null;
+                    const quorum = object.get("quorum_available") orelse .null;
+                    ready = ready and hint == .integer and hint.integer == leader_id;
+                    if (index + 1 == leader_id) {
+                        ready = ready and role == .string and
+                            std.mem.eql(u8, role.string, "leader") and
+                            quorum == .bool and quorum.bool;
+                    }
+                }
+                if (ready) break;
+                leader_id = 0;
+            }
             io.sleep(.fromMilliseconds(25), .awake) catch {};
         }
         if (leader_id == 0) {
