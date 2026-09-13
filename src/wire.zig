@@ -22,7 +22,9 @@ const paxos = @import("paxos");
 const types = @import("types.zig");
 const command = @import("command.zig");
 
-/// Version 9 is the ZDS 0011 format cut: 64-bit global slots on every
+/// Version 10 makes a trim command's chosen global slot its identity and
+/// deliberately shares no frames with version 9.
+/// Version 9 was the ZDS 0011 format cut: 64-bit global slots on every
 /// frame, the chunked PromiseRange phase-one reply, bounded range
 /// recovery, and durable-state reports. It shares no frames with v8 and
 /// there is deliberately no bridge.
@@ -31,7 +33,7 @@ const command = @import("command.zig");
 /// version 6 the enrollment exchange; version 5 quorum-confirmed proofs.
 /// Older peers are deliberately rejected: silently falling back would
 /// turn a configuration error into a security downgrade.
-pub const protocol_version: u16 = 9;
+pub const protocol_version: u16 = 10;
 
 /// Upper bound for one frame body; larger frames are a protocol error.
 pub const max_frame_bytes: u32 = 64 * 1024 * 1024;

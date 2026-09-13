@@ -28,7 +28,7 @@ const durability = @import("durability.zig");
 const paxos = @import("paxos");
 
 const magic: u32 = 0x5254585a; // "ZXTR" in file byte order.
-const version: u16 = 1;
+const version: u16 = 2;
 
 pub const file_name = "TRIM";
 
@@ -46,7 +46,8 @@ pub const Lease = struct {
 /// The durable local trim state: the adopted cluster anchor plus every
 /// active lease capping deletion.
 pub const State = struct {
-    trim_id: u64 = 0,
+    /// Global Paxos slot of the chosen trim command.
+    decision_slot: u64 = 0,
     through_slot: u64 = 0,
     history_hash: [32]u8 = [_]u8{0} ** 32,
     configuration_id: u64 = 0,
@@ -149,14 +150,19 @@ pub fn deleteFloor(
 /// anchor is corruption and must stop the node.
 pub const Adoption = enum { adopt, ignore, corrupt };
 
-pub fn classify(state: *const State, record: command.TrimRecord) Adoption {
-    if (record.trim_id == state.trim_id) {
+pub fn classify(
+    state: *const State,
+    decision_slot: u64,
+    record: command.TrimRecord,
+) Adoption {
+    if (decision_slot == state.decision_slot) {
         const same = record.through_slot == state.through_slot and
+            record.configuration_id == state.configuration_id and
             std.mem.eql(u8, &record.history_hash, &state.history_hash);
         return if (same) .ignore else .corrupt;
     }
-    if (record.trim_id < state.trim_id) return .ignore;
-    if (record.through_slot < state.through_slot) return .corrupt;
+    if (decision_slot < state.decision_slot) return .ignore;
+    if (record.through_slot <= state.through_slot) return .corrupt;
     return .adopt;
 }
 
@@ -171,7 +177,7 @@ pub fn store(io: Io, dir: Io.Dir, state: State) !void {
     writeInt(u32, &bytes, &offset, magic);
     writeInt(u16, &bytes, &offset, version);
     writeInt(u16, &bytes, &offset, 0);
-    writeInt(u64, &bytes, &offset, state.trim_id);
+    writeInt(u64, &bytes, &offset, state.decision_slot);
     writeInt(u64, &bytes, &offset, state.through_slot);
     writeBytes(&bytes, &offset, &state.history_hash);
     writeInt(u64, &bytes, &offset, state.configuration_id);
@@ -196,7 +202,7 @@ pub fn store(io: Io, dir: Io.Dir, state: State) !void {
     try durability.syncPathnameTransition(io, dir, file_name);
 }
 
-pub const LoadError = error{CorruptTrimRecord};
+pub const LoadError = error{ CorruptTrimRecord, UnsupportedTrimVersion };
 
 /// Reads the durable trim state; a missing file is a fresh database. A
 /// malformed record fails closed rather than permitting deletion.
@@ -219,10 +225,10 @@ pub fn load(io: Io, dir: Io.Dir) !?State {
 
     var offset: usize = 0;
     if (readInt(u32, &bytes, &offset) != magic) return error.CorruptTrimRecord;
-    if (readInt(u16, &bytes, &offset) != version) return error.CorruptTrimRecord;
+    if (readInt(u16, &bytes, &offset) != version) return error.UnsupportedTrimVersion;
     if (readInt(u16, &bytes, &offset) != 0) return error.CorruptTrimRecord;
     var state = State{
-        .trim_id = readInt(u64, &bytes, &offset),
+        .decision_slot = readInt(u64, &bytes, &offset),
         .through_slot = readInt(u64, &bytes, &offset),
     };
     readBytes(&bytes, &offset, &state.history_hash);
@@ -321,37 +327,38 @@ test "the delete floor honors trim, local state, retention, and leases" {
 
 test "trim adoption is idempotent and a conflicting anchor is corruption" {
     const state = State{
-        .trim_id = 2,
+        .decision_slot = 20,
         .through_slot = 100,
         .history_hash = [_]u8{1} ** 32,
         .configuration_id = 1,
     };
     const same = command.TrimRecord{
-        .trim_id = 2,
         .through_slot = 100,
         .history_hash = [_]u8{1} ** 32,
         .configuration_id = 1,
         .policy = 0,
     };
-    try testing.expectEqual(Adoption.ignore, classify(&state, same));
+    try testing.expectEqual(Adoption.ignore, classify(&state, 20, same));
 
     var conflicting = same;
     conflicting.history_hash = [_]u8{9} ** 32;
-    try testing.expectEqual(Adoption.corrupt, classify(&state, conflicting));
+    try testing.expectEqual(Adoption.corrupt, classify(&state, 20, conflicting));
 
     var newer = same;
-    newer.trim_id = 3;
     newer.through_slot = 150;
-    try testing.expectEqual(Adoption.adopt, classify(&state, newer));
+    try testing.expectEqual(Adoption.adopt, classify(&state, 30, newer));
 
     var regressing = newer;
     regressing.through_slot = 50;
-    try testing.expectEqual(Adoption.corrupt, classify(&state, regressing));
+    try testing.expectEqual(Adoption.corrupt, classify(&state, 30, regressing));
+
+    var nonadvancing = newer;
+    nonadvancing.through_slot = state.through_slot;
+    try testing.expectEqual(Adoption.corrupt, classify(&state, 30, nonadvancing));
 
     var older = same;
-    older.trim_id = 1;
     older.through_slot = 40;
-    try testing.expectEqual(Adoption.ignore, classify(&state, older));
+    try testing.expectEqual(Adoption.ignore, classify(&state, 10, older));
 }
 
 test "the durable trim record round trips and fails closed on corruption" {
@@ -362,7 +369,7 @@ test "the durable trim record round trips and fails closed on corruption" {
     try testing.expectEqual(@as(?State, null), try load(io, tmp.dir));
 
     var state = State{
-        .trim_id = 5,
+        .decision_slot = 5,
         .through_slot = 700,
         .history_hash = [_]u8{3} ** 32,
         .configuration_id = 2,
@@ -376,7 +383,7 @@ test "the durable trim record round trips and fails closed on corruption" {
     };
     try store(io, tmp.dir, state);
     const loaded = (try load(io, tmp.dir)).?;
-    try testing.expectEqual(@as(u64, 5), loaded.trim_id);
+    try testing.expectEqual(@as(u64, 5), loaded.decision_slot);
     try testing.expectEqual(@as(u64, 700), loaded.through_slot);
     try testing.expectEqual(@as(u8, 1), loaded.lease_count);
     try testing.expectEqual(@as(u64, 650), loaded.leases[0].base_slot);
@@ -390,4 +397,19 @@ test "the durable trim record round trips and fails closed on corruption" {
         try file.writePositionalAll(io, &byte, 10);
     }
     try testing.expectError(error.CorruptTrimRecord, load(io, tmp.dir));
+}
+
+test "TRIM version 1 is explicitly unsupported" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try store(io, tmp.dir, .{});
+    const file = try tmp.dir.openFile(io, file_name, .{ .mode = .read_write });
+    defer file.close(io);
+    var bytes: [record_size]u8 = undefined;
+    _ = try file.readPositionalAll(io, &bytes, 0);
+    std.mem.writeInt(u16, bytes[4..6], 1, .little);
+    Sha256.hash(bytes[0 .. record_size - 32], bytes[record_size - 32 ..][0..32], .{});
+    try file.writePositionalAll(io, &bytes, 0);
+    try testing.expectError(error.UnsupportedTrimVersion, load(io, tmp.dir));
 }

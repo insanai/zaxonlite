@@ -34,10 +34,10 @@ pub const ReadBarrier = struct {
 
 /// A chosen log-trim decision (ZDS 0011): every slot at or below
 /// `through_slot` is chosen under `history_hash`, and nodes may release
-/// journal history through it subject to their local delete rules. Trim IDs
-/// are monotonic; a same-ID record with a different anchor is corruption.
+/// journal history through it subject to their local delete rules. The
+/// command's chosen global log slot is its identity; it is deliberately not
+/// repeated inside the command body.
 pub const TrimRecord = struct {
-    trim_id: u64,
     through_slot: u64,
     history_hash: HashBytes,
     configuration_id: u64,
@@ -108,7 +108,6 @@ pub fn encode(cmd: Command, out: *[encoded_size]u8) void {
         },
         .trim => |trim| {
             writer.byte(3);
-            writer.int(u64, trim.trim_id);
             writer.int(u64, trim.through_slot);
             writer.bytes(&trim.history_hash);
             writer.int(u64, trim.configuration_id);
@@ -150,7 +149,6 @@ pub fn decode(buffer: []const u8) DecodeError!Command {
         2 => .{ .read_barrier = .{ .nonce = reader.int(u128) } },
         3 => blk: {
             const trim = TrimRecord{
-                .trim_id = reader.int(u64),
                 .through_slot = reader.int(u64),
                 .history_hash = reader.hash(),
                 .configuration_id = reader.int(u64),
@@ -296,7 +294,6 @@ test "command round trips through the canonical codec" {
         .{ .transaction_batch = sampleBatch() },
         .{ .read_barrier = .{ .nonce = 0x1234_5678_9abc_def0 } },
         .{ .trim = .{
-            .trim_id = 7,
             .through_slot = 90_000,
             .history_hash = [_]u8{5} ** 32,
             .configuration_id = 3,
@@ -323,15 +320,14 @@ test "command round trips through the canonical codec" {
 test "decode rejects an unknown trim policy" {
     var encoded: [encoded_size]u8 = undefined;
     encode(.{ .trim = .{
-        .trim_id = 1,
         .through_slot = 10,
         .history_hash = [_]u8{0} ** 32,
         .configuration_id = 1,
         .policy = 0,
     } }, &encoded);
-    // The policy byte sits after tag, two u64 fields, the hash, and the
+    // The policy byte sits after tag, the trim slot, the hash, and the
     // configuration ID.
-    encoded[1 + 8 + 8 + 32 + 8] = 1;
+    encoded[1 + 8 + 32 + 8] = 1;
     try std.testing.expectError(error.InvalidPolicy, decode(&encoded));
 }
 
