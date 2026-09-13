@@ -1461,6 +1461,43 @@ fn expectTrimEqual(cluster: *Cluster, first: usize, second: usize) void {
             cluster.nodes[second].id,
         });
     }
+
+    const first_path = std.fmt.allocPrint(
+        cluster.gpa,
+        "{s}/consensus/TRIM",
+        .{cluster.nodes[first].directory},
+    ) catch fail(cluster, "cannot allocate TRIM path", .{});
+    defer cluster.gpa.free(first_path);
+    const second_path = std.fmt.allocPrint(
+        cluster.gpa,
+        "{s}/consensus/TRIM",
+        .{cluster.nodes[second].directory},
+    ) catch fail(cluster, "cannot allocate TRIM path", .{});
+    defer cluster.gpa.free(second_path);
+    const first_bytes = Io.Dir.cwd().readFileAlloc(
+        cluster.io,
+        first_path,
+        cluster.gpa,
+        .limited(4096),
+    ) catch fail(cluster, "cannot read node {d} TRIM bytes", .{
+        cluster.nodes[first].id,
+    });
+    defer cluster.gpa.free(first_bytes);
+    const second_bytes = Io.Dir.cwd().readFileAlloc(
+        cluster.io,
+        second_path,
+        cluster.gpa,
+        .limited(4096),
+    ) catch fail(cluster, "cannot read node {d} TRIM bytes", .{
+        cluster.nodes[second].id,
+    });
+    defer cluster.gpa.free(second_bytes);
+    if (!std.mem.eql(u8, first_bytes, second_bytes)) {
+        fail(cluster, "TRIM bytes differ between node {d} and node {d}", .{
+            cluster.nodes[first].id,
+            cluster.nodes[second].id,
+        });
+    }
 }
 
 fn initTrimCluster(
