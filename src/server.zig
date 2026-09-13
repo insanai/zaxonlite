@@ -249,6 +249,10 @@ pub const ServeOptions = struct {
     handshake_timeout_ms: u64 = 10_000,
     /// Embedding-owned stop request. The ticker observes it even after failure.
     shutdown_flag: ?*std.atomic.Value(bool) = null,
+    /// Optional embedding-owned first-failure publication. The server writes
+    /// the bytes before publishing the nonzero length with release ordering.
+    failure_name_buffer: ?*[128]u8 = null,
+    failure_name_len: ?*std.atomic.Value(u8) = null,
     /// Established connections that receive no frame for this long are
     /// closed. Peer heartbeats keep healthy cluster links active. Zero
     /// disables the bound for a deterministic test schedule.
@@ -754,7 +758,7 @@ pub fn serve(
     }
     server.waitForHandlers();
     std.log.info("node {d}: stopped", .{options.node_id});
-    return 0;
+    return if (server.failed) 4 else 0;
 }
 
 fn isNumericLoopback(host: []const u8) bool {
@@ -979,11 +983,17 @@ pub const Server = struct {
     last_reported_durable: paxos.Slot = 0,
     tick_count: u64 = 0,
     failed: bool = false,
+    /// First terminal host error. Protected by `mutex` and never cleared.
+    first_failure: ?anyerror = null,
+    fatal_shutdown_requested: bool = false,
     shutdown_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     stop_response_requested: bool = false, // Protected by mutex; only the first stop wins.
     stop_response_sent: Io.Event = .unset,
     handler_count: usize = 0,
     handler_cond: std.Io.Condition = .init,
+    /// Prevents handlers from closing descriptors while shutdown performs
+    /// its off-lock interruption pass over a stable snapshot.
+    connection_interrupting: bool = false,
     active_connections: std.ArrayList(TrackedConnection) = .empty,
     /// Present when `options.tls` is set: responder identity for accepted
     /// connections and initiator identity for peer dialing.
@@ -1160,7 +1170,7 @@ pub const Server = struct {
     fn shutdown(self: *Server) void {
         self.mutex.lockUncancelable(self.io);
         self.shutdown_flag.store(true, .release);
-        const response_pending = self.stop_response_requested;
+        const response_pending = self.stop_response_requested and !self.failed;
         self.wakeWaiters();
         self.mutex.unlock(self.io);
         // Only RPC shutdown has a reply to flush. A sleep count is not a deadline:
@@ -1172,13 +1182,26 @@ pub const Server = struct {
             self.stop_response_sent.waitTimeout(self.io, .{ .deadline = end }) catch {};
         }
         self.mutex.lockUncancelable(self.io);
-        for (self.active_connections.items) |connection| {
+        const connections = self.gpa.alloc(
+            TrackedConnection,
+            self.active_connections.items.len,
+        ) catch @panic("out of memory while stopping server");
+        self.connection_interrupting = true;
+        if (connections.len > 0) {
+            @memcpy(connections, self.active_connections.items);
+        }
+        self.mutex.unlock(self.io);
+        defer self.gpa.free(connections);
+        for (connections) |connection| {
             connection.stream.shutdown(self.io, .both) catch {};
         }
+        self.mutex.lockUncancelable(self.io);
+        self.connection_interrupting = false;
+        self.handler_cond.broadcast(self.io);
+        self.mutex.unlock(self.io);
         for (self.senders.items) |sender| {
             sender.requestStop();
         }
-        self.mutex.unlock(self.io);
     }
 
     /// Admission limit for concurrent connections. The default is sized
@@ -1451,6 +1474,9 @@ pub const Server = struct {
     fn noteHandlerClosing(self: *Server, stream: std.Io.net.Stream) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        while (self.connection_interrupting) {
+            self.handler_cond.waitUncancelable(self.io, &self.mutex);
+        }
         for (self.active_connections.items, 0..) |connection, index| {
             if (connection.stream.socket.handle == stream.socket.handle) {
                 _ = self.active_connections.swapRemove(index);
@@ -1519,9 +1545,32 @@ pub const Server = struct {
     fn pump(self: *Server) void {
         self.pumpFallible() catch |err| {
             std.log.err("node host failure: {s}", .{@errorName(err)});
-            self.failed = true;
-            self.failEverything();
+            self.failLocked(err);
         };
+    }
+
+    /// First-failure-wins terminal transition. The caller holds `mutex`.
+    /// Socket interruption and listener wakeup are deliberately left to
+    /// teardown/ticker code running without the mutex.
+    fn failLocked(self: *Server, err: anyerror) void {
+        if (self.first_failure != null) return;
+        self.first_failure = err;
+        if (self.options.failure_name_buffer) |buffer| {
+            const name = @errorName(err);
+            const len: u8 = @intCast(@min(name.len, buffer.len));
+            @memcpy(buffer[0..len], name[0..len]);
+            if (self.options.failure_name_len) |published| {
+                published.store(len, .release);
+            }
+        }
+        self.failed = true;
+        self.node.markFailed();
+        self.failEverything();
+        self.fatal_shutdown_requested = true;
+    }
+
+    fn failForTest(self: *Server) void {
+        self.failLocked(error.TestHostFailure);
     }
 
     fn pumpFallible(self: *Server) !void {
@@ -1565,16 +1614,12 @@ pub const Server = struct {
         // candidate only moves on anchor publishes, so this is naturally
         // cadence-limited (ZDS 0011).
         if (!self.retired and self.node.isLeader()) {
-            self.maybeProposeTrim() catch |err| {
-                std.log.warn("trim proposal failed: {t}", .{err});
-            };
+            try self.maybeProposeTrim();
         }
 
         // Physical reclamation below the adopted trim, off the commit path.
         if (!self.retired) {
-            self.node.reclaim() catch |err| {
-                std.log.warn("reclamation failed: {t}", .{err});
-            };
+            try self.node.reclaim();
         }
 
         // A decided membership stop completes here: the survivor installs
@@ -1902,6 +1947,10 @@ pub const Server = struct {
     fn maybeProposeTrim(self: *Server) !void {
         if (self.node.membership_change_pending or
             self.node.log.stop_pending) return;
+        // Serialize maintenance behind the applied proposal frontier. The
+        // candidate is intentionally computed only after this check so a
+        // newer report cannot queue a second trim behind an unresolved one.
+        if (!self.node.proposalFrontierSettled()) return;
         self.recordFrontier(self.node.frontier());
         var data_buffer: [types.log_options.max_members]paxos.NodeId = undefined;
         const data = self.dataReplicaIds(&data_buffer);
@@ -1988,8 +2037,12 @@ pub const Server = struct {
     // ------------------------------------------------------------------
 
     fn tickLoop(self: *Server) void {
-        while (!self.isShutdown()) {
+        defer self.wakeAcceptLoop();
+        while (true) {
             self.io.sleep(.fromMilliseconds(@intCast(self.options.tick_ms)), .awake) catch {};
+            // Fatal transitions request shutdown while holding the host
+            // mutex. Wake the accept loop here, outside it, within one tick.
+            if (self.isShutdown()) break;
             if (self.options.shutdown_flag) |flag| {
                 if (flag.load(.acquire)) self.requestShutdown(.local);
             }
@@ -1998,6 +2051,11 @@ pub const Server = struct {
                 self.mutex.lockUncancelable(self.io);
                 defer self.mutex.unlock(self.io);
                 if (self.isShutdown()) break;
+                if (self.fatal_shutdown_requested) {
+                    self.shutdown_flag.store(true, .release);
+                    self.wakeWaiters();
+                    break;
+                }
                 self.tick_count += 1;
                 self.wakeWaiters();
                 self.closeExpiredConnections();
@@ -2015,8 +2073,7 @@ pub const Server = struct {
                 }
                 self.node.tickProtocol() catch |err| {
                     std.log.err("tick failure: {s}", .{@errorName(err)});
-                    self.failed = true;
-                    self.failEverything();
+                    self.failLocked(err);
                     continue;
                 };
                 self.releaseHeldVotes();
@@ -2570,8 +2627,7 @@ pub const Server = struct {
 
         self.node.stepEnvelope(envelope) catch |err| {
             std.log.err("step failure: {s}", .{@errorName(err)});
-            self.failed = true;
-            self.failEverything();
+            self.failLocked(err);
             return;
         };
         self.pump();
@@ -2654,8 +2710,7 @@ pub const Server = struct {
         if (self.failed) return;
         _ = self.node.store.put(payload) catch |err| {
             std.log.warn("payload store failure: {s}", .{@errorName(err)});
-            self.failed = true;
-            self.failEverything();
+            self.failLocked(err);
             return;
         };
 
@@ -2674,8 +2729,7 @@ pub const Server = struct {
             for (entry.value.envelopes[0..entry.value.count]) |envelope| {
                 self.node.stepEnvelope(envelope) catch |err| {
                     std.log.err("step failure: {s}", .{@errorName(err)});
-                    self.failed = true;
-                    self.failEverything();
+                    self.failLocked(err);
                     return;
                 };
             }
@@ -2753,8 +2807,11 @@ pub const Server = struct {
         // no longer cover the peer's gap; otherwise range recovery over
         // ordinary commit envelopes is cheaper and does the same job.
         self.mutex.lockUncancelable(self.io);
+        const fresh_later_configuration = request.applied_slot == 0 and
+            self.node.identity.configuration_id > 1;
         if (!self.node.capabilities.materializes or
-            self.node.journal.retainedFirstSlot() <= request.applied_slot + 1)
+            (!fresh_later_configuration and
+                self.node.journal.retainedFirstSlot() <= request.applied_slot + 1))
         {
             self.mutex.unlock(self.io);
             std.log.info(
@@ -3338,13 +3395,14 @@ pub const Server = struct {
         };
         defer parsed.deinit();
         const request = parsed.value;
+        if (std.mem.eql(u8, request.op, "status")) {
+            return self.opStatus(out);
+        }
         if (self.isShutdown() and !std.mem.eql(u8, request.op, "stop")) {
             return writeErrorResponse(out, "unavailable", "node shutting down");
         }
 
-        if (std.mem.eql(u8, request.op, "status")) {
-            return self.opStatus(out);
-        } else if (std.mem.eql(u8, request.op, "members")) {
+        if (std.mem.eql(u8, request.op, "members")) {
             return self.opMembers(out);
         } else if (std.mem.eql(u8, request.op, "leader")) {
             return self.opLeader(out);
@@ -3752,7 +3810,14 @@ pub const Server = struct {
             self.mutex.unlock(self.io);
             return writeErrorResponse(out, "corrupt_pending_operation", @errorName(err));
         };
-        const quorum_available = self.quorumAvailable();
+        const quorum_available = !self.failed and self.quorumAvailable();
+        const health = if (self.failed)
+            "failed"
+        else if (self.isShutdown())
+            "stopping"
+        else
+            "healthy";
+        const failure = if (self.first_failure) |err| @errorName(err) else null;
         const installation_state = self.installationState();
         const installation_error = self.installationError();
         self.mutex.unlock(self.io);
@@ -3763,6 +3828,8 @@ pub const Server = struct {
             phase,
             quorum_available,
             installation_state,
+            health,
+            failure,
         );
         try status_json.writeMembershipOperation(out, pending, installation_error);
         try out.writeAll("}");
@@ -3921,14 +3988,12 @@ pub const Server = struct {
 
         const result: ExecOutcome = run(self.node, context) catch |err| {
             if (self.node.needsResync() and !self.node.storageFailed()) {
-                self.node.resyncImage() catch {
-                    self.failed = true;
-                    self.failEverything();
+                self.node.resyncImage() catch |resync_err| {
+                    self.failLocked(resync_err);
                 };
             }
             if (self.node.storageFailed()) {
-                self.failed = true;
-                self.failEverything();
+                self.failLocked(err);
             }
             return err;
         };
@@ -5143,8 +5208,7 @@ const PeerSender = struct {
                 {
                     self.server.node.peerReconnected(self.peer.id) catch |err| {
                         std.log.err("reconnect repair failed: {s}", .{@errorName(err)});
-                        self.server.failed = true;
-                        self.server.failEverything();
+                        self.server.failLocked(err);
                     };
                 }
                 if (!self.server.failed) self.server.pump();
@@ -5333,7 +5397,7 @@ test "shutdown and failure cancel parked host operations without protocol ticks"
         .write = Server.runWrite,
         .frontier = Server.awaitLeaderFrontier,
         .wait = Server.opWait,
-        .fail = Server.failEverything,
+        .fail = Server.failForTest,
         .wake = Server.wakeWaiters,
         .release = Server.releaseWriterGate,
         .shutdown = Server.shutdown,

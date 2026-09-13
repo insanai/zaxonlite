@@ -80,6 +80,7 @@ fn checkOne(
     node.log = &log;
     log.core.role = .leader;
     node.applied_slot = 0;
+    node.fatal_storage_error = false;
     var server = Server{
         .gpa = std.testing.allocator,
         .io = io,
@@ -132,6 +133,11 @@ fn checkOne(
     try std.testing.expectEqual(@as(u32, 0), server.frontier_waiters);
     try std.testing.expectEqual(@as(usize, 0), server.waiters.items.len);
     try std.testing.expectEqual(@as(u64, 0), server.tick_count);
+    if (failure) {
+        try std.testing.expectEqual(error.TestHostFailure, server.first_failure.?);
+        try std.testing.expect(node.storageFailed());
+        try std.testing.expect(server.fatal_shutdown_requested);
+    }
 }
 
 fn awaitPending(server: anytype) !void {

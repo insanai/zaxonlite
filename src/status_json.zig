@@ -15,13 +15,21 @@ pub fn writeHead(
     phase: []const u8,
     quorum_available: bool,
     installation_state: []const u8,
+    health: []const u8,
+    failure: ?[]const u8,
 ) !void {
     const chain_hex = std.fmt.bytesToHex(status.chain, .lower);
+    var failure_buffer: [128]u8 = undefined;
+    const failure_json = if (failure) |message|
+        std.fmt.bufPrint(&failure_buffer, "\"{s}\"", .{message}) catch unreachable
+    else
+        "null";
     try out.print(
         "{{\"ok\":true,\"node_id\":{d},\"database_id\":\"{x:0>32}\"," ++
             "\"configuration_id\":{d},\"role\":\"{s}\"," ++
             "\"node_type\":\"{s}\",\"leader\":{?d}," ++
             "\"phase\":\"{s}\",\"quorum_available\":{}," ++
+            "\"health\":\"{s}\",\"failure\":{s}," ++
             "\"installation_state\":\"{s}\"," ++
             "\"ballot\":{{\"round\":{d},\"priority\":{d},\"node\":{d}}}," ++
             "\"decided_slot\":{d},\"applied_slot\":{d}," ++
@@ -43,6 +51,7 @@ pub fn writeHead(
             status.configuration_id,       status.role,
             status.node_type,              leader,
             phase,                         quorum_available,
+            health,                        failure_json,
             installation_state,            status.ballot.round,
             status.ballot.priority,        status.ballot.node,
             status.decided_slot,           status.applied_slot,
