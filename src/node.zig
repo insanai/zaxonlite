@@ -524,6 +524,8 @@ pub const Node = struct {
     /// The durable-state frontier A_i: the greatest slot covered by a
     /// synchronized image and its APPLIED anchor record (ZDS 0011).
     durable_state_slot: paxos.Slot = 0,
+    /// Anchored data frontier; prevents an idle anchor/trim feedback loop.
+    durable_data_slot: paxos.Slot = 0,
     /// Generation counter of the alternating APPLIED records.
     anchor_generation: u64 = 0,
     /// Durable local trim state: the adopted cluster anchor plus the
@@ -644,7 +646,7 @@ pub const Node = struct {
         // An enrolled replacement carries a join descriptor: the decided
         // database identity it must adopt instead of deriving one from its
         // flags, and the registry digest it will fetch and verify.
-        var join = try readJoinDescriptor(gpa, io, dir);
+        const join = try readJoinDescriptor(gpa, io, dir);
 
         // The database identity derived from bootstrap flags applies only
         // while no registry exists; afterwards the decided registry carries
@@ -676,8 +678,6 @@ pub const Node = struct {
                 {
                     return error.RegistryMismatch;
                 }
-                try durableDeleteFile(io, dir, join_file_name);
-                join = null;
             }
             members = decided.voterIds(&member_storage);
         } else if (join != null) {
@@ -849,18 +849,15 @@ pub const Node = struct {
             );
         }
 
-        self.log.core.setCampaignEnabled(capabilities.campaigns);
         // A materializing voter that joins an existing cluster with no
         // applied state must not lead: catch-up and snapshot escalation
         // run against the leader, so winning the election would starve
         // its own recovery forever. It still votes; campaigning resumes
         // once any state is applied.
-        if (capabilities.campaigns and capabilities.materializes and
-            identity.configuration_id > 1 and self.applied_slot == 0)
-        {
-            self.join_campaign_hold = true;
-            self.log.core.setCampaignEnabled(false);
-        }
+        const fresh_voter = capabilities.campaigns and capabilities.materializes and
+            identity.configuration_id > 1;
+        self.join_campaign_hold = fresh_voter and (join != null or self.applied_slot == 0);
+        self.log.core.setCampaignEnabled(capabilities.campaigns and !self.join_campaign_hold);
         if (single and capabilities.campaigns) {
             // Volatile leadership: campaign on every open. A one-member
             // quorum completes phase one immediately.
@@ -991,11 +988,9 @@ pub const Node = struct {
         // old entries' configuration-bound history leaves from entries
         // alone. It must first install a survivor's post-handover anchor;
         // range recovery is safe for the suffix after that base.
+        if (self.join_descriptor != null) return;
         if (self.join_campaign_hold and self.applied_slot == 0 and
-            self.identity.configuration_id > 1)
-        {
-            return;
-        }
+            self.identity.configuration_id > 1) return;
         try self.log.requestCatchUp(peer, self.applied_slot + 1, self.effects);
         try self.consumeEffects();
     }
@@ -1754,6 +1749,7 @@ pub const Node = struct {
             .last_chain = self.last_chain,
         });
         self.durable_state_slot = self.applied_slot;
+        self.durable_data_slot = self.last_data_slot;
         self.history_hash_at_anchor = self.history_hash;
         self.last_anchor_ns =
             std.Io.Clock.Timestamp.now(self.io, .awake).raw.nanoseconds;
@@ -2019,6 +2015,9 @@ pub const Node = struct {
             .last_chain = begin.last_chain,
         });
         self.durable_state_slot = begin.anchor_slot;
+        self.durable_data_slot = begin.last_data_slot;
+        if (self.join_descriptor != null) try durableDeleteFile(self.io, self.dir, join_file_name);
+        self.join_descriptor = null;
         failpoint.hit("after_transfer_anchor");
 
         // The protocol node resumes at the anchor; everything below it is
@@ -2047,11 +2046,14 @@ pub const Node = struct {
 
     /// Creates a state anchor once execution has run far enough past the
     /// durable one. Returns whether an anchor was published.
-    /// Re-enables campaigning once a joining voter has applied any state
-    /// (through catch-up or an installed transfer); the host calls this
-    /// from its periodic duties.
+    /// Re-enables campaigning after a joining voter installs its transfer,
+    /// or after an ordinary held voter applies state.
     pub fn releaseCampaignHold(self: *Node) void {
         if (!self.join_campaign_hold) return;
+        if (self.join_descriptor != null and self.durable_state_slot == 0) return;
+        if (self.join_descriptor != null)
+            durableDeleteFile(self.io, self.dir, join_file_name) catch return;
+        self.join_descriptor = null;
         if (self.applied_slot == 0) return;
         self.join_campaign_hold = false;
         self.log.core.setCampaignEnabled(self.capabilities.campaigns);
@@ -2067,11 +2069,12 @@ pub const Node = struct {
     /// recovers from genesis, so the first anchor publishes promptly;
     /// afterwards an anchor is due every 10,000 applied slots, every 30
     /// seconds, or when the uncheckpointed WAL reaches 64 MiB —
-    /// whichever arrives first, and only while new applied state exists
-    /// to anchor.
+    /// whichever arrives first, and only while new transaction state exists
+    /// to anchor. Configuration handover publishes its required anchor directly.
     fn anchorDue(self: *Node) bool {
+        if (self.join_descriptor != null) return false;
+        if (self.last_data_slot <= self.durable_data_slot) return false;
         if (self.durable_state_slot == 0) return self.applied_slot > 0;
-        if (self.applied_slot <= self.durable_state_slot) return false;
         if (self.applied_slot >= self.durable_state_slot +| anchor_interval_slots) {
             return true;
         }
@@ -2286,7 +2289,8 @@ pub const Node = struct {
         // Publish a base carrying the new configuration identity even when
         // the stop changed no SQLite pages. A later replacement installs
         // this exact history anchor before requesting the retained suffix.
-        if (self.capabilities.materializes and
+        if (self.join_descriptor == null and !self.join_campaign_hold and
+            self.capabilities.materializes and
             self.applied_slot > self.durable_state_slot)
         {
             try self.createStateAnchor();
@@ -2333,9 +2337,6 @@ pub const Node = struct {
         failpoint.hit("after_registry_blob");
         try registry.activatePointer(self.io, self.dir, fetched.configuration_id);
         failpoint.hit("after_registry_pointer");
-        try durableDeleteFile(self.io, self.dir, join_file_name);
-        self.join_descriptor = null;
-
         self.identity.configuration_id = fetched.configuration_id;
         try writeIdentity(self.io, self.dir, self.identity);
         self.decided_registry = fetched;
@@ -3776,6 +3777,7 @@ pub const Node = struct {
                 self.history_hash_at_anchor = anchor.history_hash;
                 self.last_chain = anchor.last_chain;
                 self.last_data_slot = anchor.last_data_slot;
+                self.durable_data_slot = anchor.last_data_slot;
                 self.last_batch_id = anchor.last_batch_id;
                 self.durable_state_slot = anchor.global_slot;
                 self.page_size = anchor.sqlite_page_size;
@@ -3895,6 +3897,7 @@ pub const Node = struct {
             else => return err,
         };
         self.durable_state_slot = 0;
+        self.durable_data_slot = 0;
         try self.materializeFromJournal();
     }
 

@@ -907,6 +907,7 @@ pub const Server = struct {
     };
 
     fn deinit(self: *Server) void {
+        std.debug.assert(self.active_connections.items.len == 0);
         for (self.senders.items) |sender| {
             sender.deinit();
             self.gpa.destroy(sender);
@@ -1916,7 +1917,7 @@ pub const Server = struct {
         self.snapshot_requested_tick = self.tick_count;
         var body: [wire.SnapshotRequest.encoded_size]u8 = undefined;
         const encoded = (wire.SnapshotRequest{
-            .applied_slot = self.node.applied_slot,
+            .applied_slot = if (self.node.join_descriptor != null) 0 else self.node.applied_slot,
         }).encode(&body);
         const frame = wire.frameAlloc(self.gpa, .snapshot_request, &.{encoded}) catch
             return false;
@@ -1970,11 +1971,13 @@ pub const Server = struct {
                 self.releaseHeldVotes();
                 self.pump();
                 self.reportLeaderChangeLocked();
+                const join = self.node.join_descriptor;
 
                 // A joining replacement fetches the decided registry it
                 // was enrolled against before it can participate.
                 if (self.tick_count % 20 == 0 and
-                    self.node.join_descriptor != null)
+                    join != null and
+                    self.node.identity.configuration_id < join.?.configuration_id)
                 {
                     self.requestJoinRegistry();
                 }
@@ -1989,7 +1992,8 @@ pub const Server = struct {
                 // between range recovery and an image transfer.
                 if (self.tick_count % 20 == 10 and
                     self.node.join_campaign_hold and
-                    self.node.join_descriptor == null)
+                    join != null and
+                    self.node.identity.configuration_id == join.?.configuration_id)
                 {
                     if (self.nextRecoveryPeer()) |peer| {
                         self.node.requestCatchUp(peer) catch {};
@@ -2490,6 +2494,13 @@ pub const Server = struct {
         }
         if (local_configuration != self.transport_configuration_id) return;
 
+        // An enrolled replacement must establish its materialized and
+        // protocol base from the certified transfer anchor before it can
+        // consume or vote on the retained suffix. Peers may send ordinary
+        // envelopes as soon as the fetched registry rebuilds transport;
+        // ignore those until installing the image durably clears JOIN.
+        if (self.node.join_descriptor != null) return;
+
         switch (envelope.message) {
             .heartbeat => |m| {
                 if (m.decided_through > self.observed_leader_decided) {
@@ -2858,15 +2869,16 @@ pub const Server = struct {
         body: []const u8,
         install: *InstallState,
     ) !void {
-        const data = wire.RegistryData.decode(body) catch
-            return error.InvalidFrame;
+        const data = wire.RegistryData.decode(body) catch return error.InvalidFrame;
         {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
-            if (self.node.join_descriptor != null) {
+            if (self.node.join_descriptor) |join| {
                 // A joining replacement adopts the registry it enrolled
                 // against, then joins its configuration at slot zero and
                 // catches up through the retained journal (ZDS 0011).
+                if (self.node.identity.configuration_id == join.configuration_id)
+                    return;
                 self.node.installFetchedRegistry(data.blob) catch |err| {
                     std.log.warn(
                         "fetched registry rejected: {s}",
@@ -2946,10 +2958,8 @@ pub const Server = struct {
             }
             return;
         };
-        if (self.installation != .not_applicable) {
-            self.installation = .installed;
-            self.installation_failure = null;
-        }
+        if (self.installation != .not_applicable) self.installation = .installed;
+        if (self.installation != .not_applicable) self.installation_failure = null;
         self.observed_leader_decided = 0;
         self.node.requestCatchUp(from) catch {};
         self.pump();

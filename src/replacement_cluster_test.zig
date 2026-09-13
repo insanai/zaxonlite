@@ -113,6 +113,11 @@ const Cluster = struct {
         try argv.appendSlice(self.gpa, &.{ "--admin", "ops" });
         try argv.appendSlice(self.gpa, &.{ "--sync", "os" });
         try argv.append(self.gpa, "--enable-failpoints");
+        // Keep automatic anchors out of the handover/transfer assertions.
+        try argv.appendSlice(self.gpa, &.{
+            "--test-anchor-interval-ms",
+            "3600000",
+        });
 
         const log_file = try Io.Dir.cwd().createFile(self.io, node.log_path, .{});
         node.child = try std.process.spawn(self.io, .{
@@ -152,6 +157,96 @@ var progress_step: []const u8 = "init";
 fn step(name: []const u8) void {
     progress_step = name;
     std.debug.print("== {s}\n", .{name});
+}
+
+fn logContains(cluster: *Cluster, index: usize, needle: []const u8) bool {
+    const body = Io.Dir.cwd().readFileAlloc(
+        cluster.io,
+        cluster.nodes[index].log_path,
+        cluster.gpa,
+        .limited(1 << 20),
+    ) catch return false;
+    defer cluster.gpa.free(body);
+    return std.mem.indexOf(u8, body, needle) != null;
+}
+
+fn statusInt(cluster: *Cluster, endpoint: Endpoint, name: []const u8) ?i64 {
+    const body = rpcTry(cluster, endpoint, "{\"op\":\"status\"}") orelse return null;
+    defer cluster.gpa.free(body);
+    const parsed = parse(cluster, body);
+    defer parsed.deinit();
+    if (!isOk(&parsed)) return null;
+    return fieldInt(&parsed, name);
+}
+
+fn statusDatabaseId(cluster: *Cluster, endpoint: Endpoint) u128 {
+    const body = rpcTry(cluster, endpoint, "{\"op\":\"status\"}") orelse
+        fail(cluster, "status unavailable at port {d}", .{endpoint.port});
+    defer cluster.gpa.free(body);
+    const parsed = parse(cluster, body);
+    defer parsed.deinit();
+    const text = fieldString(&parsed, "database_id") orelse
+        fail(cluster, "status has no database_id", .{});
+    return std.fmt.parseInt(u128, text, 16) catch
+        fail(cluster, "invalid database_id {s}", .{text});
+}
+
+fn waitForInstalled(
+    cluster: *Cluster,
+    endpoint: Endpoint,
+    minimum_applied: u64,
+) void {
+    var elapsed: u64 = 0;
+    while (elapsed <= 60_000) : (elapsed += 50) {
+        const body = rpcTry(cluster, endpoint, "{\"op\":\"status\"}") orelse {
+            cluster.io.sleep(.fromMilliseconds(50), .awake) catch {};
+            continue;
+        };
+        defer cluster.gpa.free(body);
+        const parsed = parse(cluster, body);
+        defer parsed.deinit();
+        const state = fieldString(&parsed, "installation_state") orelse continue;
+        const applied = fieldInt(&parsed, "applied_slot") orelse continue;
+        if ((std.mem.eql(u8, state, "installed") or
+            std.mem.eql(u8, state, "active")) and applied >= minimum_applied) return;
+        cluster.io.sleep(.fromMilliseconds(50), .awake) catch {};
+    }
+    fail(cluster, "replacement did not install through slot {d}", .{minimum_applied});
+}
+
+fn appliedAnchor(
+    cluster: *Cluster,
+    index: usize,
+    database_id: u128,
+) ?zaxonlite.applied_anchor.Anchor {
+    var node_dir = Io.Dir.cwd().openDir(
+        cluster.io,
+        cluster.nodes[index].directory,
+        .{},
+    ) catch return null;
+    defer node_dir.close(cluster.io);
+    var consensus = node_dir.openDir(cluster.io, "consensus", .{}) catch return null;
+    defer consensus.close(cluster.io);
+    return zaxonlite.applied_anchor.select(cluster.io, consensus, database_id);
+}
+
+fn waitForAnchorConfiguration(
+    cluster: *Cluster,
+    index: usize,
+    database_id: u128,
+    configuration_id: u64,
+) zaxonlite.applied_anchor.Anchor {
+    var elapsed: u64 = 0;
+    while (elapsed <= 30_000) : (elapsed += 25) {
+        if (appliedAnchor(cluster, index, database_id)) |anchor| {
+            if (anchor.configuration_id == configuration_id) return anchor;
+        }
+        cluster.io.sleep(.fromMilliseconds(25), .awake) catch {};
+    }
+    fail(cluster, "node {d} did not publish configuration {d} anchor", .{
+        cluster.nodes[index].id,
+        configuration_id,
+    });
 }
 
 fn fail(cluster: *Cluster, comptime format: []const u8, args: anytype) noreturn {
@@ -708,6 +803,30 @@ pub fn main(init: std.process.Init) !u8 {
     if (!std.mem.eql(u32, after_1.voters[0..3], &expected_voters)) {
         fail(&cluster, "voters are {any}, expected 1,2,4", .{after_1.voters[0..3]});
     }
+    const database_id = statusDatabaseId(&cluster, endpoints[0]);
+    const handover_1 = waitForAnchorConfiguration(
+        &cluster,
+        0,
+        database_id,
+        next_configuration,
+    );
+    const handover_2 = waitForAnchorConfiguration(
+        &cluster,
+        1,
+        database_id,
+        next_configuration,
+    );
+    if (handover_1.global_slot != handover_2.global_slot or
+        !std.mem.eql(u8, &handover_1.history_hash, &handover_2.history_hash))
+    {
+        fail(&cluster, "survivors published different handover anchors", .{});
+    }
+    const stop_slot = handover_1.global_slot;
+    if (appliedAnchor(&cluster, 2, database_id)) |retired_anchor| {
+        if (retired_anchor.configuration_id != sealed_configuration) {
+            fail(&cluster, "retired voter published a later configuration anchor", .{});
+        }
+    }
 
     step("the held client connection survived the in-process swap");
     {
@@ -850,6 +969,16 @@ pub fn main(init: std.process.Init) !u8 {
     cluster.waitNodeExit(3);
 
     step("start the replacement voter; it fetches the decided registry");
+    for (0..2) |index| {
+        const retained = statusInt(&cluster, endpoints[index], "retained_first_slot") orelse
+            fail(&cluster, "survivor {d} status unavailable", .{index + 1});
+        if (retained != 1) {
+            fail(&cluster, "survivor {d} retained history starts at {d}, expected 1", .{
+                index + 1,
+                retained,
+            });
+        }
+    }
     try cluster.spawnNode(3, &updated_ids, &updated_ports, null);
     const joined = waitForConfiguration(
         &cluster,
@@ -859,6 +988,34 @@ pub fn main(init: std.process.Init) !u8 {
     );
     if (!std.mem.eql(u8, &joined.digest, &after_1.digest)) {
         fail(&cluster, "replacement installed a different registry digest", .{});
+    }
+    waitForInstalled(&cluster, cluster.endpointOf(3), stop_slot);
+    const join_anchor = waitForAnchorConfiguration(
+        &cluster,
+        3,
+        database_id,
+        next_configuration,
+    );
+    if (join_anchor.generation != 1 or join_anchor.global_slot < stop_slot) {
+        fail(&cluster, "replacement did not install the handover image", .{});
+    }
+    var pinning_survivor: ?usize = null;
+    for (0..2) |index| {
+        if (logContains(&cluster, index, "declining transfer for peer 4")) {
+            fail(&cluster, "survivor declined the required replacement image", .{});
+        }
+        if (logContains(&cluster, index, "pinning transfer image for peer 4")) {
+            pinning_survivor = index;
+        }
+    }
+    const sender_index = pinning_survivor orelse
+        fail(&cluster, "no survivor pinned an image for peer 4", .{});
+    const sender_anchor = appliedAnchor(&cluster, sender_index, database_id) orelse
+        fail(&cluster, "pinning survivor has no APPLIED anchor", .{});
+    if (sender_anchor.global_slot != join_anchor.global_slot or
+        !std.mem.eql(u8, &sender_anchor.history_hash, &join_anchor.history_hash))
+    {
+        fail(&cluster, "replacement installed a different transfer anchor", .{});
     }
 
     step("the replacement participates: quorum survives a survivor stop");
