@@ -367,6 +367,21 @@ pub fn build(b: *std.Build) void {
     );
     trim_cluster_step.dependOn(&run_trim_cluster_test.step);
 
+    const trim_soak_seconds = b.option(
+        u64,
+        "trim-soak-seconds",
+        "Three-process trim soak duration in seconds (default 60)",
+    ) orelse 60;
+    const run_trim_soak = b.addRunArtifact(cluster_test);
+    run_trim_soak.addArtifactArg(zaxon);
+    run_trim_soak.addArgs(&.{ "1", "trim-soak" });
+    run_trim_soak.addArg(b.fmt("{d}", .{trim_soak_seconds}));
+    const trim_soak_step = b.step(
+        "test-trim-soak",
+        "Run the sustained three-process trim workload",
+    );
+    trim_soak_step.dependOn(&run_trim_soak.step);
+
     const replacement_cluster_test = b.addExecutable(.{
         .name = "zaxon-replace-cluster-test",
         .root_module = b.createModule(.{

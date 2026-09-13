@@ -1,0 +1,12 @@
+{
+  "date": "2026-09-13",
+  "host": "Apple M1 MacBook Air",
+  "os": "Darwin 25.6.0 arm64",
+  "duration_seconds": 60,
+  "writes": 3031,
+  "trim_decision_slot": 3778,
+  "chosen_trim_slot": 3776,
+  "retained_first_slot": 3729,
+  "trim_regressions": 0,
+  "assertions": "healthy and monotonic on every sample; common byte-identical TRIM; equal integrity and digests; retained prefix reclaimed; count preserved across restart; post-restart write committed"
+}

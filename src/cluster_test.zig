@@ -20,7 +20,8 @@
 //! Every wait is deadline-based on observable conditions. On failure the
 //! controller prints each node's status and recent log tail, then exits 1.
 //!
-//! Usage: cluster-test <path-to-zaxon> [runs] [mandatory|takeover|trim]
+//! Usage: cluster-test <path-to-zaxon> [runs]
+//!        [mandatory|takeover|trim|trim-soak] [soak-seconds]
 
 const std = @import("std");
 const Io = std.Io;
@@ -45,6 +46,8 @@ const NodeProc = struct {
     vote_delay_ms: u64 = 0,
     /// Test-only periodic anchor cadence. Zero keeps the production default.
     anchor_interval_ms: u64 = 0,
+    /// Test-only journal segment rotation threshold.
+    segment_records: u64 = 0,
 };
 
 const Cluster = struct {
@@ -120,6 +123,15 @@ const Cluster = struct {
                 self.gpa,
                 &.{ "--test-anchor-interval-ms", interval_text },
             );
+        }
+        if (node.segment_records != 0) {
+            const records_text = try std.fmt.allocPrint(
+                self.gpa,
+                "{d}",
+                .{node.segment_records},
+            );
+            try scratch.append(self.gpa, records_text);
+            try argv.appendSlice(self.gpa, &.{ "--segment-records", records_text });
         }
         try argv.append(self.gpa, "--enable-failpoints");
         try argv.append(self.gpa, "--dev-psk");
@@ -215,7 +227,12 @@ fn rpcTry(cluster: *Cluster, endpoint: Endpoint, request: []const u8) ?[]u8 {
         cluster_secret,
     ) catch return null;
     defer connection.close();
-    return connection.call(request) catch null;
+    const deadline = Io.Clock.Timestamp{
+        .clock = .awake,
+        .raw = .{ .nanoseconds = Io.Clock.Timestamp.now(cluster.io, .awake).raw.nanoseconds +
+            5 * std.time.ns_per_s },
+    };
+    return connection.callWithDeadline(request, deadline) catch null;
 }
 
 const Parsed = std.json.Parsed(std.json.Value);
@@ -513,7 +530,8 @@ pub fn main(init: std.process.Init) !u8 {
     _ = iterator.next();
     const zaxon = iterator.next() orelse {
         std.debug.print(
-            "usage: cluster-test <path-to-zaxon> [runs] [mandatory|takeover|trim]\n",
+            "usage: cluster-test <path-to-zaxon> [runs] " ++
+                "[mandatory|takeover|trim|trim-soak] [soak-seconds]\n",
             .{},
         );
         return 2;
@@ -527,7 +545,12 @@ pub fn main(init: std.process.Init) !u8 {
     const run_mandatory = only == null or std.mem.eql(u8, only.?, "mandatory");
     const run_takeover = only == null or std.mem.eql(u8, only.?, "takeover");
     const run_trim = only != null and std.mem.eql(u8, only.?, "trim");
-    if (!run_mandatory and !run_takeover and !run_trim) {
+    const run_trim_soak = only != null and std.mem.eql(u8, only.?, "trim-soak");
+    const soak_seconds = if (iterator.next()) |text|
+        std.fmt.parseInt(u64, text, 10) catch 60
+    else
+        60;
+    if (!run_mandatory and !run_takeover and !run_trim and !run_trim_soak) {
         std.debug.print("unknown cluster scenario: {s}\n", .{only.?});
         return 2;
     }
@@ -547,8 +570,13 @@ pub fn main(init: std.process.Init) !u8 {
             std.debug.print("=== trim takeover/fatal run {d}/{d}\n", .{ run_index + 1, runs });
             try runTrimTakeoverFatalScenario(gpa, io, zaxon, run_index);
         }
+        if (run_trim_soak) {
+            std.debug.print("=== trim soak run {d}/{d}\n", .{ run_index + 1, runs });
+            try runTrimSoakScenario(gpa, io, zaxon, run_index, soak_seconds);
+        }
     }
     if (run_trim) std.debug.print("trim cluster: all scenarios passed\n", .{});
+    if (run_trim_soak) std.debug.print("trim soak: scenario passed\n", .{});
     std.debug.print("cluster test: all {d} run(s) passed\n", .{runs});
     return 0;
 }
@@ -1104,6 +1132,45 @@ const ContentionWorker = struct {
     }
 };
 
+const ParkedWriteWorker = struct {
+    io: Io,
+    endpoint: Endpoint,
+    done: std.atomic.Value(bool) = .init(false),
+    refused_or_ambiguous: bool = false,
+
+    fn run(self: *ParkedWriteWorker) void {
+        const gpa = std.heap.page_allocator;
+        const connection = client.Connection.openWithSecret(
+            gpa,
+            self.io,
+            self.endpoint,
+            cluster_secret,
+        ) catch {
+            self.refused_or_ambiguous = true;
+            self.done.store(true, .release);
+            return;
+        };
+        defer connection.close();
+        const deadline = Io.Clock.Timestamp{
+            .clock = .awake,
+            .raw = .{ .nanoseconds = Io.Clock.Timestamp.now(self.io, .awake).raw.nanoseconds +
+                10 * std.time.ns_per_s },
+        };
+        const body = connection.callWithDeadline(
+            "{\"op\":\"exec\",\"sql\":\"insert into t(v) values ('parked')\"}",
+            deadline,
+        ) catch {
+            self.refused_or_ambiguous = true;
+            self.done.store(true, .release);
+            return;
+        };
+        defer gpa.free(body);
+        self.refused_or_ambiguous = std.mem.indexOf(u8, body, "\"unavailable\"") != null or
+            std.mem.indexOf(u8, body, "\"ambiguous\"") != null;
+        self.done.store(true, .release);
+    }
+};
+
 fn anyLogContains(cluster: *Cluster, needle: []const u8) bool {
     for (cluster.nodes) |node| {
         const contents = Io.Dir.cwd().readFileAlloc(
@@ -1344,6 +1411,7 @@ const TrimStatus = struct {
     trim_decision: i64,
     chosen_trim: i64,
     journal_records: i64,
+    retained_first: i64,
 };
 
 fn statusAt(cluster: *Cluster, endpoint: Endpoint) ?TrimStatus {
@@ -1365,6 +1433,7 @@ fn statusAt(cluster: *Cluster, endpoint: Endpoint) ?TrimStatus {
         .trim_decision = fieldInt(&parsed, "trim_decision_slot") orelse return null,
         .chosen_trim = fieldInt(&parsed, "chosen_trim_slot") orelse return null,
         .journal_records = fieldInt(&parsed, "journal_records") orelse return null,
+        .retained_first = fieldInt(&parsed, "retained_first_slot") orelse return null,
     };
 }
 
@@ -1786,25 +1855,62 @@ fn runTrimTakeoverFatalScenario(
     expectTrimEqual(&cluster, old_leader, successor);
     expectTrimEqual(&cluster, old_leader, 2);
 
-    step("a real trim storage failure exits 4 with one diagnostic");
+    step("a real trim failure wakes parked writers and exits 4 once");
     execSql(&cluster, "insert into t(v) values ('fatal')", 30_000);
     const fatal_base = mustStatusAt(&cluster, cluster.endpoints[successor], 10_000);
     waitAllApplied(&cluster, fatal_base.applied, 30_000);
+    setVoteDelayAt(&cluster, cluster.endpoints[old_leader], 3000);
+    setVoteDelayAt(&cluster, cluster.endpoints[2], 3000);
     anchorAt(&cluster, cluster.endpoints[old_leader]);
     const trim_path = try std.fmt.allocPrint(
         gpa,
         "{s}/consensus/TRIM",
-        .{cluster.nodes[old_leader].directory},
+        .{cluster.nodes[successor].directory},
     );
     defer gpa.free(trim_path);
     try Io.Dir.cwd().deleteFile(io, trim_path);
     try Io.Dir.cwd().createDir(io, trim_path, @enumFromInt(0o700));
     anchorAt(&cluster, cluster.endpoints[successor]);
 
-    const child = &(cluster.nodes[old_leader].child orelse
+    var elapsed: u64 = 0;
+    while (elapsed < 2000) : (elapsed += 25) {
+        const pending = mustStatusAt(&cluster, cluster.endpoints[successor], 1000);
+        if (pending.decided != fatal_base.decided) {
+            fail(&cluster, "fatal trim decided before writers could park", .{});
+        }
+        if (pending.journal_records == fatal_base.journal_records + 1) break;
+        if (pending.journal_records > fatal_base.journal_records + 1) {
+            fail(&cluster, "fatal trim was appended more than once", .{});
+        }
+        io.sleep(.fromMilliseconds(25), .awake) catch {};
+    } else fail(&cluster, "fatal trim proposal was not observed", .{});
+
+    var workers = [_]ParkedWriteWorker{
+        .{ .io = io, .endpoint = cluster.endpoints[successor] },
+        .{ .io = io, .endpoint = cluster.endpoints[successor] },
+        .{ .io = io, .endpoint = cluster.endpoints[successor] },
+    };
+    var writer_threads: [workers.len]std.Thread = undefined;
+    for (&workers, &writer_threads) |*worker, *thread| {
+        thread.* = try std.Thread.spawn(.{}, ParkedWriteWorker.run, .{worker});
+    }
+    io.sleep(.fromMilliseconds(100), .awake) catch {};
+    for (&workers) |*worker| {
+        if (worker.done.load(.acquire)) {
+            fail(&cluster, "writer completed before the fatal trim decision", .{});
+        }
+    }
+
+    const child = &(cluster.nodes[successor].child orelse
         fail(&cluster, "failed node has no child process", .{}));
     const term = child.wait(io) catch fail(&cluster, "failed node did not exit", .{});
-    cluster.nodes[old_leader].child = null;
+    cluster.nodes[successor].child = null;
+    for (&writer_threads) |*thread| thread.join();
+    for (&workers) |*worker| {
+        if (!worker.done.load(.acquire) or !worker.refused_or_ambiguous) {
+            fail(&cluster, "parked writer was not released with an uncertain result", .{});
+        }
+    }
     switch (term) {
         .exited => |code| if (code != 4) {
             fail(&cluster, "failed node exited {d}, expected 4", .{code});
@@ -1813,7 +1919,7 @@ fn runTrimTakeoverFatalScenario(
     }
     const log = try Io.Dir.cwd().readFileAlloc(
         io,
-        cluster.nodes[old_leader].log_path,
+        cluster.nodes[successor].log_path,
         gpa,
         .limited(1 << 20),
     );
@@ -1822,17 +1928,145 @@ fn runTrimTakeoverFatalScenario(
     const failure_needle = std.fmt.bufPrint(
         &failure_needle_buffer,
         "node {d} failed:",
-        .{cluster.nodes[old_leader].id},
+        .{cluster.nodes[successor].id},
     ) catch unreachable;
     if (std.mem.count(u8, log, failure_needle) != 1 or
         std.mem.indexOf(u8, log, "-- NODE FAILED --") == null)
     {
         fail(&cluster, "fatal log lacks one first-failure line and diagnostic", .{});
     }
-    _ = waitTrimDecision(&cluster, cluster.endpoints[successor], fatal_base.decided + 1);
+    setVoteDelayAt(&cluster, cluster.endpoints[old_leader], 0);
+    setVoteDelayAt(&cluster, cluster.endpoints[2], 0);
+    _ = waitTrimDecision(&cluster, cluster.endpoints[old_leader], fatal_base.decided + 1);
     _ = waitTrimDecision(&cluster, cluster.endpoints[2], fatal_base.decided + 1);
+    expectTrimEqual(&cluster, old_leader, 2);
     execSql(&cluster, "insert into t(v) values ('survivor')", 30_000);
     if (anyLogContains(&cluster, "TrimRegression")) {
         fail(&cluster, "TrimRegression during takeover or fatal isolation", .{});
     }
+}
+
+fn runTrimSoakScenario(
+    gpa: std.mem.Allocator,
+    io: Io,
+    zaxon: []const u8,
+    run_index: usize,
+    seconds: u64,
+) !void {
+    if (seconds == 0) return error.InvalidSoakDuration;
+    const paths = try trimRoot(gpa, io, "zx-trim-soak", run_index);
+    defer freeTrimRoot(gpa, io, paths);
+    var cluster = try initTrimCluster(gpa, io, zaxon, paths.root, paths.auth, false);
+    defer deinitTrimCluster(&cluster);
+    for (&cluster.nodes) |*node| {
+        node.vote_delay_ms = 0;
+        node.anchor_interval_ms = 200;
+        node.segment_records = 256;
+    }
+    for (0..3) |index| try cluster.spawnNode(index, false);
+
+    step("run sustained writes with fast anchors and a monotonic trim watch");
+    execSql(&cluster, "create table t(id integer primary key, v text)", 30_000);
+    var last_trim = [_]i64{0} ** 3;
+    var last_decision = [_]i64{0} ** 3;
+    var missed = [_]u8{0} ** 3;
+    var writes: u64 = 0;
+    const start = std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds;
+    const duration_ns: i96 = @as(i96, @intCast(seconds)) * std.time.ns_per_s;
+    var next_sample = start;
+    while (std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds - start < duration_ns) {
+        execSql(&cluster, "insert into t(v) values ('soak')", 30_000);
+        writes += 1;
+        const now = std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds;
+        if (now < next_sample) continue;
+        next_sample = now + 50 * std.time.ns_per_ms;
+        for (cluster.endpoints, 0..) |endpoint, index| {
+            const status = statusAt(&cluster, endpoint) orelse {
+                missed[index] += 1;
+                if (missed[index] >= 3) {
+                    fail(&cluster, "node {d} missed three health samples", .{index + 1});
+                }
+                continue;
+            };
+            missed[index] = 0;
+            if (status.chosen_trim < last_trim[index] or
+                status.trim_decision < last_decision[index])
+            {
+                fail(&cluster, "node {d} trim state regressed", .{index + 1});
+            }
+            last_trim[index] = status.chosen_trim;
+            last_decision[index] = status.trim_decision;
+        }
+    }
+
+    step("converge, verify retained history, and compare durable state");
+    const leader = leaderIndex(&cluster);
+    const final_status = mustStatusAt(&cluster, cluster.endpoints[leader], 10_000);
+    step("wait for every member to apply the final decided slot");
+    waitAllApplied(&cluster, final_status.decided, 30_000);
+    step("wait for a stable common trim");
+    var converged: ?TrimStatus = null;
+    const convergence_end = Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds +
+        30 * std.time.ns_per_s;
+    while (Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds < convergence_end) {
+        const a = statusAt(&cluster, cluster.endpoints[0]);
+        const b = statusAt(&cluster, cluster.endpoints[1]);
+        const c = statusAt(&cluster, cluster.endpoints[2]);
+        if (a != null and b != null and c != null and
+            a.?.chosen_trim == b.?.chosen_trim and
+            a.?.chosen_trim == c.?.chosen_trim and
+            a.?.trim_decision == b.?.trim_decision and
+            a.?.trim_decision == c.?.trim_decision and
+            a.?.chosen_trim > 0)
+        {
+            io.sleep(.fromMilliseconds(500), .awake) catch {};
+            const stable = statusAt(&cluster, cluster.endpoints[0]);
+            if (stable != null and stable.?.chosen_trim == a.?.chosen_trim and
+                stable.?.trim_decision == a.?.trim_decision)
+            {
+                converged = a.?;
+                break;
+            }
+        }
+        io.sleep(.fromMilliseconds(100), .awake) catch {};
+    }
+    const settled = converged orelse fail(&cluster, "trim state did not converge", .{});
+    if (seconds >= 10) {
+        for (cluster.endpoints) |endpoint| {
+            if (mustStatusAt(&cluster, endpoint, 10_000).retained_first <= 1) {
+                fail(&cluster, "sustained trim workload did not reclaim a segment", .{});
+            }
+        }
+    }
+    expectTrimEqual(&cluster, 0, 1);
+    expectTrimEqual(&cluster, 0, 2);
+    expectIntegrityAll(&cluster);
+    expectAllDigestsEqual(&cluster, "trim soak");
+    if (anyLogContains(&cluster, "TrimRegression")) {
+        fail(&cluster, "TrimRegression during sustained trim workload", .{});
+    }
+    const count = linearizableCount(&cluster, 30_000);
+    if (count != @as(i64, @intCast(writes))) {
+        fail(&cluster, "soak acknowledged {d} writes but counted {d}", .{ writes, count });
+    }
+
+    step("restart every member and verify continued service");
+    cluster.killAll();
+    for (0..3) |index| try cluster.spawnNode(index, false);
+    _ = leaderIndex(&cluster);
+    if (linearizableCount(&cluster, 30_000) != @as(i64, @intCast(writes))) {
+        fail(&cluster, "soak row count changed across restart", .{});
+    }
+    execSql(&cluster, "insert into t(v) values ('after-restart')", 30_000);
+    for (cluster.endpoints) |endpoint| _ = mustStatusAt(&cluster, endpoint, 10_000);
+    std.debug.print(
+        "trim soak: {d}s, {d} writes, decision {d}, through {d}, retained {d}\n",
+        .{
+            seconds,
+            writes,
+            settled.trim_decision,
+            settled.chosen_trim,
+            settled.retained_first,
+        },
+    );
 }
