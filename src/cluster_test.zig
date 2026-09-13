@@ -22,8 +22,10 @@
 //!
 //! Usage: cluster-test <path-to-zaxon> [runs]
 //!        [mandatory|takeover|trim|trim-soak] [soak-seconds]
+//!        [--record <json>]
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const zaxonlite = @import("zaxonlite");
 const client = zaxonlite.client;
@@ -531,7 +533,8 @@ pub fn main(init: std.process.Init) !u8 {
     const zaxon = iterator.next() orelse {
         std.debug.print(
             "usage: cluster-test <path-to-zaxon> [runs] " ++
-                "[mandatory|takeover|trim|trim-soak] [soak-seconds]\n",
+                "[mandatory|takeover|trim|trim-soak] [soak-seconds] " ++
+                "[--record <json>]\n",
             .{},
         );
         return 2;
@@ -550,8 +553,24 @@ pub fn main(init: std.process.Init) !u8 {
         std.fmt.parseInt(u64, text, 10) catch 60
     else
         60;
+    var record_path: ?[]const u8 = null;
+    while (iterator.next()) |argument| {
+        if (std.mem.eql(u8, argument, "--record")) {
+            record_path = iterator.next() orelse {
+                std.debug.print("--record needs a path\n", .{});
+                return 2;
+            };
+        } else {
+            std.debug.print("unknown cluster option: {s}\n", .{argument});
+            return 2;
+        }
+    }
     if (!run_mandatory and !run_takeover and !run_trim and !run_trim_soak) {
         std.debug.print("unknown cluster scenario: {s}\n", .{only.?});
+        return 2;
+    }
+    if (record_path != null and (!run_trim_soak or runs != 1)) {
+        std.debug.print("--record requires one trim-soak run\n", .{});
         return 2;
     }
 
@@ -572,7 +591,15 @@ pub fn main(init: std.process.Init) !u8 {
         }
         if (run_trim_soak) {
             std.debug.print("=== trim soak run {d}/{d}\n", .{ run_index + 1, runs });
-            try runTrimSoakScenario(gpa, io, zaxon, run_index, soak_seconds);
+            try runTrimSoakScenario(
+                gpa,
+                io,
+                zaxon,
+                run_index,
+                soak_seconds,
+                record_path,
+                init.environ_map.get("HOSTNAME") orelse builtin.cpu.model.name,
+            );
         }
     }
     if (run_trim) std.debug.print("trim cluster: all scenarios passed\n", .{});
@@ -1133,10 +1160,12 @@ const ContentionWorker = struct {
 };
 
 const ParkedWriteWorker = struct {
+    const Outcome = enum { pending, unavailable, ambiguous, ok, other, transport_error };
+
     io: Io,
     endpoint: Endpoint,
     done: std.atomic.Value(bool) = .init(false),
-    refused_or_ambiguous: bool = false,
+    outcome: Outcome = .pending,
 
     fn run(self: *ParkedWriteWorker) void {
         const gpa = std.heap.page_allocator;
@@ -1146,7 +1175,7 @@ const ParkedWriteWorker = struct {
             self.endpoint,
             cluster_secret,
         ) catch {
-            self.refused_or_ambiguous = true;
+            self.outcome = .transport_error;
             self.done.store(true, .release);
             return;
         };
@@ -1160,14 +1189,32 @@ const ParkedWriteWorker = struct {
             "{\"op\":\"exec\",\"sql\":\"insert into t(v) values ('parked')\"}",
             deadline,
         ) catch {
-            self.refused_or_ambiguous = true;
+            self.outcome = .transport_error;
             self.done.store(true, .release);
             return;
         };
         defer gpa.free(body);
-        self.refused_or_ambiguous = std.mem.indexOf(u8, body, "\"unavailable\"") != null or
-            std.mem.indexOf(u8, body, "\"ambiguous\"") != null;
+        self.outcome = if (std.mem.indexOf(u8, body, "\"ok\":true") != null)
+            .ok
+        else if (std.mem.indexOf(u8, body, "\"unavailable\"") != null)
+            .unavailable
+        else if (std.mem.indexOf(u8, body, "\"ambiguous\"") != null)
+            .ambiguous
+        else
+            .other;
         self.done.store(true, .release);
+    }
+};
+
+const ChildWaiter = struct {
+    io: Io,
+    child: *std.process.Child,
+    term: ?std.process.Child.Term = null,
+    done: Io.Event = .unset,
+
+    fn run(self: *ChildWaiter) void {
+        self.term = self.child.wait(self.io) catch null;
+        self.done.set(self.io);
     }
 };
 
@@ -1903,12 +1950,27 @@ fn runTrimTakeoverFatalScenario(
 
     const child = &(cluster.nodes[successor].child orelse
         fail(&cluster, "failed node has no child process", .{}));
-    const term = child.wait(io) catch fail(&cluster, "failed node did not exit", .{});
+    var child_waiter = ChildWaiter{ .io = io, .child = child };
+    const child_thread = try std.Thread.spawn(.{}, ChildWaiter.run, .{&child_waiter});
+    const child_deadline = Io.Clock.Timestamp{
+        .clock = .awake,
+        .raw = .{ .nanoseconds = Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds +
+            10 * std.time.ns_per_s },
+    };
+    while (!child_waiter.done.isSet()) {
+        if (Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds >=
+            child_deadline.raw.nanoseconds) std.c._exit(1);
+        child_waiter.done.waitTimeout(io, .{ .deadline = child_deadline }) catch {};
+    }
+    child_thread.join();
+    const term = child_waiter.term orelse fail(&cluster, "failed node did not exit", .{});
     cluster.nodes[successor].child = null;
     for (&writer_threads) |*thread| thread.join();
     for (&workers) |*worker| {
-        if (!worker.done.load(.acquire) or !worker.refused_or_ambiguous) {
-            fail(&cluster, "parked writer was not released with an uncertain result", .{});
+        if (!worker.done.load(.acquire) or
+            (worker.outcome != .unavailable and worker.outcome != .ambiguous))
+        {
+            fail(&cluster, "parked writer completed as {s}", .{@tagName(worker.outcome)});
         }
     }
     switch (term) {
@@ -1952,6 +2014,8 @@ fn runTrimSoakScenario(
     zaxon: []const u8,
     run_index: usize,
     seconds: u64,
+    record_path: ?[]const u8,
+    host: []const u8,
 ) !void {
     if (seconds == 0) return error.InvalidSoakDuration;
     const paths = try trimRoot(gpa, io, "zx-trim-soak", run_index);
@@ -2059,6 +2123,9 @@ fn runTrimSoakScenario(
     }
     execSql(&cluster, "insert into t(v) values ('after-restart')", 30_000);
     for (cluster.endpoints) |endpoint| _ = mustStatusAt(&cluster, endpoint, 10_000);
+    if (record_path) |path| {
+        try recordTrimSoak(gpa, io, path, host, seconds, writes, settled);
+    }
     std.debug.print(
         "trim soak: {d}s, {d} writes, decision {d}, through {d}, retained {d}\n",
         .{
@@ -2069,4 +2136,56 @@ fn runTrimSoakScenario(
             settled.retained_first,
         },
     );
+}
+
+fn recordTrimSoak(
+    gpa: std.mem.Allocator,
+    io: Io,
+    path: []const u8,
+    host: []const u8,
+    seconds: u64,
+    writes: u64,
+    settled: TrimStatus,
+) !void {
+    const epoch_seconds: u64 = @intCast(Io.Clock.Timestamp.now(io, .real).raw.toSeconds());
+    const year_day = (std.time.epoch.EpochSeconds{ .secs = epoch_seconds })
+        .getEpochDay().calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    var date_buffer: [10]u8 = undefined;
+    const date = try std.fmt.bufPrint(&date_buffer, "{d:0>4}-{d:0>2}-{d:0>2}", .{
+        year_day.year,
+        month_day.month.numeric(),
+        month_day.day_index + 1,
+    });
+    var os_buffer: [48]u8 = undefined;
+    const os = try std.fmt.bufPrint(
+        &os_buffer,
+        "{s} {s}",
+        .{ @tagName(builtin.os.tag), @tagName(builtin.cpu.arch) },
+    );
+    const record = .{
+        .date = date,
+        .host = host,
+        .os = os,
+        .duration_seconds = seconds,
+        .writes = writes,
+        .trim_decision_slot = settled.trim_decision,
+        .chosen_trim_slot = settled.chosen_trim,
+        .retained_first_slot = settled.retained_first,
+        .trim_regressions = 0,
+        .assertions = if (seconds >= 10)
+            "healthy and monotonic on every sample; common byte-identical TRIM; " ++
+                "equal integrity and digests; retained prefix reclaimed; count " ++
+                "preserved across restart; post-restart write committed"
+        else
+            "healthy and monotonic on every sample; common byte-identical TRIM; " ++
+                "equal integrity and digests; count preserved across restart; " ++
+                "post-restart write committed; reclamation requires 10s or longer",
+    };
+    const encoded = try std.json.Stringify.valueAlloc(gpa, record, .{
+        .whitespace = .indent_2,
+    });
+    defer gpa.free(encoded);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = encoded });
+    std.debug.print("recorded {s}\n", .{path});
 }

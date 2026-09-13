@@ -7,6 +7,7 @@ const waits = @import("server_waiters.zig");
 
 pub fn check(comptime Server: type, comptime api: anytype) !void {
     try checkShutdownGrace(Server, api.shutdown);
+    try checkConnectionInterruption(Server, api.close);
     const Harness = struct {
         server: *Server,
         mode: enum { writer, frontier, applied, pending, fence },
@@ -65,6 +66,66 @@ pub fn check(comptime Server: type, comptime api: anytype) !void {
             try checkOne(Server, api, Harness, mode, failure);
         }
     }
+}
+
+fn checkConnectionInterruption(comptime Server: type, comptime close: anytype) !void {
+    const io = std.testing.io;
+    const address = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try address.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const client = try listener.socket.address.connect(io, .{ .mode = .stream });
+    defer client.close(io);
+    const accepted = try listener.accept(io);
+    defer accepted.close(io);
+
+    var server = Server{
+        .gpa = std.testing.allocator,
+        .io = io,
+        .node = undefined,
+        .options = .{ .directory = "", .node_id = 1 },
+        .membership = undefined,
+        .transport_configuration_id = 1,
+        .held = undefined,
+    };
+    defer server.active_connections.deinit(std.testing.allocator);
+    try server.active_connections.append(std.testing.allocator, .{
+        .stream = accepted,
+        .handshake_deadline_ms = 0,
+    });
+    server.connection_interrupting = true;
+
+    const Closing = struct {
+        server: *Server,
+        stream: Io.net.Stream,
+        started: Io.Event = .unset,
+        done: Io.Event = .unset,
+
+        fn run(self: *@This()) void {
+            self.started.set(self.server.io);
+            close(self.server, self.stream);
+            self.done.set(self.server.io);
+        }
+    };
+    var closing = Closing{ .server = &server, .stream = accepted };
+    const thread = try std.Thread.spawn(.{}, Closing.run, .{&closing});
+    const deadline = deadlines.after(io, 2000);
+    while (!closing.started.isSet()) {
+        if (deadlines.expired(io, deadline)) std.c._exit(1);
+        closing.started.waitTimeout(io, .{ .deadline = deadline }) catch {};
+    }
+    io.sleep(.fromMilliseconds(100), .awake) catch {};
+    try std.testing.expect(!closing.done.isSet());
+    server.mutex.lockUncancelable(io);
+    try std.testing.expectEqual(@as(usize, 1), server.active_connections.items.len);
+    server.connection_interrupting = false;
+    server.handler_cond.broadcast(io);
+    server.mutex.unlock(io);
+    while (!closing.done.isSet()) {
+        if (deadlines.expired(io, deadline)) std.c._exit(1);
+        closing.done.waitTimeout(io, .{ .deadline = deadline }) catch {};
+    }
+    thread.join();
+    try std.testing.expectEqual(@as(usize, 0), server.active_connections.items.len);
 }
 
 fn checkOne(

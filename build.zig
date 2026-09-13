@@ -376,6 +376,7 @@ pub fn build(b: *std.Build) void {
     run_trim_soak.addArtifactArg(zaxon);
     run_trim_soak.addArgs(&.{ "1", "trim-soak" });
     run_trim_soak.addArg(b.fmt("{d}", .{trim_soak_seconds}));
+    if (b.args) |args| run_trim_soak.addArgs(args);
     const trim_soak_step = b.step(
         "test-trim-soak",
         "Run the sustained three-process trim workload",
