@@ -1550,7 +1550,7 @@ fn runTrimSerializationScenario(
     for (&cluster.nodes) |*node| node.vote_delay_ms = 0;
     for (0..3) |index| try cluster.spawnNode(index, false);
 
-    step("establish a baseline chosen trim under delayed votes");
+    step("establish a baseline chosen trim");
     execSql(&cluster, "create table t(id integer primary key, v text)", 30_000);
     const leader = leaderIndex(&cluster);
     const initial = mustStatusAt(&cluster, cluster.endpoints[leader], 10_000);
@@ -1561,25 +1561,26 @@ fn runTrimSerializationScenario(
     }
     const baseline_trim = mustStatusAt(&cluster, cluster.endpoints[leader], 10_000);
 
-    step("append exactly one trim while its quorum votes are delayed");
+    // Followers are named so the durable reports can be staged: the lagging
+    // follower's report is what advances the candidate while the earlier
+    // trim is still undecided, the exact route behind issue #10.
+    const first_follower: usize = if (leader == 0) 1 else 0;
+    const second_follower: usize = if (leader == 2) 1 else 2;
+
+    step("stage a lagging durable report below the next candidate");
     execSql(&cluster, "insert into t(v) values ('first')", 30_000);
+    const lagging = mustStatusAt(&cluster, cluster.endpoints[leader], 10_000);
+    waitAllApplied(&cluster, lagging.applied, 30_000);
+    // Only the second follower anchors here, so its durable frontier stays
+    // one write behind the others for the rest of the scenario.
+    anchorAt(&cluster, cluster.endpoints[second_follower]);
+    execSql(&cluster, "insert into t(v) values ('second')", 30_000);
     const before_anchor = mustStatusAt(&cluster, cluster.endpoints[leader], 10_000);
     waitAllApplied(&cluster, before_anchor.applied, 30_000);
-    var last_follower: usize = undefined;
-    var anchored_one = false;
     anchorAt(&cluster, cluster.endpoints[leader]);
     for (0..3) |index| {
         if (index == leader) continue;
-        if (!anchored_one) {
-            anchorAt(&cluster, cluster.endpoints[index]);
-            anchored_one = true;
-        } else {
-            last_follower = index;
-        }
-    }
-    for (0..3) |index| {
-        if (index == leader) continue;
-        setVoteDelayAt(&cluster, cluster.endpoints[index], 1500);
+        setVoteDelayAt(&cluster, cluster.endpoints[index], 2500);
     }
     const before_trim = mustStatusAt(&cluster, cluster.endpoints[leader], 10_000);
     if (before_trim.trim_decision != baseline_trim.trim_decision) {
@@ -1594,8 +1595,11 @@ fn runTrimSerializationScenario(
             before_trim.journal_records,
         },
     );
-    anchorAt(&cluster, cluster.endpoints[last_follower]);
 
+    step("append exactly one trim while its quorum votes are delayed");
+    // The minimum durable frontier is now the lagging follower's, one write
+    // behind, so the first trim anchors there.
+    anchorAt(&cluster, cluster.endpoints[first_follower]);
     var elapsed: u64 = 0;
     while (elapsed < 30_000) : (elapsed += 25) {
         const status = mustStatusAt(&cluster, cluster.endpoints[leader], 1_000);
@@ -1607,6 +1611,11 @@ fn runTrimSerializationScenario(
         if (status.journal_records == before_trim.journal_records + 1) break;
         io.sleep(.fromMilliseconds(25), .awake) catch {};
     } else fail(&cluster, "did not observe the undecided trim append", .{});
+
+    step("advance the candidate while the first trim is still undecided");
+    // Before the fix, this report produced a second trim carrying the same
+    // identity and a later anchor, which then classified as a regression.
+    anchorAt(&cluster, cluster.endpoints[second_follower]);
     elapsed = 0;
     while (elapsed < 500) : (elapsed += 25) {
         const status = mustStatusAt(&cluster, cluster.endpoints[leader], 1_000);
@@ -1617,28 +1626,39 @@ fn runTrimSerializationScenario(
         }
         io.sleep(.fromMilliseconds(25), .awake) catch {};
     }
-    const first_decision = before_trim.decided + 1;
-    for (cluster.endpoints) |endpoint| _ = waitTrimDecision(&cluster, endpoint, first_decision);
 
+    step("both trims land in order on consecutive global slots");
+    const first_decision = before_trim.decided + 1;
+    for (cluster.endpoints) |endpoint| {
+        const status = waitTrimDecision(&cluster, endpoint, first_decision);
+        if (status.chosen_trim != lagging.applied) {
+            fail(&cluster, "first trim chose {d}, expected {d}", .{
+                status.chosen_trim,
+                lagging.applied,
+            });
+        }
+    }
+    // The advanced candidate is proposed only after the first trim is
+    // applied, so it takes the very next slot and anchors at the frontier
+    // every replica has now reported.
+    const second_decision = first_decision + 1;
+    for (cluster.endpoints) |endpoint| {
+        const status = waitTrimDecision(&cluster, endpoint, second_decision);
+        if (status.chosen_trim != before_anchor.applied) {
+            fail(&cluster, "second trim chose {d}, expected {d}", .{
+                status.chosen_trim,
+                before_anchor.applied,
+            });
+        }
+        if (status.decided != second_decision) {
+            fail(&cluster, "serialized trims consumed {d} slots, expected 2", .{
+                status.decided - before_trim.decided,
+            });
+        }
+    }
     for (0..3) |index| {
         if (index == leader) continue;
         setVoteDelayAt(&cluster, cluster.endpoints[index], 0);
-    }
-
-    step("the next candidate consumes one later global trim slot");
-    execSql(&cluster, "insert into t(v) values ('second')", 30_000);
-    const second_data = mustStatusAt(&cluster, cluster.endpoints[leader], 10_000);
-    waitAllApplied(&cluster, second_data.applied, 30_000);
-    for (cluster.endpoints) |endpoint| anchorAt(&cluster, endpoint);
-    const second_decision = second_data.decided + 1;
-    for (cluster.endpoints) |endpoint| {
-        const status = waitTrimDecision(&cluster, endpoint, second_decision);
-        if (status.chosen_trim != second_data.applied) {
-            fail(&cluster, "second trim chose {d}, expected {d}", .{
-                status.chosen_trim,
-                second_data.applied,
-            });
-        }
     }
     expectTrimEqual(&cluster, 0, 1);
     expectTrimEqual(&cluster, 0, 2);
