@@ -1411,6 +1411,40 @@ test "live transaction: rollback publishes nothing" {
     try testing.expectError(error.NoTransaction, node.rollbackLive());
 }
 
+test "live transaction refuses work after the storage latch" {
+    const gpa = testing.allocator;
+    var test_dir = try TestDir.init(gpa);
+    defer test_dir.deinit(gpa);
+    const dir = try test_dir.nodeDir(gpa);
+    defer gpa.free(dir);
+
+    const node = try openNode(dir);
+    defer node.close();
+    _ = try node.exec("create table items(id integer primary key, v text)");
+    try node.beginLive();
+    node.markFailed();
+
+    var returning: ?zaxonlite.TypedResult = null;
+    try testing.expectError(
+        error.StorageFailed,
+        node.liveExec(
+            gpa,
+            "insert into items(v) values ('refused')",
+            &.{},
+            &returning,
+        ),
+    );
+    try testing.expectError(error.StorageFailed, node.liveSavepoint(1));
+    try testing.expectError(error.StorageFailed, node.liveReleaseSavepoint(1));
+    try testing.expectError(error.StorageFailed, node.liveRollbackToSavepoint(1));
+    try testing.expectError(error.StorageFailed, node.commitLive());
+
+    // Cleanup remains available after failure so hosts can release SQLite's
+    // writer transaction deterministically.
+    try node.rollbackLive();
+    try testing.expect(!node.inLiveTransaction());
+}
+
 // ----------------------------------------------------------------------
 // Checked transactions (KDS 0018 WP1)
 // ----------------------------------------------------------------------

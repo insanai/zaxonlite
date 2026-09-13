@@ -2983,6 +2983,7 @@ pub const Node = struct {
         out_returning: *?TypedResult,
     ) !LiveStatementResult {
         if (!self.live_transaction) return error.NoTransaction;
+        if (self.fatal_storage_error) return error.StorageFailed;
         out_returning.* = null;
         var capture = WriteCapture{ .gpa = gpa };
         errdefer if (capture.returning) |*rows| rows.deinit();
@@ -3037,6 +3038,7 @@ pub const Node = struct {
         index: u32,
     ) !void {
         if (!self.live_transaction) return error.NoTransaction;
+        if (self.fatal_storage_error) return error.StorageFailed;
         var buffer: [48]u8 = undefined;
         const sql = std.fmt.bufPrintZ(&buffer, format, .{index}) catch
             unreachable;
@@ -3054,6 +3056,7 @@ pub const Node = struct {
     /// `liveExec` are the precise ones.
     pub fn commitLive(self: *Node) !ExecResult {
         if (!self.live_transaction) return error.NoTransaction;
+        if (self.fatal_storage_error) return error.StorageFailed;
         if (self.log.stop_pending or self.log.isReconfigured() != null) {
             return error.LogSealed;
         }
