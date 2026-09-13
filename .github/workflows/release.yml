@@ -6,7 +6,7 @@
 # and test the installed artifacts before a separate job can publish them.
 #
 # Cut a release by pushing the version declared in build.zig.zon:
-#   git tag v0.6.2 && git push origin v0.6.2
+#   git tag v0.7.0 && git push origin v0.7.0
 # Before tagging, bump `.version` in build.zig.zon and the library version
 # string so `zaxon version` reports the tag.
 #
