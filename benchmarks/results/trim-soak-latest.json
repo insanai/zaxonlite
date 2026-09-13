@@ -1,12 +1,12 @@
 {
   "date": "2026-09-13",
-  "host": "apple_m1",
-  "os": "macos aarch64",
+  "host": "paxos-zig-ryzen9-5950x",
+  "os": "linux x86_64",
   "duration_seconds": 60,
-  "writes": 949,
-  "trim_decision_slot": 1467,
-  "chosen_trim_slot": 1464,
-  "retained_first_slot": 1417,
+  "writes": 129,
+  "trim_decision_slot": 262,
+  "chosen_trim_slot": 261,
+  "retained_first_slot": 205,
   "trim_regressions": 0,
   "assertions": "healthy and monotonic on every sample; common byte-identical TRIM; equal integrity and digests; retained prefix reclaimed; count preserved across restart; post-restart write committed"
 }
