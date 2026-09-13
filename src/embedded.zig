@@ -98,6 +98,14 @@ pub const Embedded = struct {
     thread: std.Thread,
     finished: std.atomic.Value(bool) = .init(false),
     exit_code: std.atomic.Value(u8) = .init(255),
+    failure_name_buffer: [128]u8 = undefined,
+    failure_name_len: std.atomic.Value(u8) = .init(0),
+
+    pub const LocalServerState = union(enum) {
+        healthy,
+        stopping,
+        failed: []const u8,
+    };
 
     /// Validates the member list, copies all option slices, spawns the server
     /// thread, and blocks until this member answers on its own endpoint or
@@ -165,6 +173,7 @@ pub const Embedded = struct {
         errdefer self.cluster.deinit();
         self.finished = .init(false);
         self.exit_code = .init(255);
+        self.failure_name_len = .init(0);
         self.thread = try std.Thread.spawn(.{}, runServer, .{self});
         errdefer {
             self.requestStop();
@@ -207,6 +216,8 @@ pub const Embedded = struct {
         self.serve_options = .{
             .directory = directory,
             .shutdown_flag = &self.gateway_shutdown,
+            .failure_name_buffer = &self.failure_name_buffer,
+            .failure_name_len = &self.failure_name_len,
             .node_id = options.node_id,
             .listen_host = own.host,
             .listen_port = own.port,
@@ -412,6 +423,28 @@ pub const Embedded = struct {
         stream.close(self.io);
     }
 
+    /// Lock-free view of the local process lifecycle. This never consults a
+    /// peer, so callers cannot accidentally hide a failed embedded member by
+    /// succeeding through another cluster endpoint.
+    pub fn localServerState(self: *const Embedded) LocalServerState {
+        const failure_len = self.failure_name_len.load(.acquire);
+        if (failure_len != 0) {
+            return .{ .failed = self.failure_name_buffer[0..failure_len] };
+        }
+        if (self.finished.load(.acquire) and self.exit_code.load(.acquire) == 4) {
+            return .{ .failed = "LocalNodeFailed" };
+        }
+        if (self.gateway_shutdown.load(.acquire)) return .stopping;
+        return .healthy;
+    }
+
+    fn requireLocalHealthy(self: *const Embedded) !void {
+        switch (self.localServerState()) {
+            .failed => return error.LocalNodeFailed,
+            .healthy, .stopping => {},
+        }
+    }
+
     /// Requests a server stop, joins the background thread, and frees the
     /// facade and everything it copied; `self` is invalid afterwards. There
     /// is nothing to flush here: every acknowledged write was already synced
@@ -438,6 +471,7 @@ pub const Embedded = struct {
     /// `open`; the caller must free it with that same allocator. The body is
     /// returned as-is — including `{"ok":false,...}` error responses.
     pub fn call(self: *Embedded, request: []const u8, leader: bool) ![]u8 {
+        try self.requireLocalHealthy();
         self.client_mutex.lockUncancelable(self.io);
         defer self.client_mutex.unlock(self.io);
         const result = try self.cluster.call(request, leader);
@@ -553,4 +587,26 @@ fn copyQueryResult(gpa: std.mem.Allocator, value: *const std.json.Value) !node_m
         destination_row.* = row;
     }
     return .{ .arena = arena, .columns = columns, .rows = rows };
+}
+
+test "local server state exposes the first failure without peer routing" {
+    var embedded: Embedded = undefined;
+    embedded.finished = .init(false);
+    embedded.exit_code = .init(255);
+    embedded.gateway_shutdown = .init(false);
+    embedded.failure_name_len = .init(0);
+    try std.testing.expect(embedded.localServerState() == .healthy);
+
+    embedded.gateway_shutdown.store(true, .release);
+    try std.testing.expect(embedded.localServerState() == .stopping);
+    embedded.gateway_shutdown.store(false, .release);
+
+    const failure = "TrimRegression";
+    @memcpy(embedded.failure_name_buffer[0..failure.len], failure);
+    embedded.failure_name_len.store(@intCast(failure.len), .release);
+    switch (embedded.localServerState()) {
+        .failed => |name| try std.testing.expectEqualStrings(failure, name),
+        else => return error.TestExpectedFailure,
+    }
+    try std.testing.expectError(error.LocalNodeFailed, embedded.requireLocalHealthy());
 }
