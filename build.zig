@@ -358,6 +358,15 @@ pub fn build(b: *std.Build) void {
     );
     cluster_step.dependOn(&run_cluster_test.step);
 
+    const run_trim_cluster_test = b.addRunArtifact(cluster_test);
+    run_trim_cluster_test.addArtifactArg(zaxon);
+    run_trim_cluster_test.addArgs(&.{ "1", "trim" });
+    const trim_cluster_step = b.step(
+        "test-trim-cluster",
+        "Run trim serialization, takeover, restart, and fatal-exit scenarios",
+    );
+    trim_cluster_step.dependOn(&run_trim_cluster_test.step);
+
     const replacement_cluster_test = b.addExecutable(.{
         .name = "zaxon-replace-cluster-test",
         .root_module = b.createModule(.{

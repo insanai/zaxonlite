@@ -13,10 +13,14 @@
 //! held votes keep the re-proposed slot open while clients write at the new
 //! leader.
 //!
+//! A third mode covers trim serialization while quorum votes are delayed,
+//! takeover with an inherited undecided trim, restart below the trim decision,
+//! and fail-stop behavior when the durable TRIM file cannot be replaced.
+//!
 //! Every wait is deadline-based on observable conditions. On failure the
 //! controller prints each node's status and recent log tail, then exits 1.
 //!
-//! Usage: cluster-test <path-to-zaxon> [runs] [mandatory|takeover]
+//! Usage: cluster-test <path-to-zaxon> [runs] [mandatory|takeover|trim]
 
 const std = @import("std");
 const Io = std.Io;
@@ -39,6 +43,8 @@ const NodeProc = struct {
     storage_delay_ms: u64 = 0,
     /// Test-only hold on outgoing phase-two votes.
     vote_delay_ms: u64 = 0,
+    /// Test-only periodic anchor cadence. Zero keeps the production default.
+    anchor_interval_ms: u64 = 0,
 };
 
 const Cluster = struct {
@@ -102,6 +108,18 @@ const Cluster = struct {
             const delay_text = try std.fmt.allocPrint(self.gpa, "{d}", .{node.vote_delay_ms});
             try scratch.append(self.gpa, delay_text);
             try argv.appendSlice(self.gpa, &.{ "--test-vote-delay-ms", delay_text });
+        }
+        if (node.anchor_interval_ms != 0) {
+            const interval_text = try std.fmt.allocPrint(
+                self.gpa,
+                "{d}",
+                .{node.anchor_interval_ms},
+            );
+            try scratch.append(self.gpa, interval_text);
+            try argv.appendSlice(
+                self.gpa,
+                &.{ "--test-anchor-interval-ms", interval_text },
+            );
         }
         try argv.append(self.gpa, "--enable-failpoints");
         try argv.append(self.gpa, "--dev-psk");
@@ -494,7 +512,10 @@ pub fn main(init: std.process.Init) !u8 {
     defer iterator.deinit();
     _ = iterator.next();
     const zaxon = iterator.next() orelse {
-        std.debug.print("usage: cluster-test <path-to-zaxon> [runs]\n", .{});
+        std.debug.print(
+            "usage: cluster-test <path-to-zaxon> [runs] [mandatory|takeover|trim]\n",
+            .{},
+        );
         return 2;
     };
     const runs = blk: {
@@ -505,6 +526,11 @@ pub fn main(init: std.process.Init) !u8 {
     const only = iterator.next();
     const run_mandatory = only == null or std.mem.eql(u8, only.?, "mandatory");
     const run_takeover = only == null or std.mem.eql(u8, only.?, "takeover");
+    const run_trim = only != null and std.mem.eql(u8, only.?, "trim");
+    if (!run_mandatory and !run_takeover and !run_trim) {
+        std.debug.print("unknown cluster scenario: {s}\n", .{only.?});
+        return 2;
+    }
 
     for (0..runs) |run_index| {
         if (run_mandatory) {
@@ -515,7 +541,14 @@ pub fn main(init: std.process.Init) !u8 {
             std.debug.print("=== takeover run {d}/{d}\n", .{ run_index + 1, runs });
             try runTakeoverScenario(gpa, io, zaxon, run_index);
         }
+        if (run_trim) {
+            std.debug.print("=== trim serialization run {d}/{d}\n", .{ run_index + 1, runs });
+            try runTrimSerializationScenario(gpa, io, zaxon, run_index);
+            std.debug.print("=== trim takeover/fatal run {d}/{d}\n", .{ run_index + 1, runs });
+            try runTrimTakeoverFatalScenario(gpa, io, zaxon, run_index);
+        }
     }
+    if (run_trim) std.debug.print("trim cluster: all scenarios passed\n", .{});
     std.debug.print("cluster test: all {d} run(s) passed\n", .{runs});
     return 0;
 }
@@ -1299,4 +1332,450 @@ fn runTakeoverScenario(
     step("stop cluster");
     cluster.killAll();
     std.debug.print("takeover scenario complete\n", .{});
+}
+
+// ----------------------------------------------------------------------
+// Issue #10 trim scenarios
+// ----------------------------------------------------------------------
+
+const TrimStatus = struct {
+    decided: i64,
+    applied: i64,
+    trim_decision: i64,
+    chosen_trim: i64,
+    journal_records: i64,
+};
+
+fn statusAt(cluster: *Cluster, endpoint: Endpoint) ?TrimStatus {
+    const body = rpcTry(cluster, endpoint, "{\"op\":\"status\"}") orelse return null;
+    defer cluster.gpa.free(body);
+    const parsed = std.json.parseFromSlice(
+        std.json.Value,
+        cluster.gpa,
+        body,
+        .{},
+    ) catch return null;
+    defer parsed.deinit();
+    if (!isOk(&parsed)) return null;
+    const health = field(&parsed, "health") orelse return null;
+    if (health != .string or !std.mem.eql(u8, health.string, "healthy")) return null;
+    return .{
+        .decided = fieldInt(&parsed, "decided_slot") orelse return null,
+        .applied = fieldInt(&parsed, "applied_slot") orelse return null,
+        .trim_decision = fieldInt(&parsed, "trim_decision_slot") orelse return null,
+        .chosen_trim = fieldInt(&parsed, "chosen_trim_slot") orelse return null,
+        .journal_records = fieldInt(&parsed, "journal_records") orelse return null,
+    };
+}
+
+fn mustStatusAt(cluster: *Cluster, endpoint: Endpoint, deadline_ms: u64) TrimStatus {
+    var elapsed: u64 = 0;
+    while (elapsed <= deadline_ms) {
+        if (statusAt(cluster, endpoint)) |status| return status;
+        cluster.io.sleep(.fromMilliseconds(25), .awake) catch {};
+        elapsed += 25;
+    }
+    fail(cluster, "healthy status unavailable at port {d}", .{endpoint.port});
+}
+
+fn anchorAt(cluster: *Cluster, endpoint: Endpoint) void {
+    var elapsed: u64 = 0;
+    while (elapsed <= 10_000) {
+        if (rpcTry(cluster, endpoint, "{\"op\":\"anchor\"}")) |body| {
+            defer cluster.gpa.free(body);
+            const parsed = parse(cluster, body);
+            defer parsed.deinit();
+            if (isOk(&parsed)) return;
+        }
+        cluster.io.sleep(.fromMilliseconds(25), .awake) catch {};
+        elapsed += 25;
+    }
+    fail(cluster, "anchor unavailable at port {d}", .{endpoint.port});
+}
+
+fn setVoteDelayAt(cluster: *Cluster, endpoint: Endpoint, delay_ms: u64) void {
+    var request_buffer: [96]u8 = undefined;
+    const request = std.fmt.bufPrint(
+        &request_buffer,
+        "{{\"op\":\"test-vote-delay\",\"delay_ms\":{d}}}",
+        .{delay_ms},
+    ) catch unreachable;
+    const body = rpcTry(cluster, endpoint, request) orelse
+        fail(cluster, "vote-delay control unavailable at port {d}", .{endpoint.port});
+    defer cluster.gpa.free(body);
+    const parsed = parse(cluster, body);
+    defer parsed.deinit();
+    if (!isOk(&parsed)) fail(cluster, "vote-delay control failed: {s}", .{body});
+}
+
+fn waitTrimDecision(cluster: *Cluster, endpoint: Endpoint, decision: i64) TrimStatus {
+    var elapsed: u64 = 0;
+    while (elapsed <= 30_000) {
+        if (statusAt(cluster, endpoint)) |status| {
+            if (status.trim_decision == decision) return status;
+            if (status.trim_decision > decision) {
+                fail(cluster, "trim decision skipped {d}: observed {d}", .{
+                    decision,
+                    status.trim_decision,
+                });
+            }
+        }
+        cluster.io.sleep(.fromMilliseconds(25), .awake) catch {};
+        elapsed += 25;
+    }
+    fail(cluster, "trim decision {d} unavailable at port {d}", .{
+        decision,
+        endpoint.port,
+    });
+}
+
+fn readTrim(cluster: *Cluster, index: usize) zaxonlite.trim.State {
+    var data_dir = Io.Dir.cwd().openDir(
+        cluster.io,
+        cluster.nodes[index].directory,
+        .{},
+    ) catch fail(cluster, "cannot open node {d} data directory", .{
+        cluster.nodes[index].id,
+    });
+    defer data_dir.close(cluster.io);
+    var consensus = data_dir.openDir(cluster.io, "consensus", .{}) catch
+        fail(cluster, "cannot open node {d} consensus directory", .{
+            cluster.nodes[index].id,
+        });
+    defer consensus.close(cluster.io);
+    return (zaxonlite.trim.load(cluster.io, consensus) catch
+        fail(cluster, "cannot read node {d} TRIM", .{cluster.nodes[index].id})) orelse
+        fail(cluster, "node {d} has no TRIM", .{cluster.nodes[index].id});
+}
+
+fn expectTrimEqual(cluster: *Cluster, first: usize, second: usize) void {
+    const a = readTrim(cluster, first);
+    const b = readTrim(cluster, second);
+    if (a.decision_slot != b.decision_slot or
+        a.through_slot != b.through_slot or
+        a.configuration_id != b.configuration_id or
+        !std.mem.eql(u8, &a.history_hash, &b.history_hash))
+    {
+        fail(cluster, "TRIM differs between node {d} and node {d}", .{
+            cluster.nodes[first].id,
+            cluster.nodes[second].id,
+        });
+    }
+}
+
+fn initTrimCluster(
+    gpa: std.mem.Allocator,
+    io: Io,
+    zaxon: []const u8,
+    root: []const u8,
+    auth_file: []const u8,
+    witness: bool,
+) !Cluster {
+    var cluster = Cluster{
+        .gpa = gpa,
+        .io = io,
+        .zaxon = zaxon,
+        .root = root,
+        .auth_file = auth_file,
+        .nodes = undefined,
+        .endpoints = undefined,
+    };
+    for (0..3) |index| {
+        const id: u32 = @intCast(index + 1);
+        const port = try freePort(io);
+        cluster.nodes[index] = .{
+            .id = id,
+            .port = port,
+            .directory = try std.fmt.allocPrint(gpa, "{s}/n{d}", .{ root, id }),
+            .log_path = try std.fmt.allocPrint(gpa, "{s}/n{d}.log", .{ root, id }),
+            .witness = witness and index == 2,
+            .storage_delay_ms = if (witness and index < 2) 100 else 0,
+            .vote_delay_ms = if (!witness or index == 2) 1500 else 0,
+            .anchor_interval_ms = 3_600_000,
+        };
+        cluster.endpoints[index] = .{ .host = "127.0.0.1", .port = port };
+    }
+    return cluster;
+}
+
+fn deinitTrimCluster(cluster: *Cluster) void {
+    cluster.killAll();
+    for (cluster.nodes) |node| {
+        cluster.gpa.free(node.directory);
+        cluster.gpa.free(node.log_path);
+    }
+}
+
+fn trimRoot(
+    gpa: std.mem.Allocator,
+    io: Io,
+    prefix: []const u8,
+    run_index: usize,
+) !struct { root: []u8, auth: []u8 } {
+    var random_bytes: [8]u8 = undefined;
+    io.random(&random_bytes);
+    const root = try std.fmt.allocPrint(
+        gpa,
+        ".zig-cache/tmp/{s}-{x}-{d}",
+        .{ prefix, std.mem.readInt(u64, &random_bytes, .little), run_index },
+    );
+    errdefer gpa.free(root);
+    try Io.Dir.cwd().createDirPath(io, root);
+    const auth = try std.fmt.allocPrint(gpa, "{s}/auth.secret", .{root});
+    errdefer gpa.free(auth);
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = auth,
+        .data = cluster_secret,
+        .flags = .{ .permissions = @enumFromInt(0o600) },
+    });
+    return .{ .root = root, .auth = auth };
+}
+
+fn freeTrimRoot(gpa: std.mem.Allocator, io: Io, paths: anytype) void {
+    Io.Dir.cwd().deleteTree(io, paths.root) catch {};
+    gpa.free(paths.auth);
+    gpa.free(paths.root);
+}
+
+fn runTrimSerializationScenario(
+    gpa: std.mem.Allocator,
+    io: Io,
+    zaxon: []const u8,
+    run_index: usize,
+) !void {
+    const paths = try trimRoot(gpa, io, "zx-trim-serial", run_index);
+    defer freeTrimRoot(gpa, io, paths);
+    var cluster = try initTrimCluster(gpa, io, zaxon, paths.root, paths.auth, false);
+    defer deinitTrimCluster(&cluster);
+    for (&cluster.nodes) |*node| node.vote_delay_ms = 0;
+    for (0..3) |index| try cluster.spawnNode(index, false);
+
+    step("establish a baseline chosen trim under delayed votes");
+    execSql(&cluster, "create table t(id integer primary key, v text)", 30_000);
+    const leader = leaderIndex(&cluster);
+    const initial = mustStatusAt(&cluster, cluster.endpoints[leader], 10_000);
+    waitAllApplied(&cluster, initial.applied, 30_000);
+    for (cluster.endpoints) |endpoint| anchorAt(&cluster, endpoint);
+    for (cluster.endpoints) |endpoint| {
+        waitFor(&cluster, endpoint, trimmedAtLeast, initial.applied, 30_000, "baseline trim");
+    }
+    const baseline_trim = mustStatusAt(&cluster, cluster.endpoints[leader], 10_000);
+
+    step("append exactly one trim while its quorum votes are delayed");
+    execSql(&cluster, "insert into t(v) values ('first')", 30_000);
+    const before_anchor = mustStatusAt(&cluster, cluster.endpoints[leader], 10_000);
+    waitAllApplied(&cluster, before_anchor.applied, 30_000);
+    var last_follower: usize = undefined;
+    var anchored_one = false;
+    anchorAt(&cluster, cluster.endpoints[leader]);
+    for (0..3) |index| {
+        if (index == leader) continue;
+        if (!anchored_one) {
+            anchorAt(&cluster, cluster.endpoints[index]);
+            anchored_one = true;
+        } else {
+            last_follower = index;
+        }
+    }
+    for (0..3) |index| {
+        if (index == leader) continue;
+        setVoteDelayAt(&cluster, cluster.endpoints[index], 1500);
+    }
+    const before_trim = mustStatusAt(&cluster, cluster.endpoints[leader], 10_000);
+    if (before_trim.trim_decision != baseline_trim.trim_decision) {
+        fail(&cluster, "trim advanced before the final durable report", .{});
+    }
+    std.debug.print(
+        "trim window baseline: decided={d} trim={d} through={d} journal={d}\n",
+        .{
+            before_trim.decided,
+            before_trim.trim_decision,
+            before_trim.chosen_trim,
+            before_trim.journal_records,
+        },
+    );
+    anchorAt(&cluster, cluster.endpoints[last_follower]);
+
+    var elapsed: u64 = 0;
+    while (elapsed < 30_000) : (elapsed += 25) {
+        const status = mustStatusAt(&cluster, cluster.endpoints[leader], 1_000);
+        if (status.decided != before_trim.decided or
+            status.journal_records > before_trim.journal_records + 1)
+        {
+            fail(&cluster, "unresolved trim appended more than once", .{});
+        }
+        if (status.journal_records == before_trim.journal_records + 1) break;
+        io.sleep(.fromMilliseconds(25), .awake) catch {};
+    } else fail(&cluster, "did not observe the undecided trim append", .{});
+    elapsed = 0;
+    while (elapsed < 500) : (elapsed += 25) {
+        const status = mustStatusAt(&cluster, cluster.endpoints[leader], 1_000);
+        if (status.decided != before_trim.decided or
+            status.journal_records != before_trim.journal_records + 1)
+        {
+            fail(&cluster, "unresolved trim was not serialized", .{});
+        }
+        io.sleep(.fromMilliseconds(25), .awake) catch {};
+    }
+    const first_decision = before_trim.decided + 1;
+    for (cluster.endpoints) |endpoint| _ = waitTrimDecision(&cluster, endpoint, first_decision);
+
+    for (0..3) |index| {
+        if (index == leader) continue;
+        setVoteDelayAt(&cluster, cluster.endpoints[index], 0);
+    }
+
+    step("the next candidate consumes one later global trim slot");
+    execSql(&cluster, "insert into t(v) values ('second')", 30_000);
+    const second_data = mustStatusAt(&cluster, cluster.endpoints[leader], 10_000);
+    waitAllApplied(&cluster, second_data.applied, 30_000);
+    for (cluster.endpoints) |endpoint| anchorAt(&cluster, endpoint);
+    const second_decision = second_data.decided + 1;
+    for (cluster.endpoints) |endpoint| {
+        const status = waitTrimDecision(&cluster, endpoint, second_decision);
+        if (status.chosen_trim != second_data.applied) {
+            fail(&cluster, "second trim chose {d}, expected {d}", .{
+                status.chosen_trim,
+                second_data.applied,
+            });
+        }
+    }
+    expectTrimEqual(&cluster, 0, 1);
+    expectTrimEqual(&cluster, 0, 2);
+    if (anyLogContains(&cluster, "TrimRegression")) {
+        fail(&cluster, "TrimRegression during serialized trims", .{});
+    }
+}
+
+fn runTrimTakeoverFatalScenario(
+    gpa: std.mem.Allocator,
+    io: Io,
+    zaxon: []const u8,
+    run_index: usize,
+) !void {
+    const paths = try trimRoot(gpa, io, "zx-trim-takeover", run_index);
+    defer freeTrimRoot(gpa, io, paths);
+    var cluster = try initTrimCluster(gpa, io, zaxon, paths.root, paths.auth, true);
+    defer deinitTrimCluster(&cluster);
+    for (0..3) |index| try cluster.spawnNode(index, false);
+
+    step("establish trim baseline before takeover");
+    execSql(&cluster, "create table t(id integer primary key, v text)", 30_000);
+    const old_leader = leaderIndex(&cluster);
+    const follower = if (old_leader == 0) @as(usize, 1) else 0;
+    var status = mustStatusAt(&cluster, cluster.endpoints[old_leader], 10_000);
+    waitAllApplied(&cluster, status.applied, 30_000);
+    anchorAt(&cluster, cluster.endpoints[old_leader]);
+    anchorAt(&cluster, cluster.endpoints[follower]);
+    for (cluster.endpoints) |endpoint| {
+        _ = waitTrimDecision(&cluster, endpoint, status.decided + 1);
+    }
+
+    step("crash the leader after appending an undecided trim");
+    execSql(&cluster, "insert into t(v) values ('takeover')", 30_000);
+    status = mustStatusAt(&cluster, cluster.endpoints[old_leader], 10_000);
+    waitAllApplied(&cluster, status.applied, 30_000);
+    anchorAt(&cluster, cluster.endpoints[follower]);
+    {
+        const body = rpcTry(
+            &cluster,
+            cluster.endpoints[old_leader],
+            "{\"op\":\"failpoint\",\"name\":\"after_accept_sync\"}",
+        ) orelse fail(&cluster, "could not arm trim takeover failpoint", .{});
+        cluster.gpa.free(body);
+    }
+    if (rpcTry(&cluster, cluster.endpoints[old_leader], "{\"op\":\"anchor\"}")) |body| {
+        cluster.gpa.free(body);
+    }
+    cluster.waitNodeExit(old_leader);
+
+    const successor = follower;
+    waitFor(
+        &cluster,
+        cluster.endpoints[successor],
+        hasLeader,
+        {},
+        15_000,
+        "successor election",
+    );
+    var window_elapsed: u64 = 0;
+    while (window_elapsed < 500) : (window_elapsed += 25) {
+        const inherited = mustStatusAt(&cluster, cluster.endpoints[successor], 1_000);
+        if (inherited.decided != status.decided) {
+            fail(&cluster, "inherited trim decided before delayed-vote window", .{});
+        }
+        io.sleep(.fromMilliseconds(25), .awake) catch {};
+    }
+    const trim_decision = status.decided + 1;
+    _ = waitTrimDecision(&cluster, cluster.endpoints[successor], trim_decision);
+    _ = waitTrimDecision(&cluster, cluster.endpoints[2], trim_decision);
+    io.sleep(.fromMilliseconds(250), .awake) catch {};
+    if (mustStatusAt(&cluster, cluster.endpoints[successor], 1_000).decided != trim_decision) {
+        fail(&cluster, "successor appended a duplicate inherited trim", .{});
+    }
+
+    step("restart the old leader below the trim decision");
+    try cluster.spawnNode(old_leader, false);
+    _ = waitTrimDecision(&cluster, cluster.endpoints[old_leader], trim_decision);
+    waitFor(
+        &cluster,
+        cluster.endpoints[old_leader],
+        appliedAtLeast,
+        trim_decision,
+        30_000,
+        "restarted trim application",
+    );
+    expectDigestsEqual(&cluster, old_leader, successor, "trim restart");
+    expectTrimEqual(&cluster, old_leader, successor);
+    expectTrimEqual(&cluster, old_leader, 2);
+
+    step("a real trim storage failure exits 4 with one diagnostic");
+    execSql(&cluster, "insert into t(v) values ('fatal')", 30_000);
+    const fatal_base = mustStatusAt(&cluster, cluster.endpoints[successor], 10_000);
+    waitAllApplied(&cluster, fatal_base.applied, 30_000);
+    anchorAt(&cluster, cluster.endpoints[old_leader]);
+    const trim_path = try std.fmt.allocPrint(
+        gpa,
+        "{s}/consensus/TRIM",
+        .{cluster.nodes[old_leader].directory},
+    );
+    defer gpa.free(trim_path);
+    try Io.Dir.cwd().deleteFile(io, trim_path);
+    try Io.Dir.cwd().createDir(io, trim_path, @enumFromInt(0o700));
+    anchorAt(&cluster, cluster.endpoints[successor]);
+
+    const child = &(cluster.nodes[old_leader].child orelse
+        fail(&cluster, "failed node has no child process", .{}));
+    const term = child.wait(io) catch fail(&cluster, "failed node did not exit", .{});
+    cluster.nodes[old_leader].child = null;
+    switch (term) {
+        .exited => |code| if (code != 4) {
+            fail(&cluster, "failed node exited {d}, expected 4", .{code});
+        },
+        else => fail(&cluster, "failed node did not exit normally", .{}),
+    }
+    const log = try Io.Dir.cwd().readFileAlloc(
+        io,
+        cluster.nodes[old_leader].log_path,
+        gpa,
+        .limited(1 << 20),
+    );
+    defer gpa.free(log);
+    var failure_needle_buffer: [64]u8 = undefined;
+    const failure_needle = std.fmt.bufPrint(
+        &failure_needle_buffer,
+        "node {d} failed:",
+        .{cluster.nodes[old_leader].id},
+    ) catch unreachable;
+    if (std.mem.count(u8, log, failure_needle) != 1 or
+        std.mem.indexOf(u8, log, "-- NODE FAILED --") == null)
+    {
+        fail(&cluster, "fatal log lacks one first-failure line and diagnostic", .{});
+    }
+    _ = waitTrimDecision(&cluster, cluster.endpoints[successor], fatal_base.decided + 1);
+    _ = waitTrimDecision(&cluster, cluster.endpoints[2], fatal_base.decided + 1);
+    execSql(&cluster, "insert into t(v) values ('survivor')", 30_000);
+    if (anyLogContains(&cluster, "TrimRegression")) {
+        fail(&cluster, "TrimRegression during takeover or fatal isolation", .{});
+    }
 }

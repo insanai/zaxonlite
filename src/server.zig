@@ -48,6 +48,7 @@ const replacement_error = @import("replacement_error.zig");
 const leader_frontier = @import("leader_frontier.zig");
 const deadlines = @import("net_deadline.zig");
 const server_options = @import("server_options.zig");
+const server_test_control = @import("server_test_control.zig");
 
 const Node = node_mod.Node;
 const Log = types.Log;
@@ -3224,6 +3225,7 @@ pub const Server = struct {
         applied: ?u64 = null,
         leader: ?bool = null,
         timeout_ms: ?u64 = null,
+        delay_ms: ?u64 = null,
         freshness_ms: ?u64 = null,
         retain: ?u64 = null,
         name: ?[]const u8 = null,
@@ -3320,7 +3322,15 @@ pub const Server = struct {
         } else if (std.mem.eql(u8, request.op, "replace-voter")) {
             return self.opReplaceVoter(request, principal, out);
         } else if (std.mem.eql(u8, request.op, "failpoint")) {
-            return self.opFailpoint(request, out);
+            return server_test_control.apply(self, .arm_failpoint, request.name, null, out);
+        } else if (std.mem.eql(u8, request.op, "test-vote-delay")) {
+            return server_test_control.apply(
+                self,
+                .set_vote_delay,
+                null,
+                request.delay_ms,
+                out,
+            );
         } else if (std.mem.eql(u8, request.op, "stop")) {
             self.requestShutdown(.rpc);
             return out.writeAll("{\"ok\":true}");
@@ -4761,15 +4771,6 @@ pub const Server = struct {
             "{{\"ok\":true,\"chain\":\"{s}\",\"content\":\"{s}\",\"applied_slot\":{d}}}",
             .{ &chain_hex, &content_hex, self.node.applied_slot },
         );
-    }
-
-    fn opFailpoint(self: *Server, request: Request, out: *Io.Writer) !void {
-        if (!self.options.enable_failpoints) {
-            return writeErrorResponse(out, "bad_request", "failpoints disabled");
-        }
-        const name = request.name orelse "";
-        failpoint.arm(name);
-        try out.writeAll("{\"ok\":true}");
     }
 };
 
