@@ -15,18 +15,41 @@ pub fn writeHead(
     phase: []const u8,
     quorum_available: bool,
     installation_state: []const u8,
+    health: []const u8,
+    failure: ?[]const u8,
 ) !void {
     const chain_hex = std.fmt.bytesToHex(status.chain, .lower);
+    var failure_buffer: [130]u8 = undefined;
+    const failure_json = if (failure) |message| blk: {
+        const len = @min(message.len, failure_buffer.len - 2);
+        failure_buffer[0] = '"';
+        @memcpy(failure_buffer[1..][0..len], message[0..len]);
+        failure_buffer[len + 1] = '"';
+        break :blk failure_buffer[0 .. len + 2];
+    } else "null";
+    const ok = !std.mem.eql(u8, health, "failed");
     try out.print(
-        "{{\"ok\":true,\"node_id\":{d},\"database_id\":\"{x:0>32}\"," ++
+        "{{\"ok\":{},\"node_id\":{d},\"database_id\":\"{x:0>32}\"," ++
             "\"configuration_id\":{d},\"role\":\"{s}\"," ++
             "\"node_type\":\"{s}\",\"leader\":{?d}," ++
             "\"phase\":\"{s}\",\"quorum_available\":{}," ++
-            "\"installation_state\":\"{s}\"," ++
-            "\"ballot\":{{\"round\":{d},\"priority\":{d},\"node\":{d}}}," ++
+            "\"health\":\"{s}\",\"failure\":{s}," ++
+            "\"installation_state\":\"{s}\",",
+        .{
+            ok,                 status.node_id,
+            status.database_id, status.configuration_id,
+            status.role,        status.node_type,
+            leader,             phase,
+            quorum_available,   health,
+            failure_json,       installation_state,
+        },
+    );
+    try out.print(
+        "\"ballot\":{{\"round\":{d},\"priority\":{d},\"node\":{d}}}," ++
             "\"decided_slot\":{d},\"applied_slot\":{d}," ++
             "\"durable_state_slot\":{d},\"memory_floor\":{d}," ++
-            "\"chosen_trim_slot\":{d},\"retained_first_slot\":{d}," ++
+            "\"trim_decision_slot\":{d},\"chosen_trim_slot\":{d}," ++
+            "\"trim_ignored\":{d},\"retained_first_slot\":{d}," ++
             "\"journal_records\":{d},\"journal_segment_count\":{d}," ++
             "\"journal_bytes\":{d},\"payload_retained_bytes\":{d}," ++
             "\"chain\":\"{s}\",\"page_size\":{d}," ++
@@ -39,21 +62,18 @@ pub fn writeHead(
             "\"write_gate\":\"fifo-v1\",\"trim_mode\":\"conservative\"," ++
             "\"typed_v1\":true,",
         .{
-            status.node_id,                status.database_id,
-            status.configuration_id,       status.role,
-            status.node_type,              leader,
-            phase,                         quorum_available,
-            installation_state,            status.ballot.round,
-            status.ballot.priority,        status.ballot.node,
-            status.decided_slot,           status.applied_slot,
-            status.durable_state_slot,     status.memory_floor,
-            status.chosen_trim_slot,       status.retained_first_slot,
-            status.journal_records,        status.journal_segment_count,
-            status.journal_bytes,          status.payload_retained_bytes,
-            &chain_hex,                    status.page_size,
-            status.fts5_enabled,           status.sqlite_vec_version,
-            status.search_feature_version, status.simd_backend,
-            status.mmap_size,              status.candidate_hard_limit,
+            status.ballot.round,           status.ballot.priority,
+            status.ballot.node,            status.decided_slot,
+            status.applied_slot,           status.durable_state_slot,
+            status.memory_floor,           status.trim_decision_slot,
+            status.chosen_trim_slot,       status.trim_ignored,
+            status.retained_first_slot,    status.journal_records,
+            status.journal_segment_count,  status.journal_bytes,
+            status.payload_retained_bytes, &chain_hex,
+            status.page_size,              status.fts5_enabled,
+            status.sqlite_vec_version,     status.search_feature_version,
+            status.simd_backend,           status.mmap_size,
+            status.candidate_hard_limit,
         },
     );
 }

@@ -178,8 +178,8 @@ The comparison harnesses live in [`benchmarks/`](benchmarks/), and every
 recorded run, with environment metadata, is in
 [`benchmarks/results/`](benchmarks/results/). The systems compared are
 [rqlite](https://github.com/rqlite/rqlite) (v10.2.7, installed binaries)
-and [dqlite](https://github.com/canonical/dqlite) (harness present,
-execution deferred, Linux-only). Both harnesses run three durable voters
+and [dqlite](https://github.com/canonical/dqlite) (v1.18.7, Linux-only).
+Each comparison harness runs three durable voters
 per system with equal payloads, excluded warmup, verified results, and
 percentile latency.
 
@@ -207,14 +207,17 @@ leader under traffic, catch each up, then restart the whole three-node
 cluster. Both systems must pass correctness checks at the end: inventory,
 revenue, ledger, uniqueness, and per-node convergence.
 
+The table below was recorded 13 September 2026 on Linux x86-64 with
+zaxonlite 0.7.0 and rqlite v10.2.7.
+
 | Measure                        | zaxonlite | rqlite v10.2.7 |
 | ------------------------------ | --------: | -------------: |
-| Healthy throughput             |    227/s  |        169/s   |
-| Throughput, follower down      |    320/s  |        224/s   |
-| Throughput, leader down        |    193/s  |         83/s   |
-| Leader crash to first success  |    610 ms |       2,816 ms |
-| Follower catch-up              |    239 ms |        940 ms  |
-| Full cluster restart           |    439 ms |      1,289 ms  |
+| Healthy throughput             |  1,083/s  |      6,439/s   |
+| Throughput, follower down      |    280/s  |      5,820/s   |
+| Throughput, leader down        |    188/s  |        206/s   |
+| Leader crash to first success  |    592 ms |      1,713 ms  |
+| Follower catch-up              |    280 ms |         51 ms  |
+| Full cluster restart           |    485 ms |      1,588 ms  |
 
 Older recordings of this simulation showed zaxonlite near 1,800
 operations per second; those runs predate the full-fsync default, so
@@ -224,10 +227,24 @@ measure different things: one client waiting on one disk, and a cluster
 doing concurrent work while members die and recover. Run the harnesses
 yourself before believing anyone's table, including this one:
 
+The Linux host also ran the narrower sequential-write comparison against
+dqlite. This is 1,000 measured 256-byte autocommit writes after warmup; every
+measured value was read back. It does not include the realistic workload's
+failure, catch-up, or restart phases.
+
+| System             | Writes/s | p50 latency | p99 latency |
+| ------------------ | -------: | ----------: | ----------: |
+| zaxonlite 0.7.0    |    3,030 |     0.32 ms |     0.42 ms |
+| dqlite v1.18.7     |      945 |     0.97 ms |     1.56 ms |
+
+These are observations from the same Linux x86-64 run on 13 September 2026,
+not portable throughput claims.
+
 ```sh
 zig build benchmark                       # write/read/recovery microbenchmarks
 zig build bench-cluster -- tls 2000 2000  # three-node transport benchmark
 sh benchmarks/compare-rqlite-3node.sh     # needs installed rqlited/rqlite
+sh benchmarks/compare-dqlite-3node.sh     # Linux; needs pinned dqlite-demo
 ```
 
 ## The security boundary, plainly

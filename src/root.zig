@@ -9,7 +9,7 @@
 const std = @import("std");
 
 /// Human-readable library version.
-pub const version = "0.6.2";
+pub const version = "0.7.0";
 
 /// Fixed-size replicated command descriptor and its canonical wire codec.
 pub const command = @import("command.zig");
@@ -21,9 +21,9 @@ pub const types = @import("types.zig");
 pub const history = @import("history.zig");
 /// Alternating durable applied-state anchors for SQLite recovery (ZDS 0011).
 pub const applied_anchor = @import("applied_anchor.zig");
-/// Immutable journal v2 segments with sealed trailers (ZDS 0011).
+/// Immutable journal v3 segments with sealed trailers (ZDS 0011).
 pub const segment = @import("segment.zig");
-/// The authoritative retained-segment manifest for journal v2 (ZDS 0011).
+/// The authoritative retained-segment manifest for journal v3 (ZDS 0011).
 pub const manifest = @import("manifest.zig");
 /// Conservative trim policy and the durable TRIM record (ZDS 0011).
 pub const trim = @import("trim.zig");
@@ -162,6 +162,6 @@ test {
 }
 
 test "sqlite is linked and recent" {
-    try std.testing.expectEqualStrings("0.6.2", version);
+    try std.testing.expectEqualStrings("0.7.0", version);
     try std.testing.expect(sqlite.libversionNumber() >= 3050000);
 }

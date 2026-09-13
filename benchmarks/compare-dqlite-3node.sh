@@ -151,14 +151,16 @@ zaxon_addresses="127.0.0.1:$base_port,127.0.0.1:$((base_port + 1)),127.0.0.1:$((
 "$python_bin" "$script_dir/driver.py" dqlite \
     "127.0.0.1:$((base_port + 100))" $common_args >"$run_dir/dqlite.json"
 
-"$python_bin" - "$run_dir/zaxon.json" "$run_dir/dqlite.json" <<'PY'
-import json, platform, sys
+zaxon_version=$("$zaxon_bin" version)
+"$python_bin" - "$run_dir/zaxon.json" "$run_dir/dqlite.json" "$zaxon_version" <<'PY'
+import datetime, json, platform, sys
 with open(sys.argv[1], encoding="utf-8") as stream:
     zaxon = json.load(stream)
 with open(sys.argv[2], encoding="utf-8") as stream:
     dqlite = json.load(stream)
 print(json.dumps({
     "format": 1,
+    "run_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     "host": platform.platform(),
     "rules": {
         "nodes": 3,
@@ -172,6 +174,7 @@ print(json.dumps({
         "libdqlite": "v1.18.7 (91e3e2f90874e4ec3b45cde965f266342846531b)",
         "go_dqlite": "v3.0.4 (d046c957251f7c77565d878eab950de4ff3bba5b)",
     },
+    "tools": {"zaxon": sys.argv[3]},
     "results": [zaxon, dqlite],
 }, indent=2, sort_keys=True))
 PY

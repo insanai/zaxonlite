@@ -1,5 +1,5 @@
 //! The authoritative consensus journal: manifest-governed, segmented,
-//! and trimmable (journal v2, ZDS 0011).
+//! and trimmable (journal v3, ZDS 0011).
 //!
 //! One `consensus/` directory holds the database's whole retained journal
 //! for its lifetime: immutable sealed segments, one active segment, and
@@ -65,7 +65,7 @@ pub const Journal = struct {
     chosen_hint: u64,
     /// Rollup across deleted history plus the retained run.
     max_promised: paxos.Ballot,
-    trim_id: u64,
+    trim_decision_slot: u64,
     trimmed_through: u64,
     trim_history_hash: [32]u8,
     /// Total bytes of sealed retained segments, maintained from file
@@ -97,7 +97,7 @@ pub const Journal = struct {
             .persisted = 0,
             .chosen_hint = 0,
             .max_promised = paxos.Ballot.zero,
-            .trim_id = 0,
+            .trim_decision_slot = 0,
             .trimmed_through = 0,
             .trim_history_hash = [_]u8{0} ** 32,
         };
@@ -147,7 +147,7 @@ pub const Journal = struct {
             .persisted = 0,
             .chosen_hint = m.chosen_through,
             .max_promised = m.max_promised,
-            .trim_id = m.trim_id,
+            .trim_decision_slot = m.trim_decision_slot,
             .trimmed_through = m.trimmed_through,
             .trim_history_hash = m.trim_history_hash,
         };
@@ -218,12 +218,12 @@ pub const Journal = struct {
     /// Records the adopted trim anchor carried by future manifests.
     pub fn noteTrimAnchor(
         self: *Journal,
-        trim_id: u64,
+        decision_slot: u64,
         through: u64,
         history_hash: [32]u8,
     ) void {
-        if (trim_id <= self.trim_id) return;
-        self.trim_id = trim_id;
+        if (decision_slot <= self.trim_decision_slot) return;
+        self.trim_decision_slot = decision_slot;
         self.trimmed_through = through;
         self.trim_history_hash = history_hash;
     }
@@ -438,7 +438,7 @@ pub const Journal = struct {
             .database_id = self.database_id,
             .max_promised = self.max_promised,
             .chosen_through = self.chosen_hint,
-            .trim_id = self.trim_id,
+            .trim_decision_slot = self.trim_decision_slot,
             .trimmed_through = self.trimmed_through,
             .trim_history_hash = self.trim_history_hash,
             .active_first_slot = self.active_first_slot,

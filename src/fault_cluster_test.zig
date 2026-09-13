@@ -1,5 +1,7 @@
 //! Real-TCP adverse schedule: peer frame loss, duplication, reordering,
-//! one-byte fragmentation, and delayed durable sync in one three-voter run.
+//! fragmentation, delayed durable sync, and delayed votes in one three-voter
+//! run. Aggressive anchoring also keeps the issue #10 trim scheduler under
+//! unresolved-proposal pressure throughout the workload.
 
 const std = @import("std");
 const Io = std.Io;
@@ -8,6 +10,12 @@ const zaxonlite = @import("zaxonlite");
 pub fn main(init: std.process.Init) !u8 {
     // Logic and process-crash coverage need no power-loss flush latency.
     zaxonlite.durability.setSyncMode(.os);
+    const saved_anchor_interval = zaxonlite.Node.anchor_interval_ns;
+    zaxonlite.Node.anchor_interval_ns = 20 * std.time.ns_per_ms;
+    defer zaxonlite.Node.anchor_interval_ns = saved_anchor_interval;
+    const saved_rotation_records = zaxonlite.segment.rotation_records;
+    zaxonlite.segment.rotation_records = 64;
+    defer zaxonlite.segment.rotation_records = saved_rotation_records;
     const gpa = init.gpa;
     const io = init.io;
     var tmp = try Temp.init(gpa, io);
@@ -21,9 +29,13 @@ pub fn main(init: std.process.Init) !u8 {
         member.* = .{ .id = @intCast(index + 1), .address = address.* };
     }
     const faults = [_]zaxonlite.server.TestFaults{
-        .{ .reorder_pairs = true, .fragment_bytes = 7 },
-        .{ .drop_every = 11 },
-        .{ .duplicate_every = 7, .storage_delay_ms = 5 },
+        .{ .reorder_pairs = true, .fragment_bytes = 7, .vote_delay_ms = 75 },
+        .{ .drop_every = 11, .vote_delay_ms = 90 },
+        .{
+            .duplicate_every = 7,
+            .storage_delay_ms = 5,
+            .vote_delay_ms = 110,
+        },
     };
     var nodes = [_]?*zaxonlite.Embedded{null} ** 3;
     defer {
@@ -71,8 +83,43 @@ pub fn main(init: std.process.Init) !u8 {
         try retryCall(gpa, io, nodes[index % nodes.len].?, request);
     }
     for (members) |member| try expectCount(gpa, io, member.address, 30);
-    std.debug.print("fault cluster: loss/duplicate/reorder/fragment/slow-sync passed\n", .{});
+    // The cadence is shorter than every phase-two vote delay, so repeated host
+    // pumps necessarily observe unresolved trims. The issue #10 scheduler must
+    // serialize them and eventually install a trim on every member.
+    for (nodes) |node| try expectTrim(gpa, io, node.?);
+    std.debug.print(
+        "fault cluster: loss/duplicate/reorder/fragment/slow-sync/trim passed\n",
+        .{},
+    );
     return 0;
+}
+
+fn expectTrim(gpa: std.mem.Allocator, io: Io, node: *zaxonlite.Embedded) !void {
+    const deadline = Deadline.start(io, 30_000);
+    while (true) {
+        switch (node.localServerState()) {
+            .healthy => {},
+            else => return error.NodeBecameUnhealthy,
+        }
+        if (node.call("{\"op\":\"status\"}", false)) |body| {
+            defer gpa.free(body);
+            if (jsonInt(body, "chosen_trim_slot")) |slot| {
+                if (slot > 0) return;
+            }
+        } else |_| {}
+        if (!deadline.tick()) break;
+    }
+    return error.TrimDidNotAdvance;
+}
+
+fn jsonInt(body: []const u8, field: []const u8) ?u64 {
+    var needle_buffer: [64]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buffer, "\"{s}\":", .{field}) catch
+        return null;
+    const start = std.mem.indexOf(u8, body, needle) orelse return null;
+    const value = body[start + needle.len ..];
+    const end = std.mem.indexOfAny(u8, value, ",}") orelse value.len;
+    return std.fmt.parseInt(u64, value[0..end], 10) catch null;
 }
 
 /// A wall-clock retry deadline: the fault schedule and a loaded host

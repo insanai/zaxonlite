@@ -62,6 +62,19 @@ const ClusterHandle = struct {
     }
 };
 
+fn mapClusterError(handle: *ClusterHandle, err: anyerror) c_int {
+    switch (err) {
+        error.LocalNodeFailed, error.LocalNodeStopped => {
+            handle.setError(@errorName(err));
+            return unavailable_code;
+        },
+        else => {
+            handle.setError(@errorName(err));
+            return unavailable_code;
+        },
+    }
+}
+
 const CMember = extern struct {
     id: u32,
     address: ?[*:0]const u8,
@@ -493,6 +506,38 @@ export fn zaxonlite_cluster_close(pointer: ?*anyopaque) void {
     gpa.destroy(handle);
 }
 
+/// Returns the embedding-local lifecycle without routing through a peer:
+/// 0 healthy, 1 stopping, 2 stopped, 4 failed. On failure, copies the first
+/// error name into the caller's optional bounded buffer.
+export fn zaxonlite_cluster_state(
+    pointer: ?*anyopaque,
+    out_failure: ?[*]u8,
+    out_len: usize,
+) c_int {
+    const handle: *ClusterHandle = @ptrCast(@alignCast(
+        pointer orelse return misuse_code,
+    ));
+    if (out_failure == null and out_len != 0) return misuse_code;
+    if (out_failure) |out| {
+        if (out_len != 0) out[0] = 0;
+    }
+    return switch (handle.embedded.localServerState()) {
+        .healthy => 0,
+        .stopping => 1,
+        .stopped => 2,
+        .failed => |name| blk: {
+            if (out_failure) |out| {
+                if (out_len != 0) {
+                    const len = @min(name.len, out_len - 1);
+                    @memcpy(out[0..len], name[0..len]);
+                    out[len] = 0;
+                }
+            }
+            break :blk 4;
+        },
+    };
+}
+
 export fn zaxonlite_cluster_exec(
     pointer: ?*anyopaque,
     sql: ?[*:0]const u8,
@@ -504,8 +549,7 @@ export fn zaxonlite_cluster_exec(
     ));
     const statement = sql orelse return misuse_code;
     const result = handle.embedded.exec(std.mem.span(statement)) catch |err| {
-        handle.setError(@errorName(err));
-        return unavailable_code;
+        return mapClusterError(handle, err);
     };
     if (changes_out) |out| out.* = result.changes;
     return ok_code;
@@ -523,8 +567,7 @@ export fn zaxonlite_cluster_query_json(
     const out = json_out orelse return misuse_code;
     out.* = null;
     var result = handle.embedded.query(gpa, std.mem.span(statement)) catch |err| {
-        handle.setError(@errorName(err));
-        return unavailable_code;
+        return mapClusterError(handle, err);
     };
     defer result.deinit();
     return resultJson(&result, out);
@@ -546,8 +589,7 @@ export fn zaxonlite_cluster_call_json(
         std.mem.span(body),
         require_leader,
     ) catch |err| {
-        handle.setError(@errorName(err));
-        return unavailable_code;
+        return mapClusterError(handle, err);
     };
     defer gpa.free(response);
     const owned = gpa.alloc(u8, response.len + 1) catch return unavailable_code;

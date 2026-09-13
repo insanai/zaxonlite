@@ -358,6 +358,31 @@ pub fn build(b: *std.Build) void {
     );
     cluster_step.dependOn(&run_cluster_test.step);
 
+    const run_trim_cluster_test = b.addRunArtifact(cluster_test);
+    run_trim_cluster_test.addArtifactArg(zaxon);
+    run_trim_cluster_test.addArgs(&.{ "1", "trim" });
+    const trim_cluster_step = b.step(
+        "test-trim-cluster",
+        "Run trim serialization, takeover, restart, and fatal-exit scenarios",
+    );
+    trim_cluster_step.dependOn(&run_trim_cluster_test.step);
+
+    const trim_soak_seconds = b.option(
+        u64,
+        "trim-soak-seconds",
+        "Three-process trim soak duration in seconds (default 60)",
+    ) orelse 60;
+    const run_trim_soak = b.addRunArtifact(cluster_test);
+    run_trim_soak.addArtifactArg(zaxon);
+    run_trim_soak.addArgs(&.{ "1", "trim-soak" });
+    run_trim_soak.addArg(b.fmt("{d}", .{trim_soak_seconds}));
+    if (b.args) |args| run_trim_soak.addArgs(args);
+    const trim_soak_step = b.step(
+        "test-trim-soak",
+        "Run the sustained three-process trim workload",
+    );
+    trim_soak_step.dependOn(&run_trim_soak.step);
+
     const replacement_cluster_test = b.addExecutable(.{
         .name = "zaxon-replace-cluster-test",
         .root_module = b.createModule(.{

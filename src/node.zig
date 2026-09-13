@@ -150,7 +150,9 @@ pub const Status = struct {
     applied_slot: paxos.Slot,
     durable_state_slot: paxos.Slot,
     memory_floor: paxos.Slot,
+    trim_decision_slot: paxos.Slot,
     chosen_trim_slot: paxos.Slot,
+    trim_ignored: u64,
     retained_first_slot: paxos.Slot,
     journal_records: u64,
     journal_segment_count: u64,
@@ -522,13 +524,15 @@ pub const Node = struct {
     /// The durable-state frontier A_i: the greatest slot covered by a
     /// synchronized image and its APPLIED anchor record (ZDS 0011).
     durable_state_slot: paxos.Slot = 0,
+    /// Anchored data frontier; prevents an idle anchor/trim feedback loop.
+    durable_data_slot: paxos.Slot = 0,
     /// Generation counter of the alternating APPLIED records.
     anchor_generation: u64 = 0,
     /// Durable local trim state: the adopted cluster anchor plus the
     /// active transfer leases capping deletion (ZDS 0011).
     trim_state: trim.State = .{},
     /// Chosen-trim generation the payload sweep last ran for.
-    swept_trim_id: u64 = 0,
+    swept_trim_decision_slot: u64 = 0,
     /// Recent chosen transaction batches, kept so a write waiter can be
     /// resolved even after the core window released the slot's cell.
     recent_batches: [64]RecentBatch = [_]RecentBatch{.{}} ** 64,
@@ -574,6 +578,7 @@ pub const Node = struct {
     /// stop voting and serving; continuing after a failed fsync would violate
     /// the effects contract.
     fatal_storage_error: bool = false,
+    trim_ignored_count: u64 = 0,
     test_storage_delay_ms: u64 = 0,
     /// Operator-selected mapped-I/O limit applied to every connection.
     mmap_size: u64 = 0,
@@ -641,7 +646,8 @@ pub const Node = struct {
         // An enrolled replacement carries a join descriptor: the decided
         // database identity it must adopt instead of deriving one from its
         // flags, and the registry digest it will fetch and verify.
-        var join = try readJoinDescriptor(gpa, io, dir);
+        const join = try readJoinDescriptor(gpa, io, dir);
+        if (join != null and options.role != .data_voter) return error.JoinRequiresDataVoter;
 
         // The database identity derived from bootstrap flags applies only
         // while no registry exists; afterwards the decided registry carries
@@ -673,8 +679,6 @@ pub const Node = struct {
                 {
                     return error.RegistryMismatch;
                 }
-                try durableDeleteFile(io, dir, join_file_name);
-                join = null;
             }
             members = decided.voterIds(&member_storage);
         } else if (join != null) {
@@ -785,7 +789,7 @@ pub const Node = struct {
         if (try trim.load(io, self.journal.dir)) |stored| {
             self.trim_state = stored;
             self.journal.noteTrimAnchor(
-                stored.trim_id,
+                stored.decision_slot,
                 stored.through_slot,
                 stored.history_hash,
             );
@@ -796,7 +800,7 @@ pub const Node = struct {
         // that already licensed deletion. Twins under one id, or a journal
         // ahead of the file, mean corruption and fail closed.
         const replayed = durable.anchor;
-        if (self.trim_state.trim_id == replayed.trim_id) {
+        if (self.trim_state.decision_slot == replayed.trim_id) {
             if (replayed.trim_id != 0 and
                 (self.trim_state.through_slot != replayed.chosen_trim_slot or
                     !std.mem.eql(
@@ -807,9 +811,9 @@ pub const Node = struct {
             {
                 return error.TrimRegression;
             }
-        } else if (self.trim_state.trim_id > replayed.trim_id) {
+        } else if (self.trim_state.decision_slot > replayed.trim_id) {
             try durable.apply(.{ .trim_anchor = .{
-                .trim_id = self.trim_state.trim_id,
+                .trim_id = self.trim_state.decision_slot,
                 .chosen_trim_slot = self.trim_state.through_slot,
                 .history_hash = self.trim_state.history_hash,
             } });
@@ -846,18 +850,17 @@ pub const Node = struct {
             );
         }
 
-        self.log.core.setCampaignEnabled(capabilities.campaigns);
         // A materializing voter that joins an existing cluster with no
         // applied state must not lead: catch-up and snapshot escalation
         // run against the leader, so winning the election would starve
-        // its own recovery forever. It still votes; campaigning resumes
-        // once any state is applied.
-        if (capabilities.campaigns and capabilities.materializes and
-            identity.configuration_id > 1 and self.applied_slot == 0)
-        {
-            self.join_campaign_hold = true;
-            self.log.core.setCampaignEnabled(false);
-        }
+        // its own recovery forever. The server also suppresses its Paxos
+        // envelopes until transfer installs and clears the durable JOIN.
+        const fresh_voter = capabilities.campaigns and capabilities.materializes and
+            identity.configuration_id > 1;
+        if (fresh_voter and join == null and self.applied_slot == 0)
+            return error.JoinDescriptorRequired;
+        self.join_campaign_hold = fresh_voter and join != null;
+        self.log.core.setCampaignEnabled(capabilities.campaigns and !self.join_campaign_hold);
         if (single and capabilities.campaigns) {
             // Volatile leadership: campaign on every open. A one-member
             // quorum completes phase one immediately.
@@ -984,6 +987,11 @@ pub const Node = struct {
 
     /// Requests decided entries this node is missing from `peer`.
     pub fn requestCatchUp(self: *Node, peer: paxos.NodeId) !void {
+        // A fresh voter joining a later configuration cannot reconstruct
+        // old entries' configuration-bound history leaves from entries
+        // alone. It must first install a survivor's post-handover anchor;
+        // range recovery is safe for the suffix after that base.
+        if (self.join_descriptor != null) return;
         try self.log.requestCatchUp(peer, self.applied_slot + 1, self.effects);
         try self.consumeEffects();
     }
@@ -1587,7 +1595,9 @@ pub const Node = struct {
             .applied_slot = self.applied_slot,
             .durable_state_slot = self.durable_state_slot,
             .memory_floor = self.log.memoryFloor(),
+            .trim_decision_slot = self.trim_state.decision_slot,
             .chosen_trim_slot = self.log.trimAnchor().chosen_trim_slot,
+            .trim_ignored = self.trim_ignored_count,
             .retained_first_slot = self.journal.retainedFirstSlot(),
             .journal_records = self.journal.next_sequence - 1,
             .journal_segment_count = journal_stats.segment_count,
@@ -1740,6 +1750,7 @@ pub const Node = struct {
             .last_chain = self.last_chain,
         });
         self.durable_state_slot = self.applied_slot;
+        self.durable_data_slot = self.last_data_slot;
         self.history_hash_at_anchor = self.history_hash;
         self.last_anchor_ns =
             std.Io.Clock.Timestamp.now(self.io, .awake).raw.nanoseconds;
@@ -1762,83 +1773,42 @@ pub const Node = struct {
     /// from the minimum durable-state frontier of every data replica.
     pub fn proposeTrim(self: *Node, candidate: trim.Candidate) !void {
         if (self.fatal_storage_error) return error.StorageFailed;
+        if (!self.proposalFrontierSettled()) return;
+        if (candidate.through_slot <= self.trim_state.through_slot) return;
+        const expected_slot = self.log.proposalFrontier();
         const record = command.TrimRecord{
-            .trim_id = self.trim_state.trim_id + 1,
             .through_slot = candidate.through_slot,
             .history_hash = candidate.history_hash,
             .configuration_id = self.identity.configuration_id,
             .policy = 0,
         };
-        _ = try self.log.append(.{ .trim = record }, self.effects);
+        const proposal_slot = try self.log.append(.{ .trim = record }, self.effects);
+        std.debug.assert(proposal_slot == expected_slot);
         try self.consumeEffects();
     }
 
-    /// Adopts a chosen trim record: validates it against the durable trim
-    /// state, persists the TRIM file, installs the core anchor, and
-    /// leaves physical reclamation to the next pump.
-    fn adoptChosenTrim(self: *Node, record: command.TrimRecord) !void {
-        switch (trim.classify(&self.trim_state, record)) {
-            .ignore => return,
-            .corrupt => {
-                self.fatal_storage_error = true;
-                return error.TrimRegression;
-            },
-            .adopt => {},
-        }
-        self.trim_state.trim_id = record.trim_id;
-        self.trim_state.through_slot = record.through_slot;
-        self.trim_state.history_hash = record.history_hash;
-        self.trim_state.configuration_id = record.configuration_id;
-        failpoint.hit("before_trim_file");
-        try trim.store(self.io, self.journal.dir, self.trim_state);
-        failpoint.hit("after_trim_file");
-        try self.log.installChosenTrim(.{
-            .trim_id = record.trim_id,
-            .chosen_trim_slot = record.through_slot,
-            .history_hash = record.history_hash,
-        }, self.effects);
-        self.journal.noteTrimAnchor(
-            record.trim_id,
-            record.through_slot,
-            record.history_hash,
-        );
+    /// Adopts a chosen trim record. Exact replay is idempotent; stale or
+    /// duplicate decisions are diagnosed and skipped because they cannot
+    /// authorize deletion beyond the durable anchor. A decision-slot twin or
+    /// conflicting history at the same frontier is durable-history divergence.
+    /// A real advance persists TRIM, installs the core anchor, and leaves
+    /// physical reclamation to the next pump.
+    fn adoptChosenTrim(
+        self: *Node,
+        decision_slot: paxos.Slot,
+        record: command.TrimRecord,
+    ) !void {
+        return trim.adoptChosen(self, decision_slot, record);
     }
 
     /// Records a chosen transfer lease; deletion is capped at its base
     /// until completion, whatever happens to the sender.
-    fn trackLease(self: *Node, lease: command.TransferLease) void {
-        for (self.trim_state.leases[0..self.trim_state.lease_count]) |held| {
-            if (held.lease_id == lease.lease_id) return;
-        }
-        // Admission is deterministic: every replica applies the same
-        // chosen lease sequence against the same fixed table, so a lease
-        // past capacity is dropped identically everywhere and simply does
-        // not cap trimming; the sender's pinned image copy, not the
-        // lease, is what keeps a running transfer safe (ZDS 0011).
-        if (self.trim_state.lease_count >= trim.max_leases) return;
-        self.trim_state.leases[self.trim_state.lease_count] = .{
-            .lease_id = lease.lease_id,
-            .receiver_id = lease.receiver_id,
-            .base_slot = lease.base_slot,
-            .expiry_ticks_left = lease.expires_after_leader_ticks,
-        };
-        self.trim_state.lease_count += 1;
-        trim.store(self.io, self.journal.dir, self.trim_state) catch {
-            self.fatal_storage_error = true;
-        };
+    fn trackLease(self: *Node, lease: command.TransferLease) !void {
+        return trim.trackLease(self, lease);
     }
 
-    fn releaseLease(self: *Node, lease_id: u64) void {
-        var index: u8 = 0;
-        while (index < self.trim_state.lease_count) : (index += 1) {
-            if (self.trim_state.leases[index].lease_id == lease_id) break;
-        } else return;
-        self.trim_state.lease_count -= 1;
-        self.trim_state.leases[index] =
-            self.trim_state.leases[self.trim_state.lease_count];
-        trim.store(self.io, self.journal.dir, self.trim_state) catch {
-            self.fatal_storage_error = true;
-        };
+    fn releaseLease(self: *Node, lease_id: u64) !void {
+        return trim.releaseLease(self, lease_id);
     }
 
     /// Physically reclaims journal segments and payload objects below the
@@ -1872,9 +1842,9 @@ pub const Node = struct {
         // The payload sweep streams the whole retained journal, so it
         // runs when history was removed or the chosen trim advanced —
         // never on every pump.
-        if (removed or self.trim_state.trim_id > self.swept_trim_id) {
+        if (removed or self.trim_state.decision_slot > self.swept_trim_decision_slot) {
             try self.sweepPayloads();
-            self.swept_trim_id = self.trim_state.trim_id;
+            self.swept_trim_decision_slot = self.trim_state.decision_slot;
         }
     }
 
@@ -2046,6 +2016,9 @@ pub const Node = struct {
             .last_chain = begin.last_chain,
         });
         self.durable_state_slot = begin.anchor_slot;
+        self.durable_data_slot = begin.last_data_slot;
+        if (self.join_descriptor != null) try durableDeleteFile(self.io, self.dir, join_file_name);
+        self.join_descriptor = null;
         failpoint.hit("after_transfer_anchor");
 
         // The protocol node resumes at the anchor; everything below it is
@@ -2074,11 +2047,14 @@ pub const Node = struct {
 
     /// Creates a state anchor once execution has run far enough past the
     /// durable one. Returns whether an anchor was published.
-    /// Re-enables campaigning once a joining voter has applied any state
-    /// (through catch-up or an installed transfer); the host calls this
-    /// from its periodic duties.
+    /// Re-enables campaigning after a joining voter installs its transfer,
+    /// or after an ordinary held voter applies state.
     pub fn releaseCampaignHold(self: *Node) void {
         if (!self.join_campaign_hold) return;
+        if (self.join_descriptor != null and self.durable_state_slot == 0) return;
+        if (self.join_descriptor != null)
+            durableDeleteFile(self.io, self.dir, join_file_name) catch return;
+        self.join_descriptor = null;
         if (self.applied_slot == 0) return;
         self.join_campaign_hold = false;
         self.log.core.setCampaignEnabled(self.capabilities.campaigns);
@@ -2094,11 +2070,12 @@ pub const Node = struct {
     /// recovers from genesis, so the first anchor publishes promptly;
     /// afterwards an anchor is due every 10,000 applied slots, every 30
     /// seconds, or when the uncheckpointed WAL reaches 64 MiB —
-    /// whichever arrives first, and only while new applied state exists
-    /// to anchor.
+    /// whichever arrives first, and only while new transaction state exists
+    /// to anchor. Configuration handover publishes its required anchor directly.
     fn anchorDue(self: *Node) bool {
+        if (self.join_descriptor != null) return false;
+        if (self.last_data_slot <= self.durable_data_slot) return false;
         if (self.durable_state_slot == 0) return self.applied_slot > 0;
-        if (self.applied_slot <= self.durable_state_slot) return false;
         if (self.applied_slot >= self.durable_state_slot +| anchor_interval_slots) {
             return true;
         }
@@ -2310,6 +2287,15 @@ pub const Node = struct {
         self.decided_registry = next;
         try self.adoptDecidedMembers();
         try self.continueOnConfiguration(stop_slot);
+        // Publish a base carrying the new configuration identity even when
+        // the stop changed no SQLite pages. A later replacement installs
+        // this exact history anchor before requesting the retained suffix.
+        if (self.join_descriptor == null and !self.join_campaign_hold and
+            self.capabilities.materializes and
+            self.applied_slot > self.durable_state_slot)
+        {
+            try self.createStateAnchor();
+        }
 
         if (try self.pendingOperation()) |pending| {
             if (parsed.seed) |seed| {
@@ -2352,9 +2338,6 @@ pub const Node = struct {
         failpoint.hit("after_registry_blob");
         try registry.activatePointer(self.io, self.dir, fetched.configuration_id);
         failpoint.hit("after_registry_pointer");
-        try durableDeleteFile(self.io, self.dir, join_file_name);
-        self.join_descriptor = null;
-
         self.identity.configuration_id = fetched.configuration_id;
         try writeIdentity(self.io, self.dir, self.identity);
         self.decided_registry = fetched;
@@ -2432,7 +2415,7 @@ pub const Node = struct {
         // A stateless continuation of a joined configuration must not
         // lead (a joiner opens at configuration 1 and only learns its
         // real configuration from the fetched registry, so this is
-        // where the hold is decided); it lifts once anything applies.
+        // where the hold is decided); it lifts after transfer clears JOIN.
         self.join_campaign_hold = self.capabilities.campaigns and
             self.capabilities.materializes and
             self.identity.configuration_id > 1 and
@@ -3002,6 +2985,7 @@ pub const Node = struct {
         out_returning: *?TypedResult,
     ) !LiveStatementResult {
         if (!self.live_transaction) return error.NoTransaction;
+        if (self.fatal_storage_error) return error.StorageFailed;
         out_returning.* = null;
         var capture = WriteCapture{ .gpa = gpa };
         errdefer if (capture.returning) |*rows| rows.deinit();
@@ -3056,6 +3040,7 @@ pub const Node = struct {
         index: u32,
     ) !void {
         if (!self.live_transaction) return error.NoTransaction;
+        if (self.fatal_storage_error) return error.StorageFailed;
         var buffer: [48]u8 = undefined;
         const sql = std.fmt.bufPrintZ(&buffer, format, .{index}) catch
             unreachable;
@@ -3073,6 +3058,7 @@ pub const Node = struct {
     /// `liveExec` are the precise ones.
     pub fn commitLive(self: *Node) !ExecResult {
         if (!self.live_transaction) return error.NoTransaction;
+        if (self.fatal_storage_error) return error.StorageFailed;
         if (self.log.stop_pending or self.log.isReconfigured() != null) {
             return error.LogSealed;
         }
@@ -3570,21 +3556,21 @@ pub const Node = struct {
                             self.capture_batch_id = null;
                             self.needs_resync = true;
                         }
-                        try self.adoptChosenTrim(record);
+                        try self.adoptChosenTrim(entry.slot, record);
                     },
                     .transfer_lease => |lease| {
                         if (self.capture_batch_id != null) {
                             self.capture_batch_id = null;
                             self.needs_resync = true;
                         }
-                        self.trackLease(lease);
+                        try self.trackLease(lease);
                     },
                     .lease_complete => |complete| {
                         if (self.capture_batch_id != null) {
                             self.capture_batch_id = null;
                             self.needs_resync = true;
                         }
-                        self.releaseLease(complete.lease_id);
+                        try self.releaseLease(complete.lease_id);
                     },
                     .transaction_batch => |batch| {
                         try self.checkChainBase(entry.slot, batch);
@@ -3690,6 +3676,12 @@ pub const Node = struct {
         return self.fatal_storage_error;
     }
 
+    /// Irreversibly disables the local protocol participant after a host
+    /// invariant or durability failure. Recovery requires a fresh Node.
+    pub fn markFailed(self: *Node) void {
+        self.fatal_storage_error = true;
+    }
+
     /// Applies one committed payload offline to the materialized image.
     fn applyBatchOffline(self: *Node, batch: command.TransactionBatch) !void {
         const payload = self.store.load(self.gpa, batch.payload_hash) catch {
@@ -3786,6 +3778,7 @@ pub const Node = struct {
                 self.history_hash_at_anchor = anchor.history_hash;
                 self.last_chain = anchor.last_chain;
                 self.last_data_slot = anchor.last_data_slot;
+                self.durable_data_slot = anchor.last_data_slot;
                 self.last_batch_id = anchor.last_batch_id;
                 self.durable_state_slot = anchor.global_slot;
                 self.page_size = anchor.sqlite_page_size;
@@ -3905,6 +3898,7 @@ pub const Node = struct {
             else => return err,
         };
         self.durable_state_slot = 0;
+        self.durable_data_slot = 0;
         try self.materializeFromJournal();
     }
 
@@ -4226,18 +4220,15 @@ fn loadOrCreateIdentity(
     defer gpa.free(bytes);
 
     const format = manifestValue(bytes, "format") orelse return error.CorruptIdentity;
-    if (!std.mem.eql(u8, format, "1") and !std.mem.eql(u8, format, "2")) {
-        return error.CorruptIdentity;
-    }
+    if (!std.mem.eql(u8, format, "3")) return error.UnsupportedIdentityVersion;
     const node_text = manifestValue(bytes, "node_id") orelse return error.CorruptIdentity;
     const database_text = manifestValue(bytes, "database_id") orelse return error.CorruptIdentity;
     const configuration_text = manifestValue(bytes, "configuration_id") orelse
         return error.CorruptIdentity;
-    const persisted_role = if (std.mem.eql(u8, format, "2")) blk: {
-        const role_text = manifestValue(bytes, "role") orelse
-            return error.CorruptIdentity;
-        break :blk roles.Role.parse(role_text) catch return error.CorruptIdentity;
-    } else roles.Role.data_voter;
+    const role_text = manifestValue(bytes, "role") orelse
+        return error.CorruptIdentity;
+    const persisted_role = roles.Role.parse(role_text) catch
+        return error.CorruptIdentity;
 
     const identity = Identity{
         .node_id = std.fmt.parseInt(paxos.NodeId, node_text, 10) catch
@@ -4260,7 +4251,7 @@ fn writeIdentity(io: Io, dir: Io.Dir, identity: Identity) !void {
     var buffer: [256]u8 = undefined;
     const contents = std.fmt.bufPrint(
         &buffer,
-        \\format=2
+        \\format=3
         \\node_id={d}
         \\database_id={x:0>32}
         \\configuration_id={d}
@@ -4296,6 +4287,23 @@ fn atomicWriteFile(io: Io, dir: Io.Dir, name: []const u8, contents: []const u8) 
     try durability.syncFile(io, atomic.file);
     try atomic.replace(io);
     try durability.syncPathnameTransition(io, dir, name);
+}
+
+test "identity format 2 is explicitly unsupported" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try atomicWriteFile(
+        io,
+        tmp.dir,
+        identity_file_name,
+        "format=2\nnode_id=1\ndatabase_id=00000000000000000000000000000001\n" ++
+            "configuration_id=1\nrole=data-voter\n",
+    );
+    try std.testing.expectError(
+        error.UnsupportedIdentityVersion,
+        loadOrCreateIdentity(std.testing.allocator, io, tmp.dir, 1, 1, .data_voter),
+    );
 }
 
 /// Makes removal durable on every supported platform. Renaming to a live

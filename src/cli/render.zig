@@ -44,7 +44,8 @@ fn printStatusJson(status: zaxonlite.node.Status, out: *std.Io.Writer) !void {
             "\"node_type\":\"{s}\",\"leader\":{?d}," ++
             "\"decided_slot\":{d},\"applied_slot\":{d}," ++
             "\"durable_state_slot\":{d},\"memory_floor\":{d}," ++
-            "\"chosen_trim_slot\":{d},\"retained_first_slot\":{d}," ++
+            "\"trim_decision_slot\":{d},\"chosen_trim_slot\":{d}," ++
+            "\"trim_ignored\":{d},\"retained_first_slot\":{d}," ++
             "\"journal_records\":{d},\"journal_segment_count\":{d}," ++
             "\"journal_bytes\":{d}," ++
             "\"chain\":\"{s}\",\"history\":\"{s}\",\"page_size\":{d}," ++
@@ -57,7 +58,8 @@ fn printStatusJson(status: zaxonlite.node.Status, out: *std.Io.Writer) !void {
             status.node_type,              status.leader,
             status.decided_slot,           status.applied_slot,
             status.durable_state_slot,     status.memory_floor,
-            status.chosen_trim_slot,       status.retained_first_slot,
+            status.trim_decision_slot,     status.chosen_trim_slot,
+            status.trim_ignored,           status.retained_first_slot,
             status.journal_records,        status.journal_segment_count,
             status.journal_bytes,          &chain_hex,
             &history_hex,                  status.page_size,
@@ -80,7 +82,9 @@ fn printStatusPlain(status: zaxonlite.node.Status, out: *std.Io.Writer) !void {
         \\applied slot:     {d}
         \\durable slot:     {d}
         \\memory floor:     {d}
+        \\trim decision:    {d}
         \\trimmed through:  {d}
+        \\trims ignored:    {d}
         \\retained first:   {d}
         \\journal records:  {d}
         \\journal segments: {d}
@@ -104,7 +108,9 @@ fn printStatusPlain(status: zaxonlite.node.Status, out: *std.Io.Writer) !void {
         status.applied_slot,
         status.durable_state_slot,
         status.memory_floor,
+        status.trim_decision_slot,
         status.chosen_trim_slot,
+        status.trim_ignored,
         status.retained_first_slot,
         status.journal_records,
         status.journal_segment_count,
@@ -214,6 +220,10 @@ const remote_hints = [_]struct { code: []const u8, hint: []const u8 }{
         .hint = "Repair durable storage and restart the node before retrying.",
     },
     .{
+        .code = "local_node_failed",
+        .hint = "Replace or repair this local member; inspect its first-failure diagnostic.",
+    },
+    .{
         .code = "no_registry",
         .hint = "Run voter replacement only on a registry-backed network cluster.",
     },
@@ -236,6 +246,7 @@ test "replacement errors have specific operator hints" {
         "timeout",
         "ambiguous",
         "unavailable",
+        "local_node_failed",
         "stale_configuration",
         "node_id_not_fresh",
         "operation_conflict",

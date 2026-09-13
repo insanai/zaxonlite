@@ -122,6 +122,8 @@ const usage_text =
     \\                      barrier; requires --enable-failpoints.
     \\  --test-vote-delay-ms <n>  Test-only hold on outgoing phase-two
     \\                      votes; requires --enable-failpoints.
+    \\  --test-anchor-interval-ms <n>  Test-only anchor cadence;
+    \\                      requires --enable-failpoints.
     \\  --json              Machine-readable output on stdout.
     \\  --no-color          Plain shell output even on a color terminal.
     \\  --no-history        Never write the interactive shell history file.
@@ -173,6 +175,7 @@ const Options = struct {
     segment_records: ?usize = null,
     test_storage_delay_ms: ?u64 = null,
     test_vote_delay_ms: ?u64 = null,
+    test_anchor_interval_ms: ?u64 = null,
     enable_failpoints: bool = false,
     dev_psk: bool = false,
     insecure_test_tcp: bool = false,
@@ -789,7 +792,9 @@ fn serveCommand(
         }
         zaxonlite.segment.rotation_records = records;
     }
-    if ((options.test_storage_delay_ms != null or options.test_vote_delay_ms != null) and
+    if ((options.test_storage_delay_ms != null or
+        options.test_vote_delay_ms != null or
+        options.test_anchor_interval_ms != null) and
         !options.enable_failpoints)
     {
         // Deterministic takeover scenarios stretch one node's barrier or
@@ -797,9 +802,16 @@ fn serveCommand(
         // window.
         return usageError(
             err_out,
-            "--test-storage-delay-ms and --test-vote-delay-ms are test-only; " ++
+            "test delay and anchor interval flags are test-only; " ++
                 "they require --enable-failpoints",
         );
+    }
+    if (options.test_anchor_interval_ms) |milliseconds| {
+        if (milliseconds == 0) {
+            return usageError(err_out, "--test-anchor-interval-ms must be positive");
+        }
+        zaxonlite.Node.anchor_interval_ns =
+            @as(i96, milliseconds) * std.time.ns_per_ms;
     }
 
     return server.serve(gpa, io, .{
@@ -1606,6 +1618,11 @@ fn parseOptionFlag(
             return optError(err_out, "--test-vote-delay-ms needs a value");
         options.test_vote_delay_ms = std.fmt.parseInt(u64, text, 10) catch
             return optError(err_out, "--test-vote-delay-ms must be an integer");
+    } else if (std.mem.eql(u8, arg, "--test-anchor-interval-ms")) {
+        const text = iterator.next() orelse
+            return optError(err_out, "--test-anchor-interval-ms needs a value");
+        options.test_anchor_interval_ms = std.fmt.parseInt(u64, text, 10) catch
+            return optError(err_out, "--test-anchor-interval-ms must be an integer");
     } else if (std.mem.eql(u8, arg, "--enable-failpoints")) {
         options.enable_failpoints = true;
     } else if (std.mem.eql(u8, arg, "--dev-psk")) {
