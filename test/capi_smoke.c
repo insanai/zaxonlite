@@ -58,7 +58,7 @@ int main(int argc, char **argv) {
     snprintf(dir, sizeof dir, "%s-%d-%ld", argv[1], (int)getpid(),
              (long)time(NULL));
 
-    CHECK("version string", strcmp(zaxonlite_version(), "0.6.2") == 0);
+    CHECK("version string", strcmp(zaxonlite_version(), "0.7.0") == 0);
 
     zaxonlite *db = NULL;
     CHECK("open", zaxonlite_open(dir, &db) == 0 && db != NULL);
@@ -409,6 +409,11 @@ int main(int argc, char **argv) {
           zaxonlite_cluster_open(&cluster_options, &cluster) == 0 &&
               cluster != NULL);
     if (cluster != NULL) {
+        char cluster_failure[128];
+        CHECK("cluster facade healthy state",
+              zaxonlite_cluster_state(cluster, cluster_failure,
+                                      sizeof cluster_failure) == 0 &&
+                  cluster_failure[0] == '\0');
         CHECK("cluster facade exec",
               zaxonlite_cluster_exec(
                   cluster, "create table facade(value text)", &changes) == 0);

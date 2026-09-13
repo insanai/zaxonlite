@@ -34,13 +34,13 @@ from .dbapi import (
     threadsafety,
 )
 from .rows import Row
-from .server import Member, Server, start_server
+from .server import Member, Server, ServerState, start_server
 
-__version__ = "0.6.2"
+__version__ = "0.7.0"
 
 # ZDS 0010 invariant 13: the SDK and the native library must agree on
 # the native major/minor version before any handle is opened.
-_EXPECTED_NATIVE_VERSION = (0, 6)
+_EXPECTED_NATIVE_VERSION = (0, 7)
 
 
 def _check_native_version() -> None:
@@ -76,6 +76,7 @@ __all__ = [
     "RemoteConnection",
     "Row",
     "Server",
+    "ServerState",
     "Warning",
     "__version__",
     "apilevel",

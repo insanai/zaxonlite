@@ -1,4 +1,4 @@
-//! Immutable consensus journal segments (journal v2, ZDS 0011).
+//! Immutable consensus journal segments (journal v3, ZDS 0011).
 //!
 //! A segment is a contiguous run of journal records for absolute global
 //! slots: a fixed header naming the database and the first slot, framed
@@ -33,10 +33,11 @@ const durability = @import("durability.zig");
 const paxos = @import("paxos");
 const types = @import("types.zig");
 
-pub const header_magic: u32 = 0x3253585a; // "ZXS2" in file byte order.
-pub const trailer_magic: u32 = 0x3254585a; // "ZXT2" in file byte order.
-const record_magic: u32 = 0x3252585a; // "ZXR2" in file byte order.
-pub const format_version: u8 = 2;
+pub const header_magic: u32 = 0x3353585a; // "ZXS3" in file byte order.
+pub const trailer_magic: u32 = 0x3354585a; // "ZXT3" in file byte order.
+const record_magic: u32 = 0x3352585a; // "ZXR3" in file byte order.
+const previous_header_magic: u32 = 0x3253585a; // "ZXS2", unsupported.
+pub const format_version: u8 = 3;
 
 /// Records per sealed segment. With record bodies bounded by
 /// `types.max_write_size` this caps a segment near 10 MiB while keeping
@@ -453,7 +454,9 @@ fn readHeader(io: Io, file: Io.File) !Header {
     const read = file.readPositionalAll(io, &bytes, 0) catch return error.CorruptSegment;
     if (read != header_size) return error.CorruptSegment;
     var offset: usize = 0;
-    if (readInt(u32, &bytes, &offset) != header_magic) return error.CorruptSegment;
+    const found_magic = readInt(u32, &bytes, &offset);
+    if (found_magic == previous_header_magic) return error.UnsupportedSegmentVersion;
+    if (found_magic != header_magic) return error.CorruptSegment;
     if (bytes[offset] != format_version) return error.UnsupportedSegmentVersion;
     offset += 4;
     var header = Header{
@@ -654,4 +657,22 @@ test "an unsealed segment streams records until the end of file" {
     try testing.expectEqual(@as(u64, 1), (try reader.next()).?.slot);
     try testing.expectEqual(@as(u64, 2), (try reader.next()).?.slot);
     try testing.expectEqual(@as(?Record, null), try reader.next());
+}
+
+test "journal v2 segment is explicitly unsupported" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var writer = try Writer.create(io, tmp.dir, "old", .{
+        .database_id = 9,
+        .first_global_slot = 1,
+        .previous_segment_digest = [_]u8{0} ** 32,
+    });
+    writer.close();
+    const file = try tmp.dir.openFile(io, "old", .{ .mode = .read_write });
+    defer file.close(io);
+    var old_magic: [4]u8 = undefined;
+    std.mem.writeInt(u32, &old_magic, previous_header_magic, .little);
+    try file.writePositionalAll(io, &old_magic, 0);
+    try testing.expectError(error.UnsupportedSegmentVersion, peekHeader(io, tmp.dir, "old"));
 }

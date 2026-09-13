@@ -73,20 +73,20 @@ python3 benchmarks/compare-rqlite-realworld-3node.py \
 Tune with `--phase-operations`, `--warmup-operations`, `--concurrency`,
 `--seed`, and the binary-path options shown by `--help`. Set `KEEP_RUN_DIR=1`
 or pass `--keep-run-dir` to retain every node directory and process log.
-The recorded full result is
-[`results/realworld-rqlite-v10.2.7-darwin-arm64-2026-08-27.json`](results/realworld-rqlite-v10.2.7-darwin-arm64-2026-08-27.json).
-The consecutive validation run is retained as
+The current recorded full result used zaxon 0.7.0 and rqlite v10.2.7 on
+Linux x86-64 on 13 September 2026:
+[`results/realworld-rqlite-v10.2.7-linux-x86_64-2026-09-13.json`](results/realworld-rqlite-v10.2.7-linux-x86_64-2026-09-13.json).
+The earlier Darwin full result and its consecutive validation run are retained as
+[`results/realworld-rqlite-v10.2.7-darwin-arm64-2026-08-27.json`](results/realworld-rqlite-v10.2.7-darwin-arm64-2026-08-27.json) and
 [`results/realworld-rqlite-v10.2.7-darwin-arm64-2026-08-27-repeat-summary.json`](results/realworld-rqlite-v10.2.7-darwin-arm64-2026-08-27-repeat-summary.json).
 The 20 July 2026 recordings are retained beside them; they predate the
 `--sync full` default, so their zaxonlite writes did not pay the full
 cache-flush barrier and their throughput rows are not comparable to the
 durability-matched 27 August run.
 
-## dqlite (deferred execution)
+## dqlite on Linux
 
 This harness compares three Zaxonlite data voters with three dqlite voters.
-Its execution remains deferred until a supported Linux host has the pinned
-dqlite fixture; the harness itself remains available.
 
 “Persistent” means each product retains the quorum state needed to recover
 acknowledged writes in per-node directories. Current dqlite intentionally uses
@@ -100,6 +100,14 @@ The reference versions are libdqlite `v1.18.7`
 (`d046c957251f7c77565d878eab950de4ff3bba5b`). Upstream dqlite requires Linux.
 The harness verifies every measured dqlite key and the complete measured
 Zaxonlite row count after timing.
+
+The current recorded result ran on Linux x86-64 on 13 September 2026 with
+zaxonlite 0.7.0, libdqlite v1.18.7, and go-dqlite v3.0.4:
+[`results/dqlite-v1.18.7-linux-x86_64-2026-09-13.json`](results/dqlite-v1.18.7-linux-x86_64-2026-09-13.json).
+It covers sequential durable writes only. It is not a dqlite result for the
+realistic rqlite workload, whose member failures, catch-up, and full-cluster
+restart require a different lifecycle-aware driver.
+
 Build `dqlite-demo` from that go-dqlite revision against the pinned libdqlite,
 then run:
 

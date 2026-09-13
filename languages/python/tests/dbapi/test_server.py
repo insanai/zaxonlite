@@ -4,6 +4,7 @@ import os
 import shutil
 import socket
 import tempfile
+import time
 import warnings
 from collections.abc import Iterator
 from pathlib import Path
@@ -44,6 +45,8 @@ def test_unix_server_end_to_end(tmp_path: Path, sock_dir: Path) -> None:
         node_id=1,
         members=[zxlite.Member(1, f"unix:{sock}")],
     ) as server:
+        assert server.state() is zxlite.ServerState.HEALTHY
+        assert server.failure is None
         assert server.endpoint == f"unix:{sock}"
         assert server.node_id == 1
         assert server.closed is False
@@ -90,6 +93,7 @@ def test_unix_server_end_to_end(tmp_path: Path, sock_dir: Path) -> None:
         finally:
             conn.close()
     assert server.closed is True
+    assert server.state() is zxlite.ServerState.STOPPED
     assert not sock.exists()
 
 
@@ -120,6 +124,40 @@ def test_unix_server_close_is_idempotent(tmp_path: Path, sock_dir: Path) -> None
     server.close()
     server.close()
     assert server.closed is True
+
+
+@posix_only
+def test_server_reports_real_local_storage_failure(
+    tmp_path: Path, sock_dir: Path
+) -> None:
+    server = zxlite.start_server(
+        directory=tmp_path / "node",
+        node_id=1,
+        members=[zxlite.Member(1, f"unix:{sock_dir}/failed.sock")],
+    )
+    conn = zxlite.connect(server.endpoint)
+    try:
+        conn.execute("create table fatal_probe(id integer)")
+        assert '"ok":true' in server._call_local('{"op":"anchor"}')
+        trim = tmp_path / "node" / "consensus" / "TRIM"
+        trim.unlink()
+        trim.mkdir()
+        conn.execute("insert into fatal_probe values (1)")
+        assert "internal" in server._call_local('{"op":"anchor"}')
+        deadline = time.monotonic() + 2
+        while server.state() is not zxlite.ServerState.FAILED:
+            if time.monotonic() >= deadline:
+                pytest.fail("local failure was not published")
+            time.sleep(0.01)
+        assert server.failure
+        with pytest.raises(zxlite.OperationalError) as unavailable:
+            _ = server.endpoint
+        assert unavailable.value.category == "availability"
+    finally:
+        conn.close()
+    with pytest.raises(zxlite.OperationalError) as close_error:
+        server.close()
+    assert close_error.value.category == "availability"
 
 
 def test_dev_psk_single_node_end_to_end(tmp_path: Path) -> None:

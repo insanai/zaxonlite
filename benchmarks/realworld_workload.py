@@ -31,6 +31,7 @@ TRANSIENT_RQLITE_TEXT = (
     "timeout",
     "unavailable",
 )
+ZAXON_WIRE_PROTOCOL = 10
 
 
 SCHEMA = (
@@ -311,7 +312,7 @@ class ZaxonWireConnection:
         raw = socket.create_connection(endpoint, timeout=timeout)
         self.socket = tls_context.wrap_socket(
             raw, server_hostname=f"zaxon-node-{node_id}")
-        hello = struct.pack("<HB", 9, 1)
+        hello = struct.pack("<HB", ZAXON_WIRE_PROTOCOL, 1)
         hello += struct.pack("<I", 0) + bytes(16) + struct.pack("<Q", 0)
         self.send_frame(1, hello)
 

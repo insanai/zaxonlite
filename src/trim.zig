@@ -20,17 +20,25 @@
 //! restart it is the local authority for both.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const command = @import("command.zig");
 const durability = @import("durability.zig");
+const failpoint = @import("failpoint.zig");
 const paxos = @import("paxos");
 
 const magic: u32 = 0x5254585a; // "ZXTR" in file byte order.
-const version: u16 = 1;
+const version: u16 = 2;
 
 pub const file_name = "TRIM";
+
+/// Test-only control for paths whose required error diagnostics would make
+/// Zig's test runner fail an otherwise expected invariant test.
+pub const test_options = if (builtin.is_test) struct {
+    pub var suppress_adoption_log = false;
+} else struct {};
 
 /// Concurrent transfer leases are bounded; one repair or replacement at a
 /// time is the product shape, with headroom.
@@ -46,7 +54,8 @@ pub const Lease = struct {
 /// The durable local trim state: the adopted cluster anchor plus every
 /// active lease capping deletion.
 pub const State = struct {
-    trim_id: u64 = 0,
+    /// Global Paxos slot of the chosen trim command.
+    decision_slot: u64 = 0,
     through_slot: u64 = 0,
     history_hash: [32]u8 = [_]u8{0} ** 32,
     configuration_id: u64 = 0,
@@ -144,20 +153,141 @@ pub fn deleteFloor(
     return floor;
 }
 
-/// Validates a chosen trim record against the durable state. A replayed
-/// or duplicate lower trim is ignored; a same-ID record with a different
-/// anchor is corruption and must stop the node.
-pub const Adoption = enum { adopt, ignore, corrupt };
+/// Classifies a chosen trim against the already durable anchor. Exact replay
+/// is idempotent. Older decisions and later decisions that authorize no more
+/// deletion are safe to ignore: retaining more history cannot violate a
+/// GlobalTrim invariant, and recovery's page-image replay treats maintenance
+/// commands the same way. A decision-slot twin or a different history at the
+/// same trim frontier is durable-history divergence and remains fatal.
+pub const Adoption = enum {
+    adopt,
+    ignore_replay,
+    ignore_stale,
+    ignore_duplicate,
+    diverged,
+};
 
-pub fn classify(state: *const State, record: command.TrimRecord) Adoption {
-    if (record.trim_id == state.trim_id) {
+pub fn classify(
+    state: *const State,
+    decision_slot: u64,
+    record: command.TrimRecord,
+) Adoption {
+    if (decision_slot == state.decision_slot) {
         const same = record.through_slot == state.through_slot and
+            record.configuration_id == state.configuration_id and
             std.mem.eql(u8, &record.history_hash, &state.history_hash);
-        return if (same) .ignore else .corrupt;
+        return if (same) .ignore_replay else .diverged;
     }
-    if (record.trim_id < state.trim_id) return .ignore;
-    if (record.through_slot < state.through_slot) return .corrupt;
+    if (decision_slot < state.decision_slot) return .ignore_stale;
+    if (record.through_slot < state.through_slot) return .ignore_stale;
+    if (record.through_slot == state.through_slot) {
+        const same_history = record.configuration_id == state.configuration_id and
+            std.mem.eql(u8, &record.history_hash, &state.history_hash);
+        return if (same_history) .ignore_duplicate else .diverged;
+    }
     return .adopt;
+}
+
+/// Applies the classified trim outcome to a node host. Keeping the transition
+/// beside `classify` makes the safe-ignore and fatal-divergence cases share one
+/// policy boundary; `node.zig` supplies the durable stores and Paxos adapter.
+pub fn adoptChosen(node: anytype, decision_slot: u64, record: command.TrimRecord) !void {
+    const adoption = classify(&node.trim_state, decision_slot, record);
+    switch (adoption) {
+        .ignore_replay => return,
+        .ignore_stale, .ignore_duplicate => {
+            logAdoption(node.trim_state, adoption, decision_slot, record);
+            node.trim_ignored_count +|= 1;
+            return;
+        },
+        .diverged => {
+            logAdoption(node.trim_state, adoption, decision_slot, record);
+            node.fatal_storage_error = true;
+            return error.TrimRegression;
+        },
+        .adopt => {},
+    }
+    node.trim_state.decision_slot = decision_slot;
+    node.trim_state.through_slot = record.through_slot;
+    node.trim_state.history_hash = record.history_hash;
+    node.trim_state.configuration_id = record.configuration_id;
+    failpoint.hit("before_trim_file");
+    store(node.io, node.journal.dir, node.trim_state) catch |err| {
+        node.fatal_storage_error = true;
+        return err;
+    };
+    failpoint.hit("after_trim_file");
+    node.log.installChosenTrim(.{
+        .trim_id = decision_slot,
+        .chosen_trim_slot = record.through_slot,
+        .history_hash = record.history_hash,
+    }, node.effects) catch |err| {
+        node.fatal_storage_error = true;
+        return err;
+    };
+    node.journal.noteTrimAnchor(
+        decision_slot,
+        record.through_slot,
+        record.history_hash,
+    );
+}
+
+fn logAdoption(
+    state: State,
+    adoption: Adoption,
+    decision_slot: u64,
+    record: command.TrimRecord,
+) void {
+    if (builtin.is_test and test_options.suppress_adoption_log) return;
+    std.log.err(
+        "trim {s}: decision={d} adopted=({d},{d}," ++
+            "{x:0>2}{x:0>2}{x:0>2}{x:0>2}) record=({d}," ++
+            "{x:0>2}{x:0>2}{x:0>2}{x:0>2})",
+        .{
+            @tagName(adoption),     decision_slot,
+            state.decision_slot,    state.through_slot,
+            state.history_hash[0],  state.history_hash[1],
+            state.history_hash[2],  state.history_hash[3],
+            record.through_slot,    record.history_hash[0],
+            record.history_hash[1], record.history_hash[2],
+            record.history_hash[3],
+        },
+    );
+}
+
+/// Persists a newly chosen transfer lease. Capacity overflow is a
+/// deterministic no-op; the sender's pinned image remains the safety owner.
+pub fn trackLease(node: anytype, lease: command.TransferLease) !void {
+    for (node.trim_state.leasesSlice()) |held| {
+        if (held.lease_id == lease.lease_id) return;
+    }
+    if (node.trim_state.lease_count >= max_leases) return;
+    node.trim_state.leases[node.trim_state.lease_count] = .{
+        .lease_id = lease.lease_id,
+        .receiver_id = lease.receiver_id,
+        .base_slot = lease.base_slot,
+        .expiry_ticks_left = lease.expires_after_leader_ticks,
+    };
+    node.trim_state.lease_count += 1;
+    store(node.io, node.journal.dir, node.trim_state) catch |err| {
+        node.fatal_storage_error = true;
+        return err;
+    };
+}
+
+/// Removes and persists a chosen transfer lease, or does nothing when replay
+/// has already removed it.
+pub fn releaseLease(node: anytype, lease_id: u64) !void {
+    var index: u8 = 0;
+    while (index < node.trim_state.lease_count) : (index += 1) {
+        if (node.trim_state.leases[index].lease_id == lease_id) break;
+    } else return;
+    node.trim_state.lease_count -= 1;
+    node.trim_state.leases[index] = node.trim_state.leases[node.trim_state.lease_count];
+    store(node.io, node.journal.dir, node.trim_state) catch |err| {
+        node.fatal_storage_error = true;
+        return err;
+    };
 }
 
 const record_size = 4 + 2 + 2 + 8 + 8 + 32 + 8 + 1 +
@@ -171,7 +301,7 @@ pub fn store(io: Io, dir: Io.Dir, state: State) !void {
     writeInt(u32, &bytes, &offset, magic);
     writeInt(u16, &bytes, &offset, version);
     writeInt(u16, &bytes, &offset, 0);
-    writeInt(u64, &bytes, &offset, state.trim_id);
+    writeInt(u64, &bytes, &offset, state.decision_slot);
     writeInt(u64, &bytes, &offset, state.through_slot);
     writeBytes(&bytes, &offset, &state.history_hash);
     writeInt(u64, &bytes, &offset, state.configuration_id);
@@ -196,7 +326,7 @@ pub fn store(io: Io, dir: Io.Dir, state: State) !void {
     try durability.syncPathnameTransition(io, dir, file_name);
 }
 
-pub const LoadError = error{CorruptTrimRecord};
+pub const LoadError = error{ CorruptTrimRecord, UnsupportedTrimVersion };
 
 /// Reads the durable trim state; a missing file is a fresh database. A
 /// malformed record fails closed rather than permitting deletion.
@@ -219,10 +349,10 @@ pub fn load(io: Io, dir: Io.Dir) !?State {
 
     var offset: usize = 0;
     if (readInt(u32, &bytes, &offset) != magic) return error.CorruptTrimRecord;
-    if (readInt(u16, &bytes, &offset) != version) return error.CorruptTrimRecord;
+    if (readInt(u16, &bytes, &offset) != version) return error.UnsupportedTrimVersion;
     if (readInt(u16, &bytes, &offset) != 0) return error.CorruptTrimRecord;
     var state = State{
-        .trim_id = readInt(u64, &bytes, &offset),
+        .decision_slot = readInt(u64, &bytes, &offset),
         .through_slot = readInt(u64, &bytes, &offset),
     };
     readBytes(&bytes, &offset, &state.history_hash);
@@ -319,39 +449,47 @@ test "the delete floor honors trim, local state, retention, and leases" {
     );
 }
 
-test "trim adoption is idempotent and a conflicting anchor is corruption" {
+test "trim adoption distinguishes replay stale duplicate and divergence" {
     const state = State{
-        .trim_id = 2,
+        .decision_slot = 20,
         .through_slot = 100,
         .history_hash = [_]u8{1} ** 32,
         .configuration_id = 1,
     };
     const same = command.TrimRecord{
-        .trim_id = 2,
         .through_slot = 100,
         .history_hash = [_]u8{1} ** 32,
         .configuration_id = 1,
         .policy = 0,
     };
-    try testing.expectEqual(Adoption.ignore, classify(&state, same));
+    try testing.expectEqual(Adoption.ignore_replay, classify(&state, 20, same));
 
     var conflicting = same;
     conflicting.history_hash = [_]u8{9} ** 32;
-    try testing.expectEqual(Adoption.corrupt, classify(&state, conflicting));
+    try testing.expectEqual(Adoption.diverged, classify(&state, 20, conflicting));
 
     var newer = same;
-    newer.trim_id = 3;
     newer.through_slot = 150;
-    try testing.expectEqual(Adoption.adopt, classify(&state, newer));
+    try testing.expectEqual(Adoption.adopt, classify(&state, 30, newer));
 
     var regressing = newer;
     regressing.through_slot = 50;
-    try testing.expectEqual(Adoption.corrupt, classify(&state, regressing));
+    try testing.expectEqual(Adoption.ignore_stale, classify(&state, 30, regressing));
+
+    var nonadvancing = newer;
+    nonadvancing.through_slot = state.through_slot;
+    try testing.expectEqual(Adoption.ignore_duplicate, classify(&state, 30, nonadvancing));
+
+    nonadvancing.history_hash = [_]u8{9} ** 32;
+    try testing.expectEqual(Adoption.diverged, classify(&state, 30, nonadvancing));
+
+    nonadvancing = same;
+    nonadvancing.configuration_id = 2;
+    try testing.expectEqual(Adoption.diverged, classify(&state, 30, nonadvancing));
 
     var older = same;
-    older.trim_id = 1;
     older.through_slot = 40;
-    try testing.expectEqual(Adoption.ignore, classify(&state, older));
+    try testing.expectEqual(Adoption.ignore_stale, classify(&state, 10, older));
 }
 
 test "the durable trim record round trips and fails closed on corruption" {
@@ -362,7 +500,7 @@ test "the durable trim record round trips and fails closed on corruption" {
     try testing.expectEqual(@as(?State, null), try load(io, tmp.dir));
 
     var state = State{
-        .trim_id = 5,
+        .decision_slot = 5,
         .through_slot = 700,
         .history_hash = [_]u8{3} ** 32,
         .configuration_id = 2,
@@ -376,7 +514,7 @@ test "the durable trim record round trips and fails closed on corruption" {
     };
     try store(io, tmp.dir, state);
     const loaded = (try load(io, tmp.dir)).?;
-    try testing.expectEqual(@as(u64, 5), loaded.trim_id);
+    try testing.expectEqual(@as(u64, 5), loaded.decision_slot);
     try testing.expectEqual(@as(u64, 700), loaded.through_slot);
     try testing.expectEqual(@as(u8, 1), loaded.lease_count);
     try testing.expectEqual(@as(u64, 650), loaded.leases[0].base_slot);
@@ -390,4 +528,19 @@ test "the durable trim record round trips and fails closed on corruption" {
         try file.writePositionalAll(io, &byte, 10);
     }
     try testing.expectError(error.CorruptTrimRecord, load(io, tmp.dir));
+}
+
+test "TRIM version 1 is explicitly unsupported" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try store(io, tmp.dir, .{});
+    const file = try tmp.dir.openFile(io, file_name, .{ .mode = .read_write });
+    defer file.close(io);
+    var bytes: [record_size]u8 = undefined;
+    _ = try file.readPositionalAll(io, &bytes, 0);
+    std.mem.writeInt(u16, bytes[4..6], 1, .little);
+    Sha256.hash(bytes[0 .. record_size - 32], bytes[record_size - 32 ..][0..32], .{});
+    try file.writePositionalAll(io, &bytes, 0);
+    try testing.expectError(error.UnsupportedTrimVersion, load(io, tmp.dir));
 }

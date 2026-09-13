@@ -15,18 +15,20 @@ import warnings
 import weakref
 from collections.abc import Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Literal
 
 from . import _zxlite
 from .dbapi import (
     NotSupportedError,
+    OperationalError,
     ProgrammingError,
     _is_numeric_loopback,
     _map_native_error,
     _NativeWorker,
 )
 
-__all__ = ["Member", "Server", "start_server"]
+__all__ = ["Member", "Server", "ServerState", "start_server"]
 
 _ROLE_CODES = {
     "data_voter": 0,
@@ -37,6 +39,15 @@ _ROLE_CODES = {
 }
 
 _MAX_MEMBERS = 36
+
+
+class ServerState(StrEnum):
+    """Embedding-local lifecycle of a hosted cluster member."""
+
+    HEALTHY = "healthy"
+    STOPPING = "stopping"
+    STOPPED = "stopped"
+    FAILED = "failed"
 
 
 @dataclass(frozen=True)
@@ -88,12 +99,14 @@ class Server:
         self._node_id = node_id
         self._members = members
         self._closed = False
+        self._terminal_failure: str | None = None
         self._close_lock = threading.Lock()
         self._finalizer = weakref.finalize(self, _warn_unclosed, capsule, worker)
 
     @property
     def endpoint(self) -> str:
         """Return this member's own endpoint."""
+        self._raise_if_failed()
         return self._endpoint
 
     @property
@@ -111,17 +124,68 @@ class Server:
         """Report whether the server has been closed."""
         return self._closed
 
+    def _native_state(self) -> tuple[ServerState, str | None]:
+        if self._closed:
+            if self._terminal_failure is not None:
+                return ServerState.FAILED, self._terminal_failure
+            return ServerState.STOPPED, None
+        code, failure = self._worker.call(_zxlite.cluster_state, self._capsule)
+        state = {
+            0: ServerState.HEALTHY,
+            1: ServerState.STOPPING,
+            2: ServerState.STOPPED,
+            4: ServerState.FAILED,
+        }.get(code, ServerState.FAILED)
+        return state, failure or None
+
+    def state(self) -> ServerState:
+        """Return local state without succeeding through another member."""
+        return self._native_state()[0]
+
+    @property
+    def failure(self) -> str | None:
+        """Return the local member's first failure name, when failed."""
+        return self._native_state()[1]
+
+    @staticmethod
+    def _availability_error(failure: str | None) -> OperationalError:
+        error = OperationalError(failure or "local cluster member failed")
+        error.category = "availability"
+        return error
+
+    def _raise_if_failed(self) -> None:
+        state, failure = self._native_state()
+        if state is ServerState.FAILED:
+            raise self._availability_error(failure)
+
+    def _call_local(self, request: str, *, leader: bool = False) -> str:
+        """Issue an internal raw RPC, used by lifecycle conformance tests."""
+        self._raise_if_failed()
+        try:
+            return self._worker.call(
+                _zxlite.cluster_call, self._capsule, request, leader
+            )
+        except _zxlite._ZxError as error:
+            raise _map_native_error(error) from None
+
     def close(self) -> None:
         """Stop the member, join its native thread, release the lock."""
         with self._close_lock:
             if self._closed:
+                if self._terminal_failure is not None:
+                    raise self._availability_error(self._terminal_failure)
                 return
+            state, failure = self._native_state()
+            if state is ServerState.FAILED:
+                self._terminal_failure = failure or "LocalNodeFailed"
             self._closed = True
         self._finalizer.detach()
         try:
             self._worker.call(_zxlite.cluster_close, self._capsule)
         finally:
             self._worker.stop()
+        if self._terminal_failure is not None:
+            raise self._availability_error(self._terminal_failure)
 
     def __enter__(self) -> Server:
         """Return the server for use in a with-statement."""

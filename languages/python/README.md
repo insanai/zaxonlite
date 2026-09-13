@@ -101,6 +101,12 @@ development-only PSK mode (allow_psk_only_loopback=True plus an
 auth_file) is restricted to numeric loopback addresses everywhere and
 is never a production transport.
 
+`server.state()` returns `ServerState.HEALTHY`, `STOPPING`, `STOPPED`, or
+`FAILED` from the hosted member itself, and `server.failure` carries the first
+native error name. After local failure, accessors that hand out the endpoint
+and `close()` raise `OperationalError` with category `availability`; `close()`
+still joins and releases the native handle before raising.
+
 Remote connections accept DSNs:
 
     db = zxlite.connect(

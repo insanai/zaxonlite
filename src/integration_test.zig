@@ -44,6 +44,28 @@ fn countItems(node: *Node) !i64 {
     return std.fmt.parseInt(i64, result.rows[0][0].?, 10);
 }
 
+fn readTrimBytes(gpa: std.mem.Allocator, directory: []const u8) ![]u8 {
+    const path = try std.fmt.allocPrint(gpa, "{s}/consensus/TRIM", .{directory});
+    defer gpa.free(path);
+    return std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        path,
+        gpa,
+        .limited(4096),
+    );
+}
+
+fn expectTrimStateEqual(
+    expected: zaxonlite.trim.State,
+    actual: zaxonlite.trim.State,
+) !void {
+    try testing.expectEqual(expected.decision_slot, actual.decision_slot);
+    try testing.expectEqual(expected.through_slot, actual.through_slot);
+    try testing.expectEqual(expected.history_hash, actual.history_hash);
+    try testing.expectEqual(expected.configuration_id, actual.configuration_id);
+    try testing.expectEqual(expected.lease_count, actual.lease_count);
+}
+
 test "node persists across close and reopen" {
     const gpa = testing.allocator;
     var test_dir = try TestDir.init(gpa);
@@ -69,6 +91,65 @@ test "node persists across close and reopen" {
         const report = try node.integrityCheck();
         try testing.expect(report.ok());
     }
+}
+
+test "fresh later-configuration voter requires an enrollment JOIN descriptor" {
+    const gpa = testing.allocator;
+    var test_dir = try TestDir.init(gpa);
+    defer test_dir.deinit(gpa);
+    const dir = try test_dir.nodeDir(gpa);
+    defer gpa.free(dir);
+    try test_dir.tmp.dir.createDirPath(testing.io, "node");
+    try test_dir.tmp.dir.writeFile(testing.io, .{
+        .sub_path = "node/identity",
+        .data = "format=3\nnode_id=1\n" ++
+            "database_id=00000000000000000000000000000001\n" ++
+            "configuration_id=2\nrole=data-voter\n",
+    });
+    const member = try zaxonlite.registry.NodeRecord.init(
+        1,
+        .data_voter,
+        "127.0.0.1:1",
+    );
+    try testing.expectError(
+        error.JoinDescriptorRequired,
+        Node.open(gpa, testing.io, .{
+            .directory = dir,
+            .node_id = 1,
+            .database_id = 1,
+            .registry_nodes = &.{member},
+        }),
+    );
+}
+
+test "an enrollment JOIN descriptor requires the data-voter role" {
+    const gpa = testing.allocator;
+    var test_dir = try TestDir.init(gpa);
+    defer test_dir.deinit(gpa);
+    const dir = try test_dir.nodeDir(gpa);
+    defer gpa.free(dir);
+    try zaxonlite.node.writeJoinDescriptor(testing.io, dir, .{
+        .database_id = 1,
+        .configuration_id = 2,
+        .registry_digest = [_]u8{0x5a} ** 32,
+    });
+    const voter = try zaxonlite.registry.NodeRecord.init(
+        1,
+        .data_voter,
+        "127.0.0.1:1",
+    );
+
+    try testing.expectError(
+        error.JoinRequiresDataVoter,
+        Node.open(gpa, testing.io, .{
+            .directory = dir,
+            .node_id = 4,
+            .database_id = 1,
+            .role = .read_replica,
+            .members = &.{1},
+            .registry_nodes = &.{voter},
+        }),
+    );
 }
 
 test "prepared explicit transaction is one durable replicated transition" {
@@ -533,6 +614,7 @@ test "a state anchor bounds recovery and survives image loss" {
         // The one-member configuration trims itself to the fresh anchor;
         // the trim entry itself occupies the slot after the anchor.
         try testing.expectEqual(node.durable_state_slot + 1, node.applied_slot);
+        try testing.expectEqual(node.applied_slot, node.trim_state.decision_slot);
         try testing.expectEqual(node.durable_state_slot, node.trim_state.through_slot);
         try testing.expectEqual(
             node.trim_state.through_slot,
@@ -569,6 +651,88 @@ test "a state anchor bounds recovery and survives image loss" {
         const report = try node.integrityCheck();
         try testing.expect(report.ok());
     }
+}
+
+test "adopting chosen trims counts safe skips and latches on divergence" {
+    const gpa = testing.allocator;
+    var test_dir = try TestDir.init(gpa);
+    defer test_dir.deinit(gpa);
+    const dir = try test_dir.nodeDir(gpa);
+    defer gpa.free(dir);
+
+    var durable_before: []u8 = undefined;
+    {
+        const node = try openNode(dir);
+        defer node.close();
+        _ = try node.exec("create table items(id integer primary key, v text)");
+        _ = try node.exec("insert into items(v) values ('anchor')");
+        try node.createStateAnchor();
+
+        const adopted = node.trim_state;
+        try testing.expect(adopted.decision_slot > 0);
+        try testing.expect(adopted.through_slot > 0);
+        durable_before = try readTrimBytes(gpa, dir);
+
+        zaxonlite.trim.test_options.suppress_adoption_log = true;
+        defer zaxonlite.trim.test_options.suppress_adoption_log = false;
+
+        const stale = zaxonlite.command.TrimRecord{
+            .through_slot = adopted.through_slot - 1,
+            .history_hash = adopted.history_hash,
+            .configuration_id = adopted.configuration_id,
+            .policy = 0,
+        };
+        try zaxonlite.trim.adoptChosen(node, adopted.decision_slot + 5, stale);
+        try testing.expectEqual(@as(u64, 1), node.trim_ignored_count);
+        try expectTrimStateEqual(adopted, node.trim_state);
+        try testing.expect(!node.storageFailed());
+
+        const duplicate = zaxonlite.command.TrimRecord{
+            .through_slot = adopted.through_slot,
+            .history_hash = adopted.history_hash,
+            .configuration_id = adopted.configuration_id,
+            .policy = 0,
+        };
+        try zaxonlite.trim.adoptChosen(
+            node,
+            adopted.decision_slot + 6,
+            duplicate,
+        );
+        try testing.expectEqual(@as(u64, 2), node.trim_ignored_count);
+        try expectTrimStateEqual(adopted, node.trim_state);
+
+        try zaxonlite.trim.adoptChosen(node, adopted.decision_slot, duplicate);
+        try testing.expectEqual(@as(u64, 2), node.trim_ignored_count);
+
+        const durable_after_skips = try readTrimBytes(gpa, dir);
+        defer gpa.free(durable_after_skips);
+        try testing.expectEqualSlices(u8, durable_before, durable_after_skips);
+
+        var diverged = duplicate;
+        diverged.history_hash[0] ^= 1;
+        try testing.expectError(
+            error.TrimRegression,
+            zaxonlite.trim.adoptChosen(
+                node,
+                adopted.decision_slot + 7,
+                diverged,
+            ),
+        );
+        try testing.expect(node.storageFailed());
+        try testing.expectError(
+            error.StorageFailed,
+            node.exec("insert into items(v) values ('refused')"),
+        );
+    }
+    defer gpa.free(durable_before);
+
+    const durable_after_reopen = try readTrimBytes(gpa, dir);
+    defer gpa.free(durable_after_reopen);
+    try testing.expectEqualSlices(u8, durable_before, durable_after_reopen);
+    const reopened = try openNode(dir);
+    defer reopened.close();
+    const report = try reopened.integrityCheck();
+    try testing.expect(report.ok());
 }
 
 test "recovery discards a corrupt materialized image even with an empty suffix" {
@@ -1304,6 +1468,40 @@ test "live transaction: rollback publishes nothing" {
     try testing.expectEqual(@as(i64, 1), try countItems(node));
     try testing.expectError(error.NoTransaction, node.commitLive());
     try testing.expectError(error.NoTransaction, node.rollbackLive());
+}
+
+test "live transaction refuses work after the storage latch" {
+    const gpa = testing.allocator;
+    var test_dir = try TestDir.init(gpa);
+    defer test_dir.deinit(gpa);
+    const dir = try test_dir.nodeDir(gpa);
+    defer gpa.free(dir);
+
+    const node = try openNode(dir);
+    defer node.close();
+    _ = try node.exec("create table items(id integer primary key, v text)");
+    try node.beginLive();
+    node.markFailed();
+
+    var returning: ?zaxonlite.TypedResult = null;
+    try testing.expectError(
+        error.StorageFailed,
+        node.liveExec(
+            gpa,
+            "insert into items(v) values ('refused')",
+            &.{},
+            &returning,
+        ),
+    );
+    try testing.expectError(error.StorageFailed, node.liveSavepoint(1));
+    try testing.expectError(error.StorageFailed, node.liveReleaseSavepoint(1));
+    try testing.expectError(error.StorageFailed, node.liveRollbackToSavepoint(1));
+    try testing.expectError(error.StorageFailed, node.commitLive());
+
+    // Cleanup remains available after failure so hosts can release SQLite's
+    // writer transaction deterministically.
+    try node.rollbackLive();
+    try testing.expect(!node.inLiveTransaction());
 }
 
 // ----------------------------------------------------------------------

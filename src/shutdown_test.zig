@@ -361,11 +361,73 @@ test "stop with an outstanding applied wait closes and can restart the same endp
     defer gpa.free(response);
     try testing.expectEqualStrings("{\"ok\":true}", response);
     const end = after(2000);
+    while (!local.node.?.finished.load(.acquire)) {
+        if (expired(end)) return error.CleanStopDidNotFinish;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    switch (local.node.?.localServerState()) {
+        .stopped => |code| try testing.expectEqual(@as(u8, 0), code),
+        else => return error.CleanStopStateMismatch,
+    }
     local.node.?.close();
     local.node = null;
     thread.join();
     try testing.expect(!expired(end));
     try local.open();
+}
+
+test "embedded exposes a real local storage failure and stops with code four" {
+    var guard = Guard{};
+    try guard.start();
+    defer guard.stop();
+    var local = try LocalNode.init();
+    defer local.deinit();
+    try local.open();
+    const embedded = local.node.?;
+
+    _ = try embedded.exec("create table fatal_probe(id integer)");
+    var response = try embedded.call("{\"op\":\"anchor\"}", false);
+    gpa.free(response);
+
+    const trim_path = try std.fmt.allocPrint(gpa, "{s}/consensus/TRIM", .{local.path});
+    defer gpa.free(trim_path);
+    try Io.Dir.cwd().deleteFile(io, trim_path);
+    try Io.Dir.cwd().createDir(io, trim_path, @enumFromInt(0o700));
+
+    _ = try embedded.exec("insert into fatal_probe values (1)");
+    response = try embedded.call("{\"op\":\"anchor\"}", false);
+    defer gpa.free(response);
+    try testing.expect(std.mem.indexOf(u8, response, "internal") != null);
+    const end = after(2000);
+    while (switch (embedded.localServerState()) {
+        .failed => false,
+        else => true,
+    }) {
+        if (expired(end)) return error.LocalFailureNotPublished;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    switch (embedded.localServerState()) {
+        .failed => |name| try testing.expect(name.len != 0),
+        else => return error.LocalFailureStateMismatch,
+    }
+    try testing.expectError(
+        error.LocalNodeFailed,
+        embedded.exec("insert into fatal_probe values (2)"),
+    );
+    try testing.expectError(
+        error.LocalNodeFailed,
+        embedded.query(gpa, "select * from fatal_probe"),
+    );
+    try testing.expectError(error.LocalNodeFailed, embedded.call("{\"op\":\"status\"}", false));
+    while (!embedded.finished.load(.acquire)) {
+        if (expired(end)) return error.FailedServerDidNotFinish;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try testing.expectEqual(@as(u8, 4), embedded.exit_code.load(.acquire));
+    const close_end = after(2000);
+    embedded.close();
+    local.node = null;
+    try testing.expect(!expired(close_end));
 }
 
 test "zero startup budget stops and joins the newly spawned server" {

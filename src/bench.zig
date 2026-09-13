@@ -78,27 +78,6 @@ fn printLagCheck(check: LagCheck, series_len: usize) void {
     );
 }
 
-/// The inter-completion series must see the forced anchor cadence: a
-/// low correlation there means the instrument is broken, not that the
-/// system is quiet.
-fn printControlCheck(check: LagCheck, series_len: usize) void {
-    if (!check.available) {
-        std.debug.print(
-            "{s}: lag {d} unavailable for {d} samples\n",
-            .{ check.name, check.lag, series_len },
-        );
-        return;
-    }
-    const verdict = if (check.r > periodicity_flag)
-        "  (positive control: anchors visible)"
-    else
-        "  ANCHORS INVISIBLE - instrument broken";
-    std.debug.print(
-        "{s}: lag {d} writes r={d:.3}{s}\n",
-        .{ check.name, check.lag, check.r, verdict },
-    );
-}
-
 const Stats = struct {
     p50: u64,
     p95: u64,
@@ -192,8 +171,8 @@ pub fn main(init: std.process.Init) !u8 {
     try benchRecovery(gpa, io, &node, root, write_count);
     if (!control_ok) {
         std.debug.print(
-            "FAILED: the anchor positive control did not register; the " ++
-                "periodicity instrument is broken\n",
+            "FAILED: the event-labelled anchor positive control did not " ++
+                "register; the periodicity instrument is broken\n",
             .{},
         );
         return 1;
@@ -244,10 +223,9 @@ fn benchWrites(gpa: std.mem.Allocator, io: std.Io, node: *Node, write_count: usi
     const write_elapsed = nowNs(io) - write_start;
     // Both checks read the series in time order, before Stats.compute
     // sorts it into order statistics.
-    // The inter-completion series carries the anchor cost itself: the
-    // forced cadence must register there with positive correlation
-    // (positive control). The bare per-exec series answers the gate
-    // question -- whether anchoring degrades the writes around it.
+    // Autocorrelation remains useful evidence, but a few periodic
+    // events can be drowned by host stalls. The event-labelled paired
+    // shift is the positive control; bare exec timings answer the gate.
     const control_check = lagCheck(
         "anchor-cost visibility",
         interval_samples,
@@ -256,7 +234,7 @@ fn benchWrites(gpa: std.mem.Allocator, io: std.Io, node: *Node, write_count: usi
     const anchor_check = lagCheck("anchor-interval", write_samples, anchor_every);
     const rotation_lag = zaxonlite.segment.rotation_records / journal_records_per_write;
     const rotation_check = lagCheck("segment-rotation", write_samples, rotation_lag);
-    try reportWriteRun(
+    const shift = try reportWriteRun(
         gpa,
         interval_samples,
         write_samples,
@@ -266,10 +244,10 @@ fn benchWrites(gpa: std.mem.Allocator, io: std.Io, node: *Node, write_count: usi
         anchor_events,
         anchor_every,
     );
-    printControlCheck(control_check, write_count);
+    printLagCheck(control_check, write_count);
     printLagCheck(anchor_check, write_count);
     printLagCheck(rotation_check, write_count);
-    return control_check.available and control_check.r > periodicity_flag;
+    return anchor_events >= 2 and shift.paired >= 2 and shift.shift > 0;
 }
 
 /// One iteration's anchor duty: the forced cadence guarantees anchor
@@ -295,7 +273,7 @@ fn reportWriteRun(
     anchor_duty_ns: u128,
     anchor_events: usize,
     anchor_every: usize,
-) !void {
+) !bench_stats.ShiftResult {
     const shift_scratch = try gpa.alloc(u64, anchor_events);
     defer gpa.free(shift_scratch);
     const duty_percent = @as(f64, @floatFromInt(anchor_duty_ns)) * 100.0 /
@@ -319,6 +297,7 @@ fn reportWriteRun(
             "{d} paired, {d} dropped)\n",
         .{ shift.shift / std.time.ns_per_us, shift.paired, shift.dropped },
     );
+    return shift;
 }
 
 fn benchReads(
